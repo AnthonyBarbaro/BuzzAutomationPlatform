@@ -363,24 +363,24 @@ brand_criteria = {
         'kickback': 0.30,
         'brands': ['Drops | ']
     },
-    "Seed Junky": {
-        'vendors': ['Seed Junky | LCISM Corp','Garden Of Weeden Inc.','Vino & Cigarro, LLC','Garden Of Weeden'],
-        'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        'brands': ['Seed Junky'],
-        # 'rules': [
-        #     {
-        #         'rule_name': 'SeedJunky - Sunday (50/30)',
-        #         'days': ['Sunday'],
-        #     },
-        #     {
-        #         'rule_name': 'SeedJunky - 8ths (50/30))',
-        #         'days': ['Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday','Monday'],
+    # "Seed Junky": {
+    #     'vendors': ['Seed Junky | LCISM Corp','Garden Of Weeden Inc.','Vino & Cigarro, LLC','Garden Of Weeden'],
+    #     'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+    #     'discount': 0.50,
+    #     'kickback': 0.30,
+    #     'brands': ['Seed Junky'],
+    #     # 'rules': [
+    #     #     {
+    #     #         'rule_name': 'SeedJunky - Sunday (50/30)',
+    #     #         'days': ['Sunday'],
+    #     #     },
+    #     #     {
+    #     #         'rule_name': 'SeedJunky - 8ths (50/30))',
+    #     #         'days': ['Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday','Monday'],
     
-        #     },
-        #         ]
-    },
+    #     #     },
+    #     #         ]
+    # },
     "KEEF": {
         'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','GB2, LLC'],
         'days': ['Tuesday','Wednesday'],
@@ -388,14 +388,14 @@ brand_criteria = {
         'kickback': 0.35,
         'brands': ['Keef']
     },
-    "PlugnPlay": {
-        'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','IE Licensing, LLC'],
-        # 'days': ['Saturday','Monday','Sunday'],
-        'days': ['Monday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        'brands': ['Plug n Play |','Plug N Play |']
-    },
+    # "PlugnPlay": {
+    #     'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','IE Licensing, LLC'],
+    #     # 'days': ['Saturday','Monday','Sunday'],
+    #     'days': ['Monday'],
+    #     'discount': 0.50,
+    #     'kickback': 0.30,
+    #     'brands': ['Plug n Play |','Plug N Play |']
+    # },
     "Sluggers": {
         'vendors': ['Garden Of Weeden','Garden Of Weeden Inc.'],
         'brands': ['Sluggers'],
@@ -514,7 +514,7 @@ brand_criteria = {
         ],
         'brands': ['CAM |', 'CAM|', 'CAM '],  # safer than "CAM"
         'discount': 0.40,
-        'kickback': 0.20,
+        'kickback': 0.0,
 
         'rules': [
             {
