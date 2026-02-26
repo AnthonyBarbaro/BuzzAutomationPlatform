@@ -57,10 +57,10 @@ PDF_ROOT = REPORTS_ROOT / "pdf"
 
 # If True: run Selenium export and archive fresh files
 # If False: reuse latest RAW folder, do NOT run Selenium
-RUN_EXPORT = False
+RUN_EXPORT = True
 SHOW_BOTH_MARGINS = True
 # If RUN_EXPORT=True: delete existing /files downloads first?
-CLEANUP_FILES_BEFORE_EXPORT = False
+CLEANUP_FILES_BEFORE_EXPORT = True
 
 # If RUN_EXPORT=True: do you want to "move" files out of /files, or "copy" them?
 ARCHIVE_ACTION = "move"  # "move" or "copy"
