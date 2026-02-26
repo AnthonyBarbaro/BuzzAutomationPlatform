@@ -19,7 +19,12 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+)
 from login import username, password
 
 CONFIG_FILE = "config.txt"
@@ -37,6 +42,176 @@ store_abbr_map = {
 start_str = None
 end_str = None
 driver = None
+
+BLOCKING_SELECTORS = [
+    "div.notification",
+    ".MuiSnackbar-root",
+    ".MuiAlert-root",
+    ".MuiBackdrop-root",
+]
+REPORT_READY_TIMEOUT_SECONDS = 180
+EXPORT_DOWNLOAD_TIMEOUT_SECONDS = 300
+EXPORT_ATTEMPTS_PER_STORE = 3
+
+LOADING_SELECTORS = [
+    "[data-testid='loading-spinner_icon']",
+    "[aria-label='Loading'][aria-valuetext='Loading']",
+]
+
+
+def _is_loading_data_visible():
+    """
+    Returns True if the report loading indicator is currently visible.
+    """
+    for selector in LOADING_SELECTORS:
+        try:
+            elems = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            elems = []
+        for elem in elems:
+            try:
+                if elem.is_displayed():
+                    return True
+            except StaleElementReferenceException:
+                continue
+
+    # Fallback: visible text node used by the UI while loading.
+    try:
+        text_nodes = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(), 'Loading data...')]",
+        )
+    except Exception:
+        text_nodes = []
+    for node in text_nodes:
+        try:
+            if node.is_displayed():
+                return True
+        except StaleElementReferenceException:
+            continue
+
+    return False
+
+
+def wait_for_loading_data_cycle(timeout=REPORT_READY_TIMEOUT_SECONDS, appear_wait=10, stable_seconds=1.2):
+    """
+    After clicking Run, wait for loading to complete before export actions.
+    - If loading appears, require it to disappear and stay clear briefly.
+    - If loading never appears within appear_wait, continue.
+    """
+    start = time.time()
+    saw_loading = False
+    clear_since = None
+
+    while time.time() - start < timeout:
+        loading_visible = _is_loading_data_visible()
+
+        if loading_visible:
+            saw_loading = True
+            clear_since = None
+            time.sleep(0.25)
+            continue
+
+        if saw_loading:
+            if clear_since is None:
+                clear_since = time.time()
+            elif (time.time() - clear_since) >= stable_seconds:
+                return True
+        elif (time.time() - start) >= appear_wait:
+            return True
+
+        time.sleep(0.25)
+
+    return False
+
+
+def _wait_for_blocking_ui(timeout=8):
+    """
+    Wait briefly for toast/snackbar/backdrop overlays that can intercept clicks.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        visible_blocker = False
+        for selector in BLOCKING_SELECTORS:
+            try:
+                elems = driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                elems = []
+            for elem in elems:
+                try:
+                    if elem.is_displayed():
+                        visible_blocker = True
+                        break
+                except StaleElementReferenceException:
+                    continue
+            if visible_blocker:
+                break
+        if not visible_blocker:
+            return True
+        time.sleep(0.2)
+    return False
+
+def robust_click(by, locator, label, timeout=12, attempts=4):
+    """
+    Click helper with retry + JS fallback for intercepted clicks.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _wait_for_blocking_ui(timeout=4)
+            wait = WebDriverWait(driver, timeout)
+            elem = wait.until(EC.presence_of_element_located((by, locator)))
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", elem)
+            time.sleep(0.2)
+            elem = wait.until(EC.element_to_be_clickable((by, locator)))
+            elem.click()
+            return True
+        except (ElementClickInterceptedException, StaleElementReferenceException, TimeoutException) as e:
+            last_error = e
+            try:
+                elem = driver.find_element(by, locator)
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", elem)
+                driver.execute_script("arguments[0].click();", elem)
+                return True
+            except Exception as js_e:
+                last_error = js_e
+                print(f"[WARN] {label} click attempt {attempt}/{attempts} failed: {js_e}")
+                time.sleep(0.6)
+
+    raise TimeoutException(f"Could not click '{label}' after {attempts} attempts: {last_error}")
+
+def wait_for_report_ready(timeout=REPORT_READY_TIMEOUT_SECONDS):
+    """
+    After clicking Run, wait until UI is ready for Actions/Export.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        _wait_for_blocking_ui(timeout=1)
+        if _is_loading_data_visible():
+            time.sleep(0.35)
+            continue
+        try:
+            actions_btn = driver.find_element(By.ID, "actions-menu-button")
+            if not actions_btn.is_displayed():
+                time.sleep(0.5)
+                continue
+
+            is_enabled = actions_btn.is_enabled()
+            disabled_attr = str(actions_btn.get_attribute("disabled") or "").lower()
+            aria_disabled = str(actions_btn.get_attribute("aria-disabled") or "").lower()
+            aria_busy = str(actions_btn.get_attribute("aria-busy") or "").lower()
+
+            if (
+                is_enabled
+                and disabled_attr not in ("true", "disabled")
+                and aria_disabled != "true"
+                and aria_busy != "true"
+            ):
+                return True
+        except (NoSuchElementException, StaleElementReferenceException):
+            pass
+        time.sleep(0.5)
+    return False
 
 def wait_for_new_file(download_directory, before_files, timeout=12):
     end_time = time.time() + timeout
@@ -65,7 +240,7 @@ def launchBrowser():
     # Other stability flags
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--headless=new")
+    #chrome_options.add_argument("--headless=new")
     # Keep browser open after script (your existing behavior)
     chrome_options.add_experimental_option("detach", True)
     chrome_options.add_experimental_option("excludeSwitches", ["enable-logging"])
@@ -162,11 +337,16 @@ def set_date_range(start_date, end_date):
     time.sleep(1)
 
 def click_run_button():
-    wait = WebDriverWait(driver, 10)
-    run_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Run')]")))
-    run_button.click()
+    robust_click(By.XPATH, "//button[contains(normalize-space(),'Run')]", "Run button", timeout=15, attempts=5)
     print("Run button clicked successfully.")
-    time.sleep(1)
+
+    # Wait for "Loading data..." to complete before touching Actions/Export.
+    if not wait_for_loading_data_cycle():
+        raise TimeoutException("Loading data did not finish after clicking Run.")
+
+    # Then wait for Actions button to be genuinely ready.
+    if not wait_for_report_ready():
+        raise TimeoutException("Report did not reach ready state after clicking Run.")
 
 def monitor_folder_for_new_file(folder_path, before_files, timeout=120):
     """Monitor a folder for new files."""
@@ -207,83 +387,133 @@ def wait_until_file_is_stable(file_path, stable_time=2, max_wait=30):
             return False
         time.sleep(1)
 
+def _snapshot_files(folder_path):
+    snap = {}
+    for name in os.listdir(folder_path):
+        path = os.path.join(folder_path, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            snap[name] = (os.path.getmtime(path), os.path.getsize(path))
+        except OSError:
+            continue
+    return snap
+
+def _expected_store_filename(current_store):
+    if current_store == "Buzz Cannabis - Mission Valley":
+        return "salesMV.xlsx"
+    if current_store == "Buzz Cannabis-La Mesa":
+        return "salesLM.xlsx"
+    if current_store == "Buzz Cannabis - SORRENTO VALLEY":
+        return "salesSV.xlsx"
+    if current_store == "Buzz Cannabis - Lemon Grove":
+        return "salesLG.xlsx"
+    if current_store == "Buzz Cannabis (National City)":
+        return "salesNC.xlsx"
+    if current_store == "Buzz Cannabis Wildomar Palomar":
+        return "salesWP.xlsx"
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", current_store).strip("_")
+    return f"sales_{safe_name}_{timestamp}.xlsx"
+
+def _wait_for_downloaded_export(files_dir, before_snapshot, timeout=EXPORT_DOWNLOAD_TIMEOUT_SECONDS):
+    """
+    Wait for a finished export file by detecting either:
+    - a new file, or
+    - an existing file whose mtime/size changed.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        snap = _snapshot_files(files_dir)
+        active_partial = any(
+            name.endswith(".crdownload") or name.endswith(".tmp")
+            for name in snap.keys()
+        )
+
+        changed_paths = []
+        for name, stat in snap.items():
+            if name.endswith(".crdownload") or name.endswith(".tmp"):
+                continue
+            prev = before_snapshot.get(name)
+            if prev is None or prev != stat:
+                changed_paths.append((os.path.join(files_dir, name), stat[0]))
+
+        if changed_paths and not active_partial:
+            changed_paths.sort(key=lambda x: x[1], reverse=True)
+            for path, _ in changed_paths:
+                if not os.path.isfile(path):
+                    continue
+                if wait_until_file_is_stable(path, stable_time=2, max_wait=25):
+                    return path
+        time.sleep(1)
+    return None
+
 def clickActionsAndExport(current_store):
     try:
         print(f"\n=== Exporting data for store: {current_store} ===")
-        wait = WebDriverWait(driver, 5)
         files_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+        os.makedirs(files_dir, exist_ok=True)
 
         # Capture initial state of the download folder
-        before_files = set(os.listdir(files_dir))
-        print("Files before download:", before_files)
+        before_snapshot = _snapshot_files(files_dir)
+        print("Files before download:", set(before_snapshot.keys()))
 
         # Click the Actions button
-        actions_button = wait.until(EC.element_to_be_clickable((By.ID, 'actions-menu-button')))
-        actions_button.click()
+        robust_click(By.ID, "actions-menu-button", "Actions button", timeout=12, attempts=4)
         print("Actions button clicked successfully.")
-        time.sleep(2)
+        time.sleep(1)
 
         # Select the Export option
-        export_option = wait.until(EC.element_to_be_clickable((By.XPATH, "//li[contains(text(),'Export')]")))
-        export_option.click()
+        robust_click(By.XPATH, "//li[contains(text(),'Export')]", "Export option", timeout=12, attempts=4)
         print("Export option clicked successfully.")
-        time.sleep(4)
+        exported_path = _wait_for_downloaded_export(
+            files_dir,
+            before_snapshot,
+            timeout=EXPORT_DOWNLOAD_TIMEOUT_SECONDS,
+        )
 
-        # Wait for a new file to appear in the directory
-        downloaded_file = wait_for_new_file(files_dir, before_files, timeout=120)
-        if downloaded_file:
-            original_path = os.path.join(files_dir, downloaded_file)
-            print(f"New file detected: {downloaded_file}")
-            
-        # Check the folder contents after download
-        time.sleep(1)  # Short wait to ensure the file is written
-        after_files = set(os.listdir(files_dir))
-        print("Files after download:", after_files)
+        if not exported_path:
+            print(f"No export file detected within {EXPORT_DOWNLOAD_TIMEOUT_SECONDS}s.")
+            print("Files after download:", set(_snapshot_files(files_dir).keys()))
+            return False
 
-        # Identify new files
-        new_files = after_files - before_files
-        if new_files:
-            downloaded_file = max(new_files, key=lambda f: os.path.getctime(os.path.join(files_dir, f)))
-            print(f"New file detected: {downloaded_file}")
-            original_path = os.path.join(files_dir, downloaded_file)
+        print(f"Export file detected: {os.path.basename(exported_path)}")
+        new_filename = _expected_store_filename(current_store)
+        new_path = os.path.join(files_dir, new_filename)
 
-            # Ensure file is stable before renaming
-            if wait_until_file_is_stable(original_path):
-                # Generate a new filename
-                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-                if current_store == "Buzz Cannabis - Mission Valley":
-                    new_filename = f"salesMV.xlsx"
-                elif current_store == "Buzz Cannabis-La Mesa":
-                    new_filename = f"salesLM.xlsx"
-                elif current_store == "Buzz Cannabis - SORRENTO VALLEY":
-                    new_filename = f"salesSV.xlsx"
-                elif current_store == "Buzz Cannabis - Lemon Grove":
-                    new_filename = f"salesLG.xlsx"
-                elif current_store == "Buzz Cannabis (National City)":
-                    new_filename = f"salesNC.xlsx"  # ✅ Add this line
-                elif current_store == "Buzz Cannabis Wildomar Palomar":
-                    new_filename = f"salesWP.xlsx"
-
-                else:
-                    new_filename = f"sales_{current_store}_{timestamp}.xlsx"
-
-                new_path = os.path.join(files_dir, new_filename)
-
-                # Rename the file
-                try:
-                    os.rename(original_path, new_path)
-                    print(f"Renamed file to: {new_filename}")
-                except Exception as e:
-                    print(f"Error renaming file: {e}")
-            else:
-                print("File did not stabilize in time.")
-        else:
-            print("No new file detected after export.")
+        # Replace old target if present, then move into canonical store filename.
+        try:
+            if os.path.exists(new_path):
+                os.remove(new_path)
+            os.rename(exported_path, new_path)
+            if os.path.getsize(new_path) <= 0:
+                print(f"[WARN] Downloaded file is empty: {new_path}")
+                return False
+            print(f"Renamed file to: {new_filename}")
+            return True
+        except Exception as e:
+            print(f"Error renaming file: {e}")
+            return False
 
     except TimeoutException:
         print("An element could not be found or clicked within the timeout period.")
+        return False
     except Exception as e:
         print(f"An error occurred during export: {traceback.format_exc()}")
+        return False
+
+def export_store_with_retries(current_store, start_date, end_date, attempts=EXPORT_ATTEMPTS_PER_STORE):
+    for attempt in range(1, attempts + 1):
+        print(f"[EXPORT] {current_store}: attempt {attempt}/{attempts}")
+        try:
+            set_date_range(start_date, end_date)
+            click_run_button()
+            if clickActionsAndExport(current_store):
+                return True
+        except Exception:
+            print(f"[WARN] Export attempt {attempt} failed for {current_store}: {traceback.format_exc()}")
+        time.sleep(3)
+    return False
 
 def update_days_combobox(year_combo, month_combo, day_combo):
     # Weekday abbreviations
@@ -457,15 +687,26 @@ def open_gui_and_run():
         global driver
         driver = launchBrowser()
         login(driver)
+        failed_stores = []
 
         for store in selected_stores:
-            if not select_dropdown_item(store):
-                break
-            set_date_range(start_date, end_date)
-            click_run_button()
-            clickActionsAndExport(store)
+            try:
+                if not select_dropdown_item(store):
+                    print(f"[WARN] Could not select store: {store}")
+                    failed_stores.append(store)
+                    continue
+                ok = export_store_with_retries(store, start_date, end_date)
+                if not ok:
+                    print(f"[WARN] Export failed for store: {store}")
+                    failed_stores.append(store)
+            except Exception:
+                print(f"[WARN] Store run failed for {store}: {traceback.format_exc()}")
+                failed_stores.append(store)
+                continue
 
         driver.quit()
+        if failed_stores:
+            print(f"[WARN] Failed stores: {failed_stores}")
 
     tk.Button(root, text="OK", command=on_ok, font=("Arial", 12, "bold"), bg="lightblue").pack(pady=10)
 
@@ -483,15 +724,28 @@ def run_sales_report(start_date, end_date):
     global driver
     driver = launchBrowser()
     login(driver)
+    failed_stores = []
 
-    for store in store_names:
-            if not select_dropdown_item(store):
-                break
-            set_date_range(start_date, end_date)
-            click_run_button()
-            clickActionsAndExport(store)
+    try:
+        for store in store_names:
+            try:
+                if not select_dropdown_item(store):
+                    print(f"[WARN] Could not select store: {store}")
+                    failed_stores.append(store)
+                    continue
+                ok = export_store_with_retries(store, start_date, end_date)
+                if not ok:
+                    print(f"[WARN] Export failed for store: {store}")
+                    failed_stores.append(store)
+            except Exception:
+                print(f"[WARN] Store run failed for {store}: {traceback.format_exc()}")
+                failed_stores.append(store)
+                continue
+    finally:
+        driver.quit()
 
-    driver.quit()
+    if failed_stores:
+        raise RuntimeError(f"Export failed for store(s): {', '.join(failed_stores)}")
 # Main execution through GUI
 if __name__ == "__main__":
     open_gui_and_run()

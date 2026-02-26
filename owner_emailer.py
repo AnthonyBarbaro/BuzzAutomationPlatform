@@ -1,9 +1,9 @@
 import os
 import base64
+import html
 from io import BytesIO
 from pathlib import Path
 from email.message import EmailMessage
-from email.utils import make_msgid
 from datetime import date
 from typing import List, Optional, Dict, Any, Tuple, Union
 
@@ -34,8 +34,9 @@ BUZZ = {
 
 # -----------------------------------------------------------------------------
 # Inline preview settings (PDF -> image)
+# Legacy options kept for compatibility; current email flow uses HTML-only previews.
 # -----------------------------------------------------------------------------
-ENABLE_INLINE_PREVIEWS = True
+ENABLE_INLINE_PREVIEWS = False
 
 # Cap how many PDFs we render previews for (PDFs are still attached regardless)
 MAX_PREVIEWS = 12
@@ -58,7 +59,7 @@ JPEG_QUALITY = 72
 # -----------------------------------------------------------------------------
 # Store images/icons (optional)
 # -----------------------------------------------------------------------------
-ENABLE_STORE_ICONS = True
+ENABLE_STORE_ICONS = False
 
 # Put store images here (recommended):
 #   store_images/MV.jpg
@@ -80,7 +81,7 @@ STORE_ICON_SIZE_PX = 44
 # -----------------------------------------------------------------------------
 # “Color wave” header banner (generated as inline PNG) (requires Pillow)
 # -----------------------------------------------------------------------------
-ENABLE_WAVE_BANNER = True
+ENABLE_WAVE_BANNER = False
 WAVE_BANNER_WIDTH_PX = 760
 WAVE_BANNER_HEIGHT_PX = 26
 
@@ -91,10 +92,17 @@ WAVE_BANNER_HEIGHT_PX = 26
 # If you want a 2-column grid, set this to 2
 CARDS_PER_ROW = 1
 
+STORE_EMAIL_ORDER = ["MV", "LM", "SV", "LG", "NC", "WP"]
+STORE_ORDER_INDEX = {abbr: i for i, abbr in enumerate(STORE_EMAIL_ORDER)}
+
 
 # =============================================================================
 # Helpers: parsing filenames
 # =============================================================================
+
+def _store_sort_key(abbr: Any) -> Tuple[int, str]:
+    key = str(abbr or "").strip().upper()
+    return (STORE_ORDER_INDEX.get(key, 999), key)
 
 def _parse_pdf_identity(pdf_path: str) -> Dict[str, Any]:
     """
@@ -124,12 +132,45 @@ def _parse_pdf_identity(pdf_path: str) -> Dict[str, Any]:
         "abbr": abbr,
         "store_name": store_name,
         "display_title": display_title,
-        "sort_key": (1, abbr),
+        "sort_key": (1, *_store_sort_key(abbr)),
     }
 
 
 def _chunk(items: List[Any], n: int) -> List[List[Any]]:
     return [items[i:i + n] for i in range(0, len(items), n)]
+
+
+def _human_file_size(num_bytes: int) -> str:
+    if num_bytes is None or num_bytes < 0:
+        return "0 B"
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    kb = num_bytes / 1024.0
+    if kb < 1024:
+        return f"{kb:.1f} KB"
+    mb = kb / 1024.0
+    return f"{mb:.2f} MB"
+
+
+def _fmt_money(value: Any) -> str:
+    try:
+        return f"${float(value):,.0f}"
+    except Exception:
+        return "$0"
+
+
+def _fmt_pct(value: Any) -> str:
+    try:
+        return f"{float(value) * 100:,.1f}%"
+    except Exception:
+        return "0.0%"
+
+
+def _fmt_int(value: Any) -> str:
+    try:
+        return f"{int(round(float(value))):,}"
+    except Exception:
+        return "0"
 
 
 # =============================================================================
@@ -332,258 +373,174 @@ def _try_make_wave_banner_png(width_px: int, height_px: int) -> Optional[bytes]:
 # HTML builder
 # =============================================================================
 
-def _build_plain_text_email(report_day: date, data_start: date, data_end: date) -> str:
-    return (
-        "Buzz Cannabis — Owner Snapshot\n\n"
-        f"Report Day: {report_day.strftime('%A, %B %d, %Y')} ({report_day.isoformat()})\n"
-        f"Data Window: {data_start.isoformat()} → {data_end.isoformat()}\n\n"
-        "Attached:\n"
-        "• Store Owner Snapshot PDFs\n"
-        "• All Stores Summary\n\n"
-        "This email was generated automatically.\n"
-    )
+def _build_plain_text_email(
+    report_day: date,
+    data_start: date,
+    data_end: date,
+    executive_summary: Optional[Dict[str, Any]] = None,
+    store_summaries: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    lines = [
+        "Buzz Cannabis — Owner Snapshot",
+        "",
+        f"Report Day: {report_day.strftime('%A, %B %d, %Y')} ({report_day.isoformat()})",
+        f"Data Window: {data_start.isoformat()} → {data_end.isoformat()}",
+        "",
+    ]
+    if executive_summary:
+        lines += [
+            "Executive Snapshot:",
+            f"- Today Net: {_fmt_money(executive_summary.get('today_net'))}",
+            f"- Today Tickets: {_fmt_int(executive_summary.get('today_tickets'))}",
+            f"- MTD Net: {_fmt_money(executive_summary.get('mtd_net'))}",
+            f"- MTD Tickets: {_fmt_int(executive_summary.get('mtd_tickets'))}",
+            f"- Projected Month Net: {_fmt_money(executive_summary.get('proj_month_net'))}",
+            f"- Projected Month Profit: {_fmt_money(executive_summary.get('proj_month_profit'))}",
+            f"- Projected Margin: {_fmt_pct(executive_summary.get('proj_margin'))}",
+            f"- Remaining Days: {_fmt_int(executive_summary.get('remaining_days'))}",
+            "",
+        ]
+    if store_summaries:
+        lines += [
+            "Store KPI Preview:",
+        ]
+        for s in sorted(store_summaries, key=lambda x: _store_sort_key(x.get("abbr", ""))):
+            lines.append(
+                f"- {s.get('abbr','')}: Today Net {_fmt_money(s.get('today_net'))}, "
+                f"Today Avg Ticket {_fmt_money(s.get('today_basket'))}, "
+                f"MTD Net {_fmt_money(s.get('mtd_net'))}, "
+                f"MTD Avg Ticket {_fmt_money(s.get('mtd_basket'))}"
+            )
+    lines += ["", "This email was generated automatically."]
+    return "\n".join(lines)
 
 
 def _build_html_email(
     report_day: date,
     data_start: date,
     data_end: date,
-    cards: List[Dict[str, Any]],
-    pdf_count: int,
-    wave_src: str = "",
+    executive_summary: Optional[Dict[str, Any]] = None,
+    store_summaries: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """
-    Build a Gmail-friendly table-based HTML.
-
-    cards entries look like:
-      {
-        "abbr": "MV",
-        "display_title": "MV • Mission Viejo",
-        "is_all": False,
-        "img_src": "cid:..." or "",
-        "icon_src": "cid:..." or "",
-        "has_preview": bool
-      }
-    """
     header_date = report_day.strftime("%A, %B %d, %Y")
-    window_str = f"{data_start.isoformat()} → {data_end.isoformat()}"
 
-    all_card = next((c for c in cards if c.get("is_all")), None)
-    store_cards = [c for c in cards if not c.get("is_all")]
+    def _esc(text: Any) -> str:
+        return html.escape(str(text or ""))
 
-    def badge(text: str, bg: str, fg: str) -> str:
-        return (
-            f"<span style=\"display:inline-block;padding:6px 10px;border-radius:999px;"
-            f"background:{bg};color:{fg};font-size:12px;font-weight:800;letter-spacing:0.2px;\">{text}</span>"
-        )
+    perf_block = ""
+    if executive_summary:
+        perf_cells: List[str] = []
 
-    def _icon_block(c: Dict[str, Any]) -> str:
-        """
-        Store icon. If we have icon_src, show image. Else fallback to abbr circle.
-        """
-        abbr = (c.get("abbr") or "").upper()
-        icon_src = c.get("icon_src") or ""
-
-        if icon_src:
-            return (
-                f"<img src=\"{icon_src}\" width=\"{STORE_ICON_SIZE_PX}\" height=\"{STORE_ICON_SIZE_PX}\" "
-                f"style=\"display:block;border-radius:999px;border:2px solid {BUZZ['yellow']};\" "
-                f"alt=\"{abbr} icon\">"
+        def _add_perf_cell(label: str, value: str) -> None:
+            perf_cells.append(
+                f"<td style=\"padding:10px;border:1px solid {BUZZ['border']};background:#FFFFFF;\">"
+                f"<div style=\"font-size:11px;color:{BUZZ['muted2']};font-weight:700;\">{_esc(label)}</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(value)}</div>"
+                f"</td>"
             )
 
-        # fallback: colored monogram circle
-        return (
-            f"<div style=\"width:{STORE_ICON_SIZE_PX}px;height:{STORE_ICON_SIZE_PX}px;border-radius:999px;"
-            f"background:{BUZZ['yellow']};color:{BUZZ['black']};text-align:center;"
-            f"line-height:{STORE_ICON_SIZE_PX}px;font-weight:900;font-size:12px;letter-spacing:0.6px;\">"
-            f"{abbr}"
-            f"</div>"
+        _add_perf_cell("Today Net", _fmt_money(executive_summary.get("today_net")))
+        _add_perf_cell("Today Tickets", _fmt_int(executive_summary.get("today_tickets")))
+        _add_perf_cell("Today Avg Ticket", _fmt_money(executive_summary.get("today_basket")))
+        _add_perf_cell("Today Discount Rate", _fmt_pct(executive_summary.get("today_discount_rate")))
+        _add_perf_cell("MTD Net", _fmt_money(executive_summary.get("mtd_net")))
+        _add_perf_cell("MTD Tickets", _fmt_int(executive_summary.get("mtd_tickets")))
+        _add_perf_cell("MTD Avg Ticket", _fmt_money(executive_summary.get("mtd_basket")))
+        _add_perf_cell("MTD Margin", _fmt_pct(executive_summary.get("mtd_margin")))
+        _add_perf_cell("Projected Month Net", _fmt_money(executive_summary.get("proj_month_net")))
+        _add_perf_cell("Projected Month Profit", _fmt_money(executive_summary.get("proj_month_profit")))
+        _add_perf_cell("Projected Margin", _fmt_pct(executive_summary.get("proj_margin")))
+        _add_perf_cell("Remaining Days", _fmt_int(executive_summary.get("remaining_days")))
+
+        perf_rows = ""
+        for i in range(0, len(perf_cells), 4):
+            perf_rows += f"<tr>{''.join(perf_cells[i:i + 4])}</tr>"
+
+        perf_block = (
+            f"<tr><td style=\"padding:0 20px 6px 20px;\">"
+            f"<div style=\"font-size:14px;font-weight:900;color:#111827;\">Performance Snapshot</div>"
+            f"<div style=\"margin-top:3px;font-size:12px;color:{BUZZ['muted2']};\">All-store day, MTD, avg-ticket, and month-end projection highlights.</div>"
+            f"</td></tr>"
+            f"<tr><td style=\"padding:8px 20px 12px 20px;\">"
+            f"<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse;\">{perf_rows}</table>"
+            f"</td></tr>"
         )
 
-    def _preview_block(c: Dict[str, Any]) -> str:
-        title = c.get("display_title", "Snapshot")
-        if c.get("has_preview") and c.get("img_src"):
-            return (
-                f"<img src=\"{c['img_src']}\" alt=\"{title} preview\" "
-                f"style=\"width:100%;height:auto;display:block;border-radius:12px;"
-                f"border:1px solid {BUZZ['border']};\">"
-                f"<div style=\"margin-top:8px;font-size:11px;color:{BUZZ['muted2']};line-height:1.35;\">"
-                f"Preview shows the top KPI section of page 1. Open the attached PDF for the full report."
-                f"</div>"
+    store_kpi_block = ""
+    if store_summaries:
+        rows = ""
+        sorted_stores = sorted(store_summaries, key=lambda s: _store_sort_key(s.get("abbr", "")))
+        for idx, s in enumerate(sorted_stores):
+            bg = "#FFFFFF" if idx % 2 == 0 else BUZZ["soft"]
+            rows += (
+                f"<tr style=\"background:{bg};\">"
+                f"<td style=\"padding:8px 8px;font-size:11px;color:#111827;font-weight:800;border-bottom:1px solid {BUZZ['border']};white-space:nowrap;\">{_esc(s.get('abbr',''))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('today_net')))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_int(s.get('today_tickets')))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('today_basket')))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('mtd_net')))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_int(s.get('mtd_tickets')))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('mtd_basket')))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_pct(s.get('mtd_margin')))}</td>"
+                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('proj_month_net')))}</td>"
+                f"</tr>"
             )
 
-        return (
-            f"<div style=\"padding:16px;border:1px dashed {BUZZ['border']};"
-            f"border-radius:12px;color:{BUZZ['muted2']};font-size:12px;line-height:1.35;\">"
-            f"Preview unavailable — see attached PDF."
-            f"</div>"
+        store_kpi_block = (
+            f"<tr><td style=\"padding:0 20px 6px 20px;\">"
+            f"<div style=\"font-size:14px;font-weight:900;color:#111827;\">Store KPI Preview</div>"
+            f"<div style=\"margin-top:3px;font-size:12px;color:{BUZZ['muted2']};\">Detailed net sales and avg-ticket metrics by store.</div>"
+            f"</td></tr>"
+            f"<tr><td style=\"padding:8px 20px 14px 20px;\">"
+            f"<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" "
+            f"style=\"border:1px solid {BUZZ['border']};border-radius:10px;overflow:hidden;border-collapse:separate;border-spacing:0;\">"
+            f"<tr style=\"background:#111827;\">"
+            f"<th align=\"left\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Store</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Today Net</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Today Tix</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Today Avg Tkt</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Net</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Tix</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Avg Tkt</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Margin</th>"
+            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Proj Net</th>"
+            f"</tr>"
+            f"{rows}"
+            f"</table></td></tr>"
         )
 
-    def card_html(c: Dict[str, Any]) -> str:
-        title = c.get("display_title", "Owner Snapshot")
-
-        return f"""
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
-               style="border:1px solid {BUZZ['border']};border-radius:16px;overflow:hidden;background:{BUZZ['white']};">
-          <tr>
-            <td style="padding:12px 14px;border-bottom:1px solid {BUZZ['border']};background:{BUZZ['soft']};">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                <tr>
-                  <td width="{STORE_ICON_SIZE_PX}" valign="middle" style="padding-right:10px;">
-                    {_icon_block(c)}
-                  </td>
-                  <td valign="middle">
-                    <div style="font-size:13px;font-weight:900;color:#111827;letter-spacing:0.2px;">
-                      {title}
-                    </div>
-                    <div style="font-size:11px;color:{BUZZ['muted2']};margin-top:2px;">
-                      Attached PDF • Owner Snapshot
-                    </div>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:12px 14px;">
-              {_preview_block(c)}
-            </td>
-          </tr>
-        </table>
-        """
-
-    # Build store grid rows
-    grid_rows_html = ""
-    rows = _chunk(store_cards, max(1, int(CARDS_PER_ROW)))
-
-    for row in rows:
-        tds = ""
-        for c in row:
-            tds += f"""
-            <td width="{int(100 / max(1, CARDS_PER_ROW))}%" valign="top" style="padding:8px;">
-              {card_html(c)}
-            </td>
-            """
-
-        # pad last row
-        if len(row) < CARDS_PER_ROW:
-            tds += f"""
-            <td width="{int(100 / max(1, CARDS_PER_ROW))}%" valign="top" style="padding:8px;"></td>
-            """
-
-        grid_rows_html += f"<tr>{tds}</tr>"
-
-    # Badges
-    top_badges = (
-        badge(f"REPORT DAY • {report_day.isoformat()}", BUZZ["yellow"], BUZZ["black"])
-        + "&nbsp;&nbsp;"
-        + badge(f"DATA WINDOW • {window_str}", BUZZ["black"], BUZZ["yellow"])
-        + "&nbsp;&nbsp;"
-        + badge(f"{pdf_count} PDF ATTACHMENTS", BUZZ["green"], BUZZ["white"])
-    )
-
-    # Wave row (inline image) OR fallback stripes
-    if wave_src:
-        wave_html = (
-            f"<img src=\"{wave_src}\" alt=\"\" style=\"width:100%;height:auto;display:block;\">"
-        )
-    else:
-        wave_html = f"""
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-          <tr>
-            <td style="height:6px;background:{BUZZ['yellow']};"></td>
-            <td style="height:6px;background:{BUZZ['green']};"></td>
-            <td style="height:6px;background:{BUZZ['yellow']};"></td>
-          </tr>
-        </table>
-        """
-
-    # All Stores block (full width)
-    all_card_html = ""
-    if all_card:
-        all_card_html = f"""
-        <tr>
-          <td style="padding:14px 20px 4px 20px;">
-            <div style="font-size:14px;font-weight:900;color:#111827;margin-bottom:10px;">
-              All Stores Summary
-            </div>
-            {card_html(all_card)}
-          </td>
-        </tr>
-        """
-
-    html = f"""
+    html_body = f"""
     <div style="margin:0;padding:0;background:{BUZZ['bg']};">
-      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:{BUZZ['bg']};padding:24px 0;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:{BUZZ['bg']};padding:20px 0;">
         <tr>
-          <td align="center">
+          <td align="center" style="padding:0 10px;">
             <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
-                   style="max-width:760px;background:{BUZZ['white']};border:1px solid {BUZZ['border']};border-radius:18px;overflow:hidden;">
-              <!-- Header -->
+                   style="max-width:780px;background:{BUZZ['white']};border:1px solid {BUZZ['border']};border-radius:14px;overflow:hidden;">
               <tr>
                 <td style="background:{BUZZ['black']};padding:18px 20px;">
-                  <div style="color:{BUZZ['yellow']};font-size:18px;font-weight:900;letter-spacing:0.6px;">
-                    BUZZ CANNABIS
-                  </div>
-                  <div style="color:{BUZZ['white']};font-size:13px;margin-top:4px;opacity:0.95;">
-                    Owner Snapshot • {header_date}
-                  </div>
+                  <div style="color:{BUZZ['yellow']};font-size:19px;font-weight:900;letter-spacing:0.5px;">BUZZ CANNABIS</div>
+                  <div style="color:#FFFFFF;font-size:13px;margin-top:4px;">Owner Snapshot • {_esc(header_date)}</div>
                 </td>
               </tr>
-
-              <!-- Wave -->
               <tr>
-                <td>
-                  {wave_html}
-                </td>
+                <td style="height:5px;background:linear-gradient(90deg,{BUZZ['yellow']} 0%,{BUZZ['green']} 55%,{BUZZ['yellow']} 100%);"></td>
               </tr>
+              {perf_block}
+              {store_kpi_block}
 
-              <!-- Badges -->
               <tr>
-                <td style="padding:14px 20px;border-bottom:1px solid {BUZZ['border']};">
-                  {top_badges}
+                <td style="padding:12px 20px;background:#111827;color:#9CA3AF;font-size:11px;line-height:1.5;">
+                  Auto-generated by Buzz Automation • Reply to this email if any value looks off.
+                  <span style="color:{BUZZ['yellow']};font-weight:800;"> #Buzz</span>
                 </td>
               </tr>
-
-              <!-- Quick note -->
-              <tr>
-                <td style="padding:16px 20px;">
-                  <div style="font-size:13px;color:{BUZZ['muted']};line-height:1.5;">
-                    Attached are the full Owner Snapshot PDFs per store, plus the All Stores summary.
-                    Below are <b>top-of-page KPI previews</b> for quick scanning.
-                  </div>
-                </td>
-              </tr>
-
-              {all_card_html}
-
-              <!-- Store Grid -->
-              <tr>
-                <td style="padding:6px 12px 10px 12px;">
-                  <div style="padding:8px 8px 4px 8px;font-size:14px;font-weight:900;color:#111827;">
-                    Store Snapshots
-                  </div>
-                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="padding:0 0 8px 0;">
-                    {grid_rows_html}
-                  </table>
-                </td>
-              </tr>
-
-              <!-- Footer -->
-              <tr>
-                <td style="padding:14px 20px;background:#111827;color:#9CA3AF;font-size:11px;line-height:1.4;">
-                  Auto-generated by Buzz Automation • Reply to this email if something looks off.
-                  <span style="color:{BUZZ['yellow']};font-weight:800;">#Buzz</span>
-                </td>
-              </tr>
-
             </table>
           </td>
         </tr>
       </table>
     </div>
     """
-    return html
+    return html_body
 
 
 # =============================================================================
@@ -596,16 +553,17 @@ def send_owner_snapshot_email(
     data_start: date,
     data_end: date,
     to_email: Union[str, List[str]] = "anthony@buzzcannabis.com",
+    executive_summary: Optional[Dict[str, Any]] = None,
+    store_summaries: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Sends Owner Snapshot PDFs via Gmail API using JSON token (cron-safe),
-    with a branded HTML body + optional inline preview images.
+    with a lightweight executive HTML body and PDF attachments.
 
-    Features:
-      - ✅ Cropped TOP-of-page preview (KPIs readable)
-      - ✅ Optional store icon per card
-      - ✅ Optional wave banner (inline image)
-      - PDFs are still attached normally
+    Notes:
+      - No image previews are embedded (faster load, smaller email payload)
+      - HTML body is KPI-focused for quick executive scanning
+      - Full details remain in attached PDFs
     """
 
     if not os.path.exists(GMAIL_TOKEN):
@@ -623,80 +581,15 @@ def send_owner_snapshot_email(
     existing_pdfs = [p for p in pdf_paths if p and os.path.exists(p)]
     pdf_identities = [_parse_pdf_identity(p) for p in existing_pdfs]
     pdf_sorted = sorted(zip(existing_pdfs, pdf_identities), key=lambda x: x[1]["sort_key"])
-
-    # ---------- Inline images registry ----------
-    inline_images: List[Dict[str, Any]] = []
-
-    def _register_inline_image(img_bytes: bytes, subtype: str, filename: str) -> str:
-        """
-        Registers an inline image and returns the HTML src (cid:...).
-        """
-        cid = make_msgid(domain="buzzcannabis.local")  # includes <...>
-        cid_ref = cid[1:-1]  # strip brackets for HTML
-        inline_images.append({
-            "cid": cid,
-            "cid_ref": cid_ref,
-            "bytes": img_bytes,
-            "subtype": subtype,
-            "filename": filename,
-        })
-        return f"cid:{cid_ref}"
-
-    # ---------- Wave banner ----------
-    wave_src = ""
-    wave_png = _try_make_wave_banner_png(WAVE_BANNER_WIDTH_PX, WAVE_BANNER_HEIGHT_PX)
-    if wave_png:
-        wave_src = _register_inline_image(wave_png, "png", "buzz_wave.png")
-
-    # ---------- Build cards (store + all) ----------
-    # Dedup icons by store abbr so we don't attach the same image twice
-    icon_src_by_abbr: Dict[str, str] = {}
-
-    cards: List[Dict[str, Any]] = []
-    preview_renders_used = 0
-
-    for pdf_path, ident in pdf_sorted:
-        abbr = ident.get("abbr", "STORE")
-
-        # Store icon (optional)
-        icon_src = ""
-        if ENABLE_STORE_ICONS and abbr and abbr != "ALL":
-            if abbr in icon_src_by_abbr:
-                icon_src = icon_src_by_abbr[abbr]
-            else:
-                icon = _try_load_store_icon_bytes(abbr)
-                if icon:
-                    icon_bytes, icon_subtype = icon
-                    icon_src = _register_inline_image(
-                        icon_bytes,
-                        icon_subtype,
-                        f"{abbr}_icon.{('png' if icon_subtype == 'png' else icon_subtype)}"
-                    )
-                    icon_src_by_abbr[abbr] = icon_src
-
-        # PDF preview (top-of-page crop)
-        img_src = ""
-        has_preview = False
-
-        if ENABLE_INLINE_PREVIEWS and preview_renders_used < MAX_PREVIEWS:
-            png = _try_render_pdf_first_page(pdf_path)
-            if png:
-                img_bytes, img_subtype = _maybe_convert_png_to_jpeg(png)
-                img_src = _register_inline_image(
-                    img_bytes,
-                    img_subtype,
-                    f"{abbr}_preview.{('jpg' if img_subtype == 'jpeg' else 'png')}"
-                )
-                has_preview = True
-
-            preview_renders_used += 1
-
-        cards.append({
-            **ident,
-            "has_preview": has_preview,
-            "img_src": img_src,
-            "icon_src": icon_src,
-        })
+    sorted_pdfs: List[str] = []
+    total_size_bytes = 0
+    for pdf_path, _ in pdf_sorted:
+        try:
+            size_bytes = int(os.path.getsize(pdf_path))
+        except Exception:
+            size_bytes = 0
+        sorted_pdfs.append(pdf_path)
+        total_size_bytes += size_bytes
 
     # ---------- Email ----------
     subject = f"Buzz Cannabis Owner Snapshot — {report_day.isoformat()}"
@@ -708,32 +601,26 @@ def send_owner_snapshot_email(
     msg["Subject"] = subject
 
     # Plain text fallback
-    msg.set_content(_build_plain_text_email(report_day, data_start, data_end))
+    msg.set_content(_build_plain_text_email(
+        report_day,
+        data_start,
+        data_end,
+        executive_summary,
+        store_summaries,
+    ))
 
     # HTML body
-    html = _build_html_email(
+    html_body = _build_html_email(
         report_day=report_day,
         data_start=data_start,
         data_end=data_end,
-        cards=cards,
-        pdf_count=len(existing_pdfs),
-        wave_src=wave_src,
+        executive_summary=executive_summary,
+        store_summaries=store_summaries,
     )
-    msg.add_alternative(html, subtype="html")
-
-    # Attach inline images to the HTML part
-    html_part = msg.get_payload()[-1]
-    for img in inline_images:
-        html_part.add_related(
-            img["bytes"],
-            maintype="image",
-            subtype=img["subtype"],
-            cid=img["cid"],  # keep brackets here
-            filename=img["filename"],
-        )
+    msg.add_alternative(html_body, subtype="html")
 
     # Attach PDFs
-    for path in existing_pdfs:
+    for path in sorted_pdfs:
         with open(path, "rb") as f:
             data = f.read()
 
@@ -753,5 +640,5 @@ def send_owner_snapshot_email(
 
     print(
         f"📧 Owner Snapshot emailed to {to_email} "
-        f"(PDFs: {len(existing_pdfs)}, Previews rendered: {preview_renders_used}, Inline images: {len(inline_images)})"
+        f"(PDFs: {len(existing_pdfs)}, Total size: {_human_file_size(total_size_bytes)}, Inline previews: disabled)"
     )

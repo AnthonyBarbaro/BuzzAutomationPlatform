@@ -606,7 +606,7 @@ brand_criteria = {
     'Stiiizy': {'vendors': [''],
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
            'discount': 0.4,
-           'kickback': 0.0,
+           'kickback': 0.28,
            'brands': ['Stiiizy |']},
     'Lyfe Sauce': {'vendors': ['DYVINEL, INC.'],
            'days': ['Friday'],

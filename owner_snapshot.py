@@ -30,6 +30,7 @@ from reportlab.platypus import (
     TableStyle,
     Image,
     PageBreak,
+    CondPageBreak,
     KeepTogether,
     Flowable,
 )
@@ -71,6 +72,9 @@ GENERATE_ALL_STORES_SUMMARY_PDF = True
 TREND_DAYS = 14
 TOP_N = 20
 CATEGORY_TOP_N = 10
+DAILY_UNITS_ROWS = 10
+CHART_DPI = 170
+CHART_JPEG_QUALITY = 86
 
 # --- Dutchie export header row ---
 FORCE_HEADER_ROW = True
@@ -266,6 +270,19 @@ def money(x: float) -> str:
         return f"${x:,.0f}"
     except Exception:
         return "$0"
+
+def money_compact(x: float) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        return "$0"
+    sign = "-" if v < 0 else ""
+    av = abs(v)
+    if av >= 1_000_000:
+        return f"{sign}${av / 1_000_000:.2f}M"
+    if av >= 1_000:
+        return f"{sign}${av / 1_000:.1f}k"
+    return f"{sign}${av:,.0f}"
 
 def money2(x: float) -> str:
     try:
@@ -1035,14 +1052,14 @@ def _try_import_sklearn():
 
 def _weekday_profile_baseline(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, float]:
     """
-    Smart fallback forecast if we can’t train ML yet.
-    Uses:
-      - MTD actual totals
-      - expected remaining days = weekday averages over last N days
+    Data-driven projection anchored to available daily data.
+    Prioritizes MTD weekday behavior, then recent trend, then wider weekday profile.
     """
     as_of_ts = pd.Timestamp(as_of)
     last_dom = _last_day_of_month(as_of)
     store = str(store_code)
+    days_in_month = last_dom.day
+    days_elapsed = max(as_of.day, 1)
 
     h = hist[(hist["store_code"] == store) & (hist["date"] <= as_of_ts)].copy().sort_values("date")
     mtd_start = pd.Timestamp(date(as_of.year, as_of.month, 1))
@@ -1053,52 +1070,123 @@ def _weekday_profile_baseline(hist: pd.DataFrame, store_code: str, as_of: date) 
     mtd_tickets = float(mtd["tickets"].sum()) if not mtd.empty else 0.0
     mtd_discount = float(mtd["discount"].sum()) if not mtd.empty else 0.0
 
-    # weekday means from last window
-    win_start = as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_WINDOW_DAYS - 1)
-    win = h[h["date"] >= win_start].copy()
-    if win.empty:
-        # no history at all: simplest pace
-        days_in_month = _last_day_of_month(as_of).day
-        pace = (mtd_net / as_of.day) if as_of.day else 0.0
-        total_net = pace * days_in_month
-        pace_p = (mtd_profit / as_of.day) if as_of.day else 0.0
-        total_profit = pace_p * days_in_month
-        pace_t = (mtd_tickets / as_of.day) if as_of.day else 0.0
-        total_tickets = pace_t * days_in_month
-        pace_d = (mtd_discount / as_of.day) if as_of.day else 0.0
-        total_discount = pace_d * days_in_month
+    if h.empty:
         return {
-            "net_pred": max(total_net, mtd_net),
-            "profit_pred": max(total_profit, mtd_profit),
-            "tickets_pred": max(total_tickets, mtd_tickets),
-            "discount_pred": max(total_discount, mtd_discount),
+            "net_pred": mtd_net,
+            "profit_pred": mtd_profit,
+            "tickets_pred": mtd_tickets,
+            "discount_pred": mtd_discount,
         }
 
-    win["wd"] = win["date"].dt.weekday
-    wd_means = win.groupby("wd").agg(
-        net=("net_revenue", "mean"),
-        profit=("profit", "mean"),
-        tickets=("tickets", "mean"),
-        discount=("discount", "mean"),
-    )
+    recent = h[h["date"] >= (as_of_ts - pd.Timedelta(days=13))].copy()
+    profile = h[h["date"] >= (as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_WINDOW_DAYS - 1))].copy()
+
+    def _weekday_means(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        tmp = df.copy()
+        tmp["wd"] = tmp["date"].dt.weekday
+        return tmp.groupby("wd").agg(
+            net=("net_revenue", "mean"),
+            profit=("profit", "mean"),
+            tickets=("tickets", "mean"),
+            discount=("discount", "mean"),
+        )
+
+    wd_mtd = _weekday_means(mtd)
+    wd_recent = _weekday_means(recent)
+    wd_profile = _weekday_means(profile)
+
+    mtd_obs_days = int(mtd["date"].nunique()) if not mtd.empty else 0
+    recent_obs_days = int(recent["date"].nunique()) if not recent.empty else 0
+    profile_obs_days = int(profile["date"].nunique()) if not profile.empty else 0
+
+    mtd_avg = {
+        "net": (mtd_net / mtd_obs_days) if mtd_obs_days else 0.0,
+        "profit": (mtd_profit / mtd_obs_days) if mtd_obs_days else 0.0,
+        "tickets": (mtd_tickets / mtd_obs_days) if mtd_obs_days else 0.0,
+        "discount": (mtd_discount / mtd_obs_days) if mtd_obs_days else 0.0,
+    }
+    recent_avg = {
+        "net": (float(recent["net_revenue"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
+        "profit": (float(recent["profit"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
+        "tickets": (float(recent["tickets"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
+        "discount": (float(recent["discount"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
+    }
+    profile_avg = {
+        "net": (float(profile["net_revenue"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
+        "profit": (float(profile["profit"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
+        "tickets": (float(profile["tickets"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
+        "discount": (float(profile["discount"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
+    }
+
+    def _pick_metric_for_weekday(metric_key: str, wd: int) -> float:
+        vals: List[Tuple[float, float]] = []
+        if wd in wd_mtd.index:
+            w = 0.58 if mtd_obs_days >= 7 else 0.40
+            vals.append((float(wd_mtd.loc[wd, metric_key]), w))
+        if wd in wd_recent.index:
+            vals.append((float(wd_recent.loc[wd, metric_key]), 0.24))
+        if wd in wd_profile.index:
+            vals.append((float(wd_profile.loc[wd, metric_key]), 0.18))
+
+        if vals:
+            w_sum = sum(w for _, w in vals)
+            if w_sum > 0:
+                return sum(v * w for v, w in vals) / w_sum
+
+        # Fallback to observed daily averages.
+        if recent_obs_days:
+            return recent_avg[metric_key]
+        if mtd_obs_days:
+            return mtd_avg[metric_key]
+        return profile_avg[metric_key]
 
     # remaining dates
     rem_net = rem_profit = rem_tickets = rem_discount = 0.0
     cur = as_of + timedelta(days=1)
     while cur <= last_dom:
         wd = cur.weekday()
-        if wd in wd_means.index:
-            rem_net += float(wd_means.loc[wd, "net"])
-            rem_profit += float(wd_means.loc[wd, "profit"])
-            rem_tickets += float(wd_means.loc[wd, "tickets"])
-            rem_discount += float(wd_means.loc[wd, "discount"])
+        rem_net += _pick_metric_for_weekday("net", wd)
+        rem_profit += _pick_metric_for_weekday("profit", wd)
+        rem_tickets += _pick_metric_for_weekday("tickets", wd)
+        rem_discount += _pick_metric_for_weekday("discount", wd)
         cur += timedelta(days=1)
 
+    # Trend adjustment from MTD acceleration/deceleration (bounded).
+    trend_factor = 1.0
+    if mtd_obs_days >= 10:
+        mtd_sorted = mtd.sort_values("date")
+        last7 = mtd_sorted.tail(7)
+        prev7 = mtd_sorted.iloc[-14:-7]
+        prev_avg_net = float(prev7["net_revenue"].mean()) if not prev7.empty else 0.0
+        last_avg_net = float(last7["net_revenue"].mean()) if not last7.empty else 0.0
+        if prev_avg_net > 0:
+            trend_factor = float(np.clip(last_avg_net / prev_avg_net, 0.85, 1.15))
+
+    rem_net *= trend_factor
+    rem_profit *= trend_factor
+    rem_tickets *= trend_factor
+    rem_discount *= trend_factor
+
+    # Blend weekday-pattern projection with straight MTD pace.
+    # Weight increases as month observation depth improves.
+    pattern_weight = float(np.clip(0.35 + (mtd_obs_days * 0.035), 0.35, 0.80))
+    pace_net = (mtd_net / days_elapsed) * days_in_month
+    pace_profit = (mtd_profit / days_elapsed) * days_in_month
+    pace_tickets = (mtd_tickets / days_elapsed) * days_in_month
+    pace_discount = (mtd_discount / days_elapsed) * days_in_month
+
+    weekday_net = mtd_net + rem_net
+    weekday_profit = mtd_profit + rem_profit
+    weekday_tickets = mtd_tickets + rem_tickets
+    weekday_discount = mtd_discount + rem_discount
+
     return {
-        "net_pred": max(mtd_net + rem_net, mtd_net),
-        "profit_pred": max(mtd_profit + rem_profit, mtd_profit),
-        "tickets_pred": max(mtd_tickets + rem_tickets, mtd_tickets),
-        "discount_pred": max(mtd_discount + rem_discount, mtd_discount),
+        "net_pred": max((pattern_weight * weekday_net) + ((1.0 - pattern_weight) * pace_net), mtd_net),
+        "profit_pred": max((pattern_weight * weekday_profit) + ((1.0 - pattern_weight) * pace_profit), mtd_profit),
+        "tickets_pred": max((pattern_weight * weekday_tickets) + ((1.0 - pattern_weight) * pace_tickets), mtd_tickets),
+        "discount_pred": max((pattern_weight * weekday_discount) + ((1.0 - pattern_weight) * pace_discount), mtd_discount),
     }
 
 class MonthEndForecaster:
@@ -1265,7 +1353,18 @@ class MonthEndForecaster:
                 p10_profit = float(self.q_models["profit"]["p10"].predict(X1)[0])
                 p90_profit = float(self.q_models["profit"]["p90"].predict(X1)[0])
 
-            model_name = self.meta.get("model_name", "ML")
+            model_name = f"{self.meta.get('model_name', 'ML')} + adaptive pace"
+
+            # Anchor ML outputs to current observed pace so projections stay responsive.
+            base = _weekday_profile_baseline(hist, store, as_of)
+            pct_elapsed = float(np.clip(feats.get("pct_elapsed", 0.0), 0.0, 1.0))
+            data_w = 0.45 + (0.30 * pct_elapsed)   # 45% early month -> 75% late month
+            ml_w = 1.0 - data_w
+
+            net_pred = (ml_w * net_pred) + (data_w * float(base["net_pred"]))
+            profit_pred = (ml_w * profit_pred) + (data_w * float(base["profit_pred"]))
+            tickets_pred = (ml_w * tickets_pred) + (data_w * float(base["tickets_pred"]))
+            discount_pred = (ml_w * discount_pred) + (data_w * float(base["discount_pred"]))
 
         # Clamp totals >= MTD actuals
         net_pred = max(net_pred, mtd_net)
@@ -1794,6 +1893,35 @@ def compute_breakdown_net(
         out = out.head(top_n)
     return out
 
+def compute_breakdown_units(
+    df: pd.DataFrame,
+    group_candidates: List[str],
+    start: date,
+    end: date,
+    top_n: Optional[int] = 10,
+) -> Optional[pd.DataFrame]:
+    group_col = find_col(df, group_candidates)
+    qty_col = find_col(df, COLUMN_CANDIDATES["quantity"])
+    if not group_col:
+        return None
+
+    tmp = _filter_df_date_range(df, start, end)
+    if tmp.empty:
+        return pd.DataFrame(columns=[group_col, "units_sold"])
+
+    if qty_col:
+        tmp["_qty"] = to_number(tmp[qty_col]).fillna(0).astype(float)
+    else:
+        # Fallback when quantity is missing in export.
+        tmp["_qty"] = 1.0
+    tmp[group_col] = tmp[group_col].fillna("Unknown").astype(str)
+
+    out = tmp.groupby(group_col, as_index=False)["_qty"].sum().rename(columns={"_qty": "units_sold"})
+    out = out.sort_values("units_sold", ascending=False)
+    if top_n is not None:
+        out = out.head(top_n)
+    return out
+
 def compute_brand_summary(
     df: pd.DataFrame,
     start: date,
@@ -2127,14 +2255,47 @@ def compute_hourly_metrics(df: pd.DataFrame, day: date) -> Optional[pd.DataFrame
 
 def _mpl_setup():
     plt.rcParams.update({
-        "font.size": 8.3,
-        "axes.titlesize": 10.2,
+        "font.size": 8.6,
+        "axes.titlesize": 11.0,
         "axes.labelsize": 8.0,
         "axes.edgecolor": "#D1D5DB",
-        "axes.linewidth": 0.8,
+        "axes.linewidth": 0.7,
+        "axes.titleweight": "bold",
+        "axes.facecolor": "#F9FAFB",
+        "figure.facecolor": "#FFFFFF",
         "grid.color": "#E5E7EB",
-        "grid.linewidth": 0.8,
+        "grid.linewidth": 0.7,
+        "grid.alpha": 0.9,
+        "xtick.color": "#374151",
+        "ytick.color": "#374151",
     })
+
+def _save_chart_image(buf: BytesIO) -> None:
+    """
+    Save chart bytes with lightweight defaults so PDFs open/download faster.
+    Falls back to PNG if JPEG save is unavailable.
+    """
+    try:
+        plt.savefig(
+            buf,
+            format="jpeg",
+            dpi=CHART_DPI,
+            bbox_inches="tight",
+            pad_inches=0.14,
+            pil_kwargs={
+                "quality": CHART_JPEG_QUALITY,
+                "optimize": True,
+                "progressive": True,
+                "subsampling": 0,
+            },
+        )
+    except TypeError:
+        # Older matplotlib versions may not support pil_kwargs.
+        plt.savefig(buf, format="jpeg", dpi=CHART_DPI, bbox_inches="tight", pad_inches=0.14)
+    except Exception:
+        buf.seek(0)
+        buf.truncate(0)
+        plt.savefig(buf, format="png", dpi=CHART_DPI, bbox_inches="tight", pad_inches=0.14)
 
 def chart_trend_bar_with_labels(
     daily: pd.DataFrame,
@@ -2142,6 +2303,7 @@ def chart_trend_bar_with_labels(
     title: str,
     days: int = 14,
     kind: str = "money",
+    figsize: Tuple[float, float] = (7.3, 3.2),
 ) -> BytesIO:
     _mpl_setup()
     buf = BytesIO()
@@ -2149,31 +2311,71 @@ def chart_trend_bar_with_labels(
         return buf
 
     tail = daily.tail(days).copy()
-    labels = [f"{d.isoformat()} {dow_short(d)}" for d in tail["date"].tolist()]
+    labels = [f"{d.month}/{d.day} {dow_short(d)}" for d in tail["date"].tolist()]
     values = tail[value_col].fillna(0).astype(float).tolist()
+    dense_labels = len(values) >= 10
 
-    plt.figure(figsize=(7.25, 2.25))
-    plt.bar(range(len(labels)), values, color=HEX_GREEN)
+    fig, ax = plt.subplots(figsize=figsize)
+    x = list(range(len(labels)))
+    ax.bar(
+        x,
+        values,
+        color=HEX_GREEN,
+        edgecolor="#047857",
+        linewidth=0.45,
+        alpha=0.95,
+        zorder=2,
+    )
+    if values:
+        ax.plot(x, values, color="#111827", linewidth=1.25, alpha=0.78, marker="o", markersize=3.2, zorder=3)
 
-    plt.title(title)
-    plt.xticks(range(len(labels)), labels, rotation=35, ha="right", fontsize=7.2)
-    plt.grid(True, axis="y", alpha=1.0)
-    plt.tight_layout()
+    ax.set_title(title, pad=22)
+    label_font = 7.2 if len(labels) > 10 else 7.6
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=label_font)
+    ax.tick_params(axis="x", pad=4)
+    ax.tick_params(axis="y", pad=4)
+    ax.grid(True, axis="y", zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.margins(x=0.01)
+    if values:
+        vmin = min(values)
+        vmax = max(values)
+        y_low = min(0.0, vmin * 1.08)
+        y_high = (vmax * (1.62 if dense_labels else 1.44)) if vmax > 0 else 1.0
+        if y_high <= y_low:
+            y_high = y_low + 1.0
+        ax.set_ylim(y_low, y_high)
+
+    fig.subplots_adjust(left=0.06, right=0.992, bottom=0.31, top=0.76)
 
     if values:
         vmax = max(values)
-        pad = (vmax * 0.02) if vmax else 1.0
+        base_pad = (vmax * 0.03) if vmax else 1.0
+        alt_pad = base_pad * 2.0 if dense_labels else base_pad * 1.35
         for i, v in enumerate(values):
             if kind == "money":
-                txt = money(v)
+                txt = money_compact(v) if dense_labels else money(v)
             elif kind == "int":
                 txt = f"{int(v):,}"
             else:
                 txt = pct1(v)
-            plt.text(i, v + pad, txt, ha="center", va="bottom", fontsize=7.2)
+            label_y = v + (alt_pad if dense_labels and (i % 2 == 1) else base_pad)
+            ax.text(
+                i,
+                label_y,
+                txt,
+                ha="center",
+                va="bottom",
+                fontsize=7.0 if dense_labels else 8.1,
+                fontweight="bold",
+                color="#111827",
+                clip_on=False,
+            )
 
-    plt.savefig(buf, format="png", dpi=190)
-    plt.close()
+    _save_chart_image(buf)
+    plt.close(fig)
     buf.seek(0)
     return buf
 
@@ -2183,7 +2385,7 @@ def chart_rank_barh(
     value_col: str,
     title: str,
     top_n: int = 10,
-    figsize: Tuple[float, float] = (7.25, 2.7),
+    figsize: Tuple[float, float] = (7.3, 3.15),
 ) -> BytesIO:
     _mpl_setup()
     buf = BytesIO()
@@ -2194,15 +2396,52 @@ def chart_rank_barh(
     labels = d[label_col].astype(str).tolist()[::-1]
     values = d[value_col].astype(float).tolist()[::-1]
 
-    plt.figure(figsize=figsize)
-    plt.barh(range(len(labels)), values, color=HEX_GREEN)
-    plt.title(title)
-    plt.yticks(range(len(labels)), labels, fontsize=7.6)
-    plt.grid(True, axis="x", alpha=1.0)
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=figsize)
+    y = list(range(len(labels)))
+    bars = ax.barh(
+        y,
+        values,
+        color=HEX_GREEN,
+        edgecolor="#047857",
+        linewidth=0.45,
+        alpha=0.95,
+        zorder=2,
+    )
+    ax.set_title(title, pad=16)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8.2)
+    ax.tick_params(axis="x", pad=5)
+    ax.grid(True, axis="x", zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.margins(y=0.08)
 
-    plt.savefig(buf, format="png", dpi=190)
-    plt.close()
+    max_val = max(values) if values else 0.0
+    pad = max_val * 0.012 if max_val else 1.0
+    for bar, val in zip(bars, values):
+        ax.text(
+            val + pad,
+            bar.get_y() + (bar.get_height() / 2.0),
+            money(val),
+            va="center",
+            ha="left",
+            fontsize=7.4,
+            fontweight="bold",
+            color="#111827",
+            clip_on=False,
+            bbox={"facecolor": "#FFFFFF", "edgecolor": "#E5E7EB", "boxstyle": "round,pad=0.12", "alpha": 0.72},
+        )
+    if max_val > 0:
+        # Keep bars visually fuller; avoid excess empty right-side space.
+        ax.set_xlim(0, max_val * 1.18)
+
+    max_label_len = max((len(lbl) for lbl in labels), default=10)
+    left_margin = min(max(0.14, 0.095 + (max_label_len * 0.006)), 0.24)
+    fig.subplots_adjust(left=left_margin, right=0.97, bottom=0.16, top=0.80)
+
+    _save_chart_image(buf)
+    plt.close(fig)
     buf.seek(0)
     return buf
 
@@ -2212,7 +2451,7 @@ def chart_hourly_shadow_compare(
     metric_col: str,
     title: str,
     kind: str,
-    figsize: Tuple[float, float] = (3.55, 2.15),
+    figsize: Tuple[float, float] = (7.3, 2.85),
 ) -> BytesIO:
     _mpl_setup()
     buf = BytesIO()
@@ -2241,25 +2480,42 @@ def chart_hourly_shadow_compare(
 
     x = list(range(len(hours)))
 
-    plt.figure(figsize=figsize)
-    plt.bar(
-        x, last_vals_plot, width=0.82, color=HEX_YELLOW, alpha=0.35,
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.bar(
+        x, last_vals_plot, width=0.72, color=HEX_YELLOW, alpha=0.35,
         edgecolor=HEX_BLACK, linewidth=0.4, label="Last Week", zorder=1,
     )
-    plt.bar(
-        x, this_vals_plot, width=0.52, color=HEX_GREEN, alpha=1.0,
+    ax.bar(
+        x, this_vals_plot, width=0.46, color=HEX_GREEN, alpha=1.0,
         edgecolor=HEX_BLACK, linewidth=0.3, label="Report Day", zorder=2,
     )
 
-    xt = [fmt_hour_ampm(h) for h in hours]
-    plt.xticks(x, xt, fontsize=7.2)
-    plt.title(title)
-    plt.grid(True, axis="y", alpha=1.0, zorder=0)
-    # plt.legend(loc="upper right", frameon=False, fontsize=6)
-    plt.tight_layout()
+    if len(hours) > 14:
+        tick_idx = [i for i, h in enumerate(hours) if (h % 2 == 0) or (i == len(hours) - 1)]
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels([fmt_hour_ampm(hours[i]) for i in tick_idx], fontsize=8.0)
+    else:
+        ax.set_xticks(x)
+        ax.set_xticklabels([fmt_hour_ampm(h) for h in hours], fontsize=8.0)
+    ax.set_title(title, pad=18)
+    ax.grid(True, axis="y", zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    y_max = max(this_vals_plot + last_vals_plot + [0.0])
+    if y_max > 0:
+        ax.set_ylim(0, y_max * 1.24)
+    ax.legend(
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.03),
+        ncol=2,
+        frameon=False,
+        fontsize=7.0,
+        borderaxespad=0.0,
+    )
+    fig.subplots_adjust(left=0.06, right=0.992, bottom=0.24, top=0.78)
 
-    plt.savefig(buf, format="png", dpi=190)
-    plt.close()
+    _save_chart_image(buf)
+    plt.close(fig)
     buf.seek(0)
     return buf
 
@@ -2666,9 +2922,10 @@ def build_store_pdf(
     net_trend = chart_trend_bar_with_labels(
         trend,
         "net_revenue",
-        f"Net Sales Trend (Last {len(trend)} Days)",
+        f"Net Sales Trend ({len(trend)} Days)",
         days=len(trend),
         kind="money",
+        figsize=(7.3, 3.2),
     )
 
     hourly_today = compute_hourly_metrics(df_raw, end_day)
@@ -2684,15 +2941,29 @@ def build_store_pdf(
             "hour", "net_revenue", "profit", "profit_real",
             "tickets", "basket", "margin", "margin_real"
         ])
-    ch_rev = chart_hourly_shadow_compare(hourly_today, hourly_last, "net_revenue", "Revenue by Hour", "money", (3.55, 2.15))
-    ch_tix = chart_hourly_shadow_compare(hourly_today, hourly_last, "tickets", "Tickets by Hour", "int", (3.55, 2.15))
-    ch_profit = chart_hourly_shadow_compare(hourly_today, hourly_last, "profit", "Profit by Hour", "money", (3.55, 2.15))
-    ch_basket = chart_hourly_shadow_compare(hourly_today, hourly_last, "basket", "Basket by Hour", "money", (3.55, 2.15))
-    ch_margin_kb = chart_hourly_shadow_compare(hourly_today, hourly_last, "margin", "Kickback Margin by Hour", "pct", (3.55, 2.15))
-    ch_margin_real = chart_hourly_shadow_compare(hourly_today, hourly_last, "margin_real", "Real Margin by Hour", "pct", (3.55, 2.15))
+    hourly_figsize = (7.3, 2.85)
+    ch_rev = chart_hourly_shadow_compare(hourly_today, hourly_last, "net_revenue", "Revenue by Hour", "money", hourly_figsize)
+    ch_tix = chart_hourly_shadow_compare(hourly_today, hourly_last, "tickets", "Tickets by Hour", "int", hourly_figsize)
+    ch_profit = chart_hourly_shadow_compare(hourly_today, hourly_last, "profit", "Profit by Hour", "money", hourly_figsize)
+    ch_basket = chart_hourly_shadow_compare(hourly_today, hourly_last, "basket", "Basket by Hour", "money", hourly_figsize)
+    ch_margin_kb = chart_hourly_shadow_compare(hourly_today, hourly_last, "margin", "Kickback Margin by Hour", "pct", hourly_figsize)
 
     prod_day = compute_breakdown_net(df_raw, COLUMN_CANDIDATES["product"], end_day, end_day, top_n=TOP_N)
     brand_day = compute_brand_summary(df_raw, end_day, end_day, top_n=TOP_N)
+    units_day_source = df_raw
+    category_col = find_col(df_raw, COLUMN_CANDIDATES["category"])
+    if category_col and category_col in df_raw.columns:
+        # Exclude accessories only for the daily units sold products table.
+        units_day_source = df_raw[
+            ~df_raw[category_col].fillna("").astype(str).str.contains(r"accessor", case=False, regex=True)
+        ].copy()
+    prod_units_day = compute_breakdown_units(
+        units_day_source,
+        COLUMN_CANDIDATES["product"],
+        end_day,
+        end_day,
+        top_n=DAILY_UNITS_ROWS,
+    )
 
     cat_today = compute_category_summary(df_raw, end_day, end_day)
     cat_mtd = compute_category_summary(df_raw, mtd_start, end_day)
@@ -2705,7 +2976,7 @@ def build_store_pdf(
             "product", "net_revenue",
             "Top Products (MTD)",
             top_n=TOP_N,
-            figsize=(7.25, 2.8),
+            figsize=(7.3, 4.05),
         )
 
     brand_mtd = compute_brand_summary(df_raw, mtd_start, end_day, top_n=TOP_N)
@@ -2716,7 +2987,7 @@ def build_store_pdf(
             "brand", "net_revenue",
             "Top Brands (MTD)",
             top_n=TOP_N,
-            figsize=(7.25, 2.8),
+            figsize=(7.3, 3.85),
         )
 
     bud_today = compute_budtender_summary(df_raw, end_day, end_day)
@@ -2728,16 +2999,7 @@ def build_store_pdf(
             bud_today, "budtender", "net_revenue",
             "Top Budtenders (Report Day)",
             top_n=min(TOP_N, len(bud_today)),
-            figsize=(7.25, 2.7),
-        )
-
-    bud_mtd_chart = BytesIO()
-    if bud_mtd is not None and not bud_mtd.empty:
-        bud_mtd_chart = chart_rank_barh(
-            bud_mtd, "budtender", "net_revenue",
-            "Top Budtenders (MTD)",
-            top_n=min(TOP_N, len(bud_mtd)),
-            figsize=(7.25, 2.7),
+            figsize=(7.3, 3.0),
         )
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -2748,6 +3010,7 @@ def build_store_pdf(
         rightMargin=PAGE_MARGINS["right"],
         topMargin=PAGE_MARGINS["top"],
         bottomMargin=PAGE_MARGINS["bottom"],
+        pageCompression=1,
         title=f"{abbr} Owner Snapshot - {label}",
         author="Buzz Automation",
     )
@@ -2805,7 +3068,7 @@ def build_store_pdf(
 
     story.append(KeepTogether([
         Paragraph("Trends", styles["Section"]),
-        Image(net_trend, width=7.25 * inch, height=2.25 * inch) if net_trend.getbuffer().nbytes > 0 else Spacer(1, 0),
+        Image(net_trend, width=7.3 * inch, height=3.2 * inch) if net_trend.getbuffer().nbytes > 0 else Spacer(1, 0),
     ]))
     story.append(Spacer(1, SPACER["xs"]))
 
@@ -2813,32 +3076,14 @@ def build_store_pdf(
         f"Hourly Snapshot (Report Day vs {last_week_day.isoformat()} {dow_short(last_week_day)})",
         styles["Section"],
     ))
-    hourly_grid = Table(
-        [[
-            Image(ch_rev, width=3.55*inch, height=2.15*inch) if ch_rev.getbuffer().nbytes > 0 else Spacer(1, 0),
-            Image(ch_tix, width=3.55*inch, height=2.15*inch) if ch_tix.getbuffer().nbytes > 0 else Spacer(1, 0),
-        ]],
-        colWidths=[3.8*inch, 3.8*inch],
-    )
-    hourly_grid.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    hourly_container = Table(
-    [[hourly_grid]],
-    colWidths=[6.8 * inch]
-)
+    hourly_img_w = 7.3 * inch
+    hourly_img_h = 2.85 * inch
+    story.append(Image(ch_rev, width=hourly_img_w, height=hourly_img_h) if ch_rev.getbuffer().nbytes > 0 else Spacer(1, 0))
+    story.append(Spacer(1, 0.10 * inch))
+    story.append(Image(ch_tix, width=hourly_img_w, height=hourly_img_h) if ch_tix.getbuffer().nbytes > 0 else Spacer(1, 0))
 
-    hourly_container.setStyle(TableStyle([
-        ("LEFTPADDING", (0,0), (-1,-1), 0.25*inch),
-        ("RIGHTPADDING", (0,0), (-1,-1), 0.25*inch),]))
-    story.append(hourly_container)
-
-    story.append(PageBreak())
-    story.append(Spacer(1, 0.25 * inch))
+    story.append(CondPageBreak(6.8 * inch))
+    story.append(Spacer(1, 0.12 * inch))
     story.append(Paragraph("Hourly Performance", styles["TitleBig"]))
     story.append(Spacer(1, 0.05 * inch))
 
@@ -2851,29 +3096,13 @@ def build_store_pdf(
     story.append(Spacer(1, 0.12 * inch))
     story.append(Spacer(1, SPACER["sm"]))
 
-    hourly_grid2 = Table(
-        [
-            [
-                Image(ch_profit, width=3.55*inch, height=2.15*inch) if ch_profit.getbuffer().nbytes > 0 else Spacer(1, 0),
-                Image(ch_basket, width=3.55*inch, height=2.15*inch) if ch_basket.getbuffer().nbytes > 0 else Spacer(1, 0),
-            ],
-            [
-                Image(ch_margin_kb, width=3.55*inch, height=2.15*inch) if ch_margin_kb.getbuffer().nbytes > 0 else Spacer(1, 0),
-                Image(ch_margin_real, width=3.55*inch, height=2.15*inch) if ch_margin_real.getbuffer().nbytes > 0 else Spacer(1, 0),
-            ],
-        ],
-        colWidths=[3.8*inch, 3.8*inch],
-    )
-    hourly_grid2.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    story.append(hourly_grid2)
+    hourly_perf_charts = [ch_profit, ch_basket, ch_margin_kb]
+    for idx, hourly_chart in enumerate(hourly_perf_charts):
+        story.append(Image(hourly_chart, width=hourly_img_w, height=hourly_img_h) if hourly_chart.getbuffer().nbytes > 0 else Spacer(1, 0))
+        if idx < len(hourly_perf_charts) - 1:
+            story.append(Spacer(1, 0.10 * inch))
 
-    story.append(PageBreak())
+    story.append(CondPageBreak(6.2 * inch))
     story.append(Paragraph("Drivers", styles["TitleBig"]))
     story.append(Paragraph("Major Categories + Products + Brands (Daily + MTD).", styles["Tiny"]))
     story.append(Spacer(1, SPACER["sm"]))
@@ -2884,6 +3113,19 @@ def build_store_pdf(
 
     if cat_mtd is not None and not cat_mtd.empty:
         story += build_category_summary_table(styles, cat_mtd, "Major Category Summary — MTD", top_n=CATEGORY_TOP_N)
+        story.append(Spacer(1, SPACER["sm"]))
+
+    if prod_units_day is not None and not prod_units_day.empty:
+        prod_units_day_rows = [[str(r[0]), f"{int(round(float(r.units_sold))):,}"] for r in prod_units_day.itertuples(index=False)]
+        story.append(Paragraph(
+            f"Top Products by Units — Report Day ({end_day.isoformat()} {dow_short(end_day)})",
+            styles["Section"],
+        ))
+        story.append(build_table(
+            ["Product", "Units Sold"],
+            prod_units_day_rows,
+            [5.85 * inch, 1.4 * inch],
+        ))
         story.append(Spacer(1, SPACER["sm"]))
 
     if prod_day is not None and not prod_day.empty:
@@ -2910,9 +3152,9 @@ def build_store_pdf(
         prod_rows = [[str(r[0]), money(float(r.net_revenue))] for r in prod_mtd.itertuples(index=False)]
         story.append(KeepTogether([
             Paragraph("Top Products (MTD)", styles["Section"]),
-            Image(prod_chart, width=7.25 * inch, height=2.8 * inch),
-            build_table(["Product", "MTD Net"], prod_rows, [5.85*inch, 1.4*inch]),
+            Image(prod_chart, width=7.3 * inch, height=4.05 * inch),
         ]))
+        story.append(build_table(["Product", "MTD Net"], prod_rows, [5.85*inch, 1.4*inch]))
         story.append(Spacer(1, SPACER["sm"]))
 
     if brand_mtd is not None and not brand_mtd.empty and brand_chart.getbuffer().nbytes > 0:
@@ -2920,11 +3162,11 @@ def build_store_pdf(
         compact=True,decimals=1),] for r in brand_mtd.itertuples(index=False)]
         story.append(KeepTogether([
             Paragraph("Top Brands (MTD)", styles["Section"]),
-            Image(brand_chart, width=7.25 * inch, height=2.8 * inch),
-            build_table(["Brand", "MTD Net", "Avg Margin"], brand_rows, [4.65 * inch, 1.4 * inch, 1.55 * inch]),
+            Image(brand_chart, width=7.3 * inch, height=3.85 * inch),
         ]))
+        story.append(build_table(["Brand", "MTD Net", "Avg Margin"], brand_rows, [4.65 * inch, 1.4 * inch, 1.55 * inch]))
 
-    story.append(PageBreak())
+    story.append(CondPageBreak(5.4 * inch))
     story.append(Paragraph("Staff Performance", styles["TitleBig"]))
     story.append(Paragraph("Budtenders — Report Day and MTD (full lists).", styles["Tiny"]))
     story.append(Spacer(1, SPACER["sm"]))
@@ -2935,7 +3177,7 @@ def build_store_pdf(
             styles["Section"],
         ))
         if bud_today_chart.getbuffer().nbytes > 0:
-            story.append(Image(bud_today_chart, width=7.25*inch, height=2.7*inch))
+            story.append(Image(bud_today_chart, width=7.3 * inch, height=3.0 * inch))
 
         bud_today_rows = []
         for r in bud_today.itertuples(index=False):
@@ -2955,8 +3197,6 @@ def build_store_pdf(
 
     if bud_mtd is not None and not bud_mtd.empty:
         story.append(Paragraph("Budtenders — MTD", styles["Section"]))
-        if bud_mtd_chart.getbuffer().nbytes > 0:
-            story.append(Image(bud_mtd_chart, width=7.25*inch, height=2.7*inch))
 
         bud_mtd_rows = []
         for r in bud_mtd.itertuples(index=False):
@@ -2996,6 +3236,7 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
         rightMargin=PAGE_MARGINS["right"],
         topMargin=PAGE_MARGINS["top"],
         bottomMargin=PAGE_MARGINS["bottom"],
+        pageCompression=1,
         title=f"All Stores Owner Snapshot - {end_day.isoformat()}",
         author="Buzz Automation",
     )
@@ -3058,10 +3299,10 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
 
     if store_rank:
         rank_df = pd.DataFrame(store_rank, columns=["store", "net_revenue"]).sort_values("net_revenue", ascending=False)
-        rank_chart = chart_rank_barh(rank_df, "store", "net_revenue", "Store Ranking (MTD Net Sales)", top_n=min(10, len(rank_df)), figsize=(7.25, 2.7))
+        rank_chart = chart_rank_barh(rank_df, "store", "net_revenue", "Store Ranking (MTD Net Sales)", top_n=min(10, len(rank_df)), figsize=(7.3, 3.05))
         story.append(KeepTogether([
             Paragraph("MTD Ranking", styles["Section"]),
-            Image(rank_chart, width=7.25 * inch, height=2.7 * inch),
+            Image(rank_chart, width=7.3 * inch, height=3.05 * inch),
         ]))
         story.append(Spacer(1, SPACER["sm"]))
 
@@ -3091,13 +3332,16 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
         if all_fc:
             # Summary table
             rows = [
+                ["Projection Method", str(all_fc.get("model", "adaptive pace"))],
                 ["MTD Net Revenue", money(all_fc["mtd_net"])],
                 ["Projected Month Net Revenue", money(all_fc["net_pred"])],
+                ["Projected Remaining Net", money(all_fc["remaining_net"])],
                 ["MTD Net Profit", money(all_fc["mtd_profit"])],
                 ["Projected Month Net Profit", money(all_fc["profit_pred"])],
                 ["Projected Month Margin", pct1(all_fc["margin_pred"])],
                 ["Remaining Days", str(all_fc["remaining_days"])],
-                ["Required Net / Day (remaining)", money(all_fc["req_net_per_day"])],
+                ["Projected Net / Day (remaining)", money(all_fc["req_net_per_day"])],
+                ["Projected Profit / Day (remaining)", money(all_fc["req_profit_per_day"])],
             ]
 
             if all_fc.get("net_p10") is not None and all_fc.get("net_p90") is not None:
@@ -3218,7 +3462,15 @@ def main():
         out_pdf = pdf_run_dir / safe_filename(
             f"{abbr} - Owner Snapshot - {store_label(store_name)} - {end_day.isoformat()}.pdf"
         )
-        build_store_pdf(out_pdf, store_name, abbr, df_raw, daily, start_day, end_day)
+        build_store_pdf(
+            out_pdf,
+            store_name,
+            abbr,
+            df_raw,
+            daily,
+            start_day,
+            end_day,
+        )
 
     if GENERATE_ALL_STORES_SUMMARY_PDF:
         out_pdf = pdf_run_dir / safe_filename(f"ALL STORES - Owner Snapshot - {end_day.isoformat()}.pdf")
@@ -3226,12 +3478,72 @@ def main():
 
 
     pdfs = sorted(str(p) for p in pdf_run_dir.glob("*.pdf"))
+    executive_summary: Dict[str, Any] = {}
+    store_summaries: List[Dict[str, Any]] = []
+
+    try:
+        mtd_start = month_start(end_day)
+        fc_stores = (forecast_bundle or {}).get("stores", {})
+
+        for store_name, abbr in store_abbr_map.items():
+            daily = store_daily_map.get(abbr)
+            if daily is None or daily.empty:
+                continue
+            s_today = metrics_for_day(daily, end_day)
+            s_mtd = metrics_for_range(daily, mtd_start, end_day)
+            s_fc = fc_stores.get(abbr, {}) if isinstance(fc_stores, dict) else {}
+            store_summaries.append({
+                "abbr": abbr,
+                "store_label": store_label(store_name),
+                "today_net": float(s_today.get("net_revenue", 0.0)),
+                "today_tickets": float(s_today.get("tickets", 0.0)),
+                "today_basket": float(s_today.get("basket", 0.0)),
+                "today_discount_rate": float(s_today.get("discount_rate", 0.0)),
+                "mtd_net": float(s_mtd.get("net_revenue", 0.0)),
+                "mtd_tickets": float(s_mtd.get("tickets", 0.0)),
+                "mtd_basket": float(s_mtd.get("basket", 0.0)),
+                "mtd_margin": float(s_mtd.get("margin", 0.0)),
+                "mtd_margin_real": float(s_mtd.get("margin_real", 0.0)),
+                "proj_month_net": float(s_fc.get("net_pred", 0.0)) if s_fc else 0.0,
+                "proj_month_profit": float(s_fc.get("profit_pred", 0.0)) if s_fc else 0.0,
+                "proj_margin": float(s_fc.get("margin_pred", 0.0)) if s_fc else 0.0,
+            })
+
+        all_daily = _aggregate_all_stores_daily(store_daily_map)
+        if all_daily is not None and not all_daily.empty:
+            all_today = metrics_for_day(all_daily, end_day)
+            all_mtd = metrics_for_range(all_daily, mtd_start, end_day)
+
+            executive_summary.update({
+                "today_net": float(all_today.get("net_revenue", 0.0)),
+                "today_tickets": float(all_today.get("tickets", 0.0)),
+                "today_basket": float(all_today.get("basket", 0.0)),
+                "today_discount_rate": float(all_today.get("discount_rate", 0.0)),
+                "mtd_net": float(all_mtd.get("net_revenue", 0.0)),
+                "mtd_tickets": float(all_mtd.get("tickets", 0.0)),
+                "mtd_basket": float(all_mtd.get("basket", 0.0)),
+                "mtd_margin": float(all_mtd.get("margin", 0.0)),
+            })
+
+        all_fc = (forecast_bundle or {}).get("stores", {}).get("ALL", {})
+        if all_fc:
+            executive_summary.update({
+                "proj_month_net": float(all_fc.get("net_pred", 0.0)),
+                "proj_month_profit": float(all_fc.get("profit_pred", 0.0)),
+                "proj_margin": float(all_fc.get("margin_pred", 0.0)),
+                "remaining_days": int(all_fc.get("remaining_days", 0)),
+            })
+    except Exception as e:
+        print(f"[EMAIL] WARN: Could not build executive summary: {e}")
+        executive_summary = {}
 
     send_owner_snapshot_email(
         pdf_paths=pdfs,
         report_day=end_day,
         data_start=start_day,
         data_end=end_day,
+        executive_summary=executive_summary,
+        store_summaries=store_summaries,
         to_email=[
         "anthony@buzzcannabis.com",
         # "ray@buzzcannabis.com",
