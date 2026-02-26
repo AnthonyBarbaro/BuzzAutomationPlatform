@@ -3546,9 +3546,12 @@ def main():
         store_summaries=store_summaries,
         to_email=[
         "anthony@buzzcannabis.com",
-        # "ray@buzzcannabis.com",
-        # "kevin@buzzcannabis.com",
+        "ray@buzzcannabis.com",
+        "kevin@buzzcannabis.com",
         # "joseph@buzzcannabis.com",
+        "stevei@buzzcannabis.com",
+        "andyhirmez@yahoo.com",
+        "stevegabbo@hotmail.com"
     ],
     )
     print("\nDone ✅")
