@@ -405,11 +405,18 @@ def _build_plain_text_email(
             "Store KPI Preview:",
         ]
         for s in sorted(store_summaries, key=lambda x: _store_sort_key(x.get("abbr", ""))):
+            lines.append(f"- {s.get('abbr','')}")
             lines.append(
-                f"- {s.get('abbr','')}: Today Net {_fmt_money(s.get('today_net'))}, "
-                f"Today Avg Ticket {_fmt_money(s.get('today_basket'))}, "
-                f"MTD Net {_fmt_money(s.get('mtd_net'))}, "
-                f"MTD Avg Ticket {_fmt_money(s.get('mtd_basket'))}"
+                f"  Today: Net {_fmt_money(s.get('today_net'))} | "
+                f"Tix {_fmt_int(s.get('today_tickets'))} | "
+                f"Avg {_fmt_money(s.get('today_basket'))}"
+            )
+            lines.append(
+                f"  MTD: Net {_fmt_money(s.get('mtd_net'))} | "
+                f"Tix {_fmt_int(s.get('mtd_tickets'))} | "
+                f"Avg {_fmt_money(s.get('mtd_basket'))} | "
+                f"Margin {_fmt_pct(s.get('mtd_margin'))} | "
+                f"Proj {_fmt_money(s.get('proj_month_net'))}"
             )
     lines += ["", "This email was generated automatically."]
     return "\n".join(lines)
@@ -433,7 +440,7 @@ def _build_html_email(
 
         def _add_perf_cell(label: str, value: str) -> None:
             perf_cells.append(
-                f"<td style=\"padding:10px;border:1px solid {BUZZ['border']};background:#FFFFFF;\">"
+                f"<td width=\"50%\" style=\"padding:10px;border:1px solid {BUZZ['border']};background:#FFFFFF;\">"
                 f"<div style=\"font-size:11px;color:{BUZZ['muted2']};font-weight:700;\">{_esc(label)}</div>"
                 f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(value)}</div>"
                 f"</td>"
@@ -453,8 +460,13 @@ def _build_html_email(
         _add_perf_cell("Remaining Days", _fmt_int(executive_summary.get("remaining_days")))
 
         perf_rows = ""
-        for i in range(0, len(perf_cells), 4):
-            perf_rows += f"<tr>{''.join(perf_cells[i:i + 4])}</tr>"
+        for i in range(0, len(perf_cells), 2):
+            row_cells = perf_cells[i:i + 2]
+            if len(row_cells) < 2:
+                row_cells.append(
+                    f"<td width=\"50%\" style=\"padding:10px;border:1px solid {BUZZ['border']};background:#FFFFFF;\"></td>"
+                )
+            perf_rows += f"<tr>{''.join(row_cells)}</tr>"
 
         perf_block = (
             f"<tr><td style=\"padding:0 20px 6px 20px;\">"
@@ -468,45 +480,68 @@ def _build_html_email(
 
     store_kpi_block = ""
     if store_summaries:
-        rows = ""
+        cards = ""
         sorted_stores = sorted(store_summaries, key=lambda s: _store_sort_key(s.get("abbr", "")))
         for idx, s in enumerate(sorted_stores):
-            bg = "#FFFFFF" if idx % 2 == 0 else BUZZ["soft"]
-            rows += (
-                f"<tr style=\"background:{bg};\">"
-                f"<td style=\"padding:8px 8px;font-size:11px;color:#111827;font-weight:800;border-bottom:1px solid {BUZZ['border']};white-space:nowrap;\">{_esc(s.get('abbr',''))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('today_net')))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_int(s.get('today_tickets')))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('today_basket')))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('mtd_net')))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_int(s.get('mtd_tickets')))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('mtd_basket')))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_pct(s.get('mtd_margin')))}</td>"
-                f"<td style=\"padding:8px 8px;font-size:10.8px;color:#111827;border-bottom:1px solid {BUZZ['border']};text-align:right;white-space:nowrap;\">{_esc(_fmt_money(s.get('proj_month_net')))}</td>"
+            card_bg = "#FFFFFF" if idx % 2 == 0 else BUZZ["soft"]
+            cards += (
+                f"<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" "
+                f"style=\"margin:0 0 10px 0;border:1px solid {BUZZ['border']};border-radius:10px;overflow:hidden;"
+                f"border-collapse:separate;border-spacing:0;background:{card_bg};\">"
+                f"<tr><td colspan=\"2\" style=\"padding:8px 10px;border-bottom:1px solid {BUZZ['border']};\">"
+                f"<span style=\"display:inline-block;padding:3px 9px;border-radius:999px;background:{BUZZ['green']};"
+                f"color:#FFFFFF;font-size:11px;font-weight:900;letter-spacing:0.3px;\">{_esc(s.get('abbr',''))}</span>"
+                f"</td></tr>"
+                f"<tr>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;border-right:1px solid {BUZZ['border']};border-bottom:1px solid {BUZZ['border']};\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">Today Net</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_money(s.get('today_net')))}</div>"
+                f"</td>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;border-bottom:1px solid {BUZZ['border']};\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">Today Tickets</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_int(s.get('today_tickets')))}</div>"
+                f"</td>"
                 f"</tr>"
+                f"<tr>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;border-right:1px solid {BUZZ['border']};border-bottom:1px solid {BUZZ['border']};\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">Today Avg Ticket</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_money(s.get('today_basket')))}</div>"
+                f"</td>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;border-bottom:1px solid {BUZZ['border']};\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">MTD Net</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_money(s.get('mtd_net')))}</div>"
+                f"</td>"
+                f"</tr>"
+                f"<tr>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;border-right:1px solid {BUZZ['border']};border-bottom:1px solid {BUZZ['border']};\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">MTD Tickets</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_int(s.get('mtd_tickets')))}</div>"
+                f"</td>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;border-bottom:1px solid {BUZZ['border']};\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">MTD Avg Ticket</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_money(s.get('mtd_basket')))}</div>"
+                f"</td>"
+                f"</tr>"
+                f"<tr>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;border-right:1px solid {BUZZ['border']};\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">MTD Margin</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_pct(s.get('mtd_margin')))}</div>"
+                f"</td>"
+                f"<td width=\"50%\" style=\"padding:9px 10px;\">"
+                f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">Projected Month Net</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_money(s.get('proj_month_net')))}</div>"
+                f"</td>"
+                f"</tr>"
+                f"</table>"
             )
 
         store_kpi_block = (
             f"<tr><td style=\"padding:0 20px 6px 20px;\">"
             f"<div style=\"font-size:14px;font-weight:900;color:#111827;\">Store KPI Preview</div>"
-            f"<div style=\"margin-top:3px;font-size:12px;color:{BUZZ['muted2']};\">Detailed net sales and avg-ticket metrics by store.</div>"
+            f"<div style=\"margin-top:3px;font-size:12px;color:{BUZZ['muted2']};\">Mobile-friendly KPI cards by store.</div>"
             f"</td></tr>"
             f"<tr><td style=\"padding:8px 20px 14px 20px;\">"
-            f"<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" "
-            f"style=\"border:1px solid {BUZZ['border']};border-radius:10px;overflow:hidden;border-collapse:separate;border-spacing:0;\">"
-            f"<tr style=\"background:#111827;\">"
-            f"<th align=\"left\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Store</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Today Net</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Today Tix</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Today Avg Tkt</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Net</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Tix</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Avg Tkt</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">MTD Margin</th>"
-            f"<th align=\"right\" style=\"padding:8px 8px;font-size:10px;color:{BUZZ['yellow']};\">Proj Net</th>"
-            f"</tr>"
-            f"{rows}"
-            f"</table></td></tr>"
+            f"{cards}</td></tr>"
         )
 
     html_body = f"""
@@ -518,8 +553,8 @@ def _build_html_email(
                    style="max-width:780px;background:{BUZZ['white']};border:1px solid {BUZZ['border']};border-radius:14px;overflow:hidden;">
               <tr>
                 <td style="background:{BUZZ['black']};padding:18px 20px;">
-                  <div style="color:{BUZZ['yellow']};font-size:19px;font-weight:900;letter-spacing:0.5px;">BUZZ CANNABIS</div>
-                  <div style="color:#FFFFFF;font-size:13px;margin-top:4px;">Owner Snapshot • {_esc(header_date)}</div>
+                  <div style="color:#FFFFFF;font-size:19px;font-weight:900;letter-spacing:0.5px;">BUZZ CANNABIS</div>
+                  <div style="color:#E5E7EB;font-size:13px;margin-top:4px;">Owner Snapshot • {_esc(header_date)}</div>
                 </td>
               </tr>
               <tr>
@@ -531,7 +566,7 @@ def _build_html_email(
               <tr>
                 <td style="padding:12px 20px;background:#111827;color:#9CA3AF;font-size:11px;line-height:1.5;">
                   Auto-generated by Buzz Automation • Reply to this email if any value looks off.
-                  <span style="color:{BUZZ['yellow']};font-weight:800;"> #Buzz</span>
+                  <span style="color:#FFFFFF;font-weight:800;"> #Buzz</span>
                 </td>
               </tr>
             </table>
