@@ -1,5 +1,6 @@
 import re
 import shutil
+import argparse
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta, date
@@ -1519,6 +1520,57 @@ def compute_date_window(backfill_days: int, tz_name: str) -> Tuple[date, date]:
     end_d = today - timedelta(days=1)
     start_d = end_d - timedelta(days=backfill_days - 1)
     return start_d, end_d
+
+def parse_iso_date(value: str) -> date:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid date '{value}'. Use YYYY-MM-DD.") from e
+
+def parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate owner snapshot PDFs and email summary."
+    )
+    parser.add_argument(
+        "--report-day",
+        type=parse_iso_date,
+        help="Report day/end date in YYYY-MM-DD (example: 2026-01-31).",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=parse_iso_date,
+        help="Explicit data-window start date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=parse_iso_date,
+        help="Explicit data-window end date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--backfill-days",
+        type=int,
+        default=BACKFILL_DAYS,
+        help=f"Window length when start date is omitted. Default: {BACKFILL_DAYS}.",
+    )
+    parser.add_argument(
+        "--run-export",
+        dest="run_export",
+        action="store_true",
+        help="Force Selenium export for the selected date window.",
+    )
+    parser.add_argument(
+        "--reuse-latest",
+        dest="run_export",
+        action="store_false",
+        help="Reuse archived raw exports instead of running Selenium.",
+    )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Generate PDFs only; skip sending email.",
+    )
+    parser.set_defaults(run_export=None)
+    return parser.parse_args()
 
 def month_start(d: date) -> date:
     return date(d.year, d.month, 1)
@@ -3386,6 +3438,7 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
 ###############################################################################
 
 def main():
+    args = parse_cli_args()
     setup_fonts()
 
     REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -3393,23 +3446,54 @@ def main():
     PDF_ROOT.mkdir(parents=True, exist_ok=True)
 
     abbr_to_file: Dict[str, Path] = {}
+    run_export = RUN_EXPORT if args.run_export is None else bool(args.run_export)
 
-    if RUN_EXPORT:
+    if args.backfill_days <= 0:
+        raise SystemExit("--backfill-days must be a positive integer.")
+
+    end_override = args.end_date or args.report_day
+    if args.report_day and args.end_date and args.report_day != args.end_date:
+        raise SystemExit("--report-day and --end-date must match when both are provided.")
+    if args.start_date and not end_override:
+        raise SystemExit("--start-date requires --end-date (or --report-day).")
+
+    if end_override:
+        end_day = end_override
+        if args.start_date:
+            start_day = args.start_date
+        else:
+            start_day = end_day - timedelta(days=args.backfill_days - 1)
+        if start_day > end_day:
+            raise SystemExit("Start date cannot be after end date.")
+        forced_range = True
+    else:
+        start_day, end_day = compute_date_window(args.backfill_days, REPORT_TZ)
+        forced_range = False
+
+    print(f"[RANGE] {start_day.isoformat()} -> {end_day.isoformat()} (report day: {end_day.isoformat()})")
+
+    if run_export:
         print("⚠️ RUN_EXPORT=True → Running Selenium export")
-        start_day, end_day = compute_date_window(BACKFILL_DAYS, REPORT_TZ)
         run_export_for_range(start_day, end_day)
         _, abbr_to_file = archive_exports(start_day, end_day)
     else:
         print("✅ RUN_EXPORT=False → Reusing latest raw export folder")
-        raw_folder = find_latest_raw_folder()
-        if raw_folder is None:
-            raise SystemExit("No raw export folders found in reports/raw_sales and RUN_EXPORT=False.")
-
-        parsed = parse_range_from_folder_name(raw_folder)
-        if parsed:
-            start_day, end_day = parsed
+        if forced_range:
+            raw_folder = RAW_ROOT / f"{start_day.isoformat()}_to_{end_day.isoformat()}"
+            if not raw_folder.exists():
+                raise SystemExit(
+                    f"Requested range folder not found: {raw_folder}\n"
+                    f"Run again with --run-export for this date window."
+                )
         else:
-            start_day, end_day = compute_date_window(BACKFILL_DAYS, REPORT_TZ)
+            raw_folder = find_latest_raw_folder()
+            if raw_folder is None:
+                raise SystemExit("No raw export folders found in reports/raw_sales and RUN_EXPORT=False.")
+
+            parsed = parse_range_from_folder_name(raw_folder)
+            if parsed:
+                start_day, end_day = parsed
+                print(f"[RANGE] Using folder window {start_day.isoformat()} -> {end_day.isoformat()}")
 
         for store_name, abbr in store_abbr_map.items():
             matches = list(raw_folder.glob(f"{abbr}*Sales Export*.xlsx"))
@@ -3537,25 +3621,28 @@ def main():
         print(f"[EMAIL] WARN: Could not build executive summary: {e}")
         executive_summary = {}
 
-    send_owner_snapshot_email(
-        pdf_paths=pdfs,
-        report_day=end_day,
-        data_start=start_day,
-        data_end=end_day,
-        executive_summary=executive_summary,
-        store_summaries=store_summaries,
-        to_email=[
-        "anthony@buzzcannabis.com",
-        "ray@buzzcannabis.com",
-        "kevin@buzzcannabis.com",
-        # "joseph@buzzcannabis.com",
-        "stevei@buzzcannabis.com",
-        "andyhirmez@yahoo.com",
-        "stevegabbo@hotmail.com"
-    ],
-    )
+    if args.no_email:
+        print("[EMAIL] Skipped (--no-email).")
+    else:
+        send_owner_snapshot_email(
+            pdf_paths=pdfs,
+            report_day=end_day,
+            data_start=start_day,
+            data_end=end_day,
+            executive_summary=executive_summary,
+            store_summaries=store_summaries,
+            to_email=[
+            "anthony@buzzcannabis.com",
+            "ray@buzzcannabis.com",
+            "kevin@buzzcannabis.com",
+            # "joseph@buzzcannabis.com",
+            "stevei@buzzcannabis.com",
+            "andyhirmez@yahoo.com",
+            "stevegabbo@hotmail.com"
+        ],
+        )
     print("\nDone ✅")
-
+#python owner_snapshot.py --report-day 2026-01-31 --run-export
 
 if __name__ == "__main__":
     main()
