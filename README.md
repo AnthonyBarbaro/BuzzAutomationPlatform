@@ -1,4 +1,4 @@
-# BuzzPythonGUI
+# BuzzAutomationPlatform
 
 Internal reporting and automation toolkit for Buzz Cannabis.
 
