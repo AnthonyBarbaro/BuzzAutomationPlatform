@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -16,7 +17,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, ElementClickInterceptedException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+)
 
 # Import your login credentials
 from login import username, password
@@ -26,10 +32,26 @@ from login import username, password
 # 1) Original script logic
 # ---------------------------------------------------------------------
 
+BLOCKING_SELECTORS = [
+    ".MuiBackdrop-root",
+    ".MuiSnackbar-root",
+    ".MuiAlert-root",
+    "div.notification",
+]
+
+LOADING_SELECTORS = [
+    "[data-testid='loading-spinner_icon']",
+    "[aria-label='Loading'][aria-valuetext='Loading']",
+]
+
 def launchBrowser():
     """Launch Chrome, go to the Dusk Closing Report page."""
     chrome_options = Options()
-    chrome_options.add_argument("start-maximized")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    if os.getenv("BUZZ_HEADLESS", "1") != "0":
+        chrome_options.add_argument("--headless=new")
     chrome_options.add_experimental_option("detach", True)
     chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
@@ -43,50 +65,258 @@ def login(driver):
     wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[data-testid='auth_input_password']"))).send_keys(password)
     login_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-testid='auth_button_go-green']")))
     login_button.click()
+    wait_for_reports_page_ready(driver)
+
+def wait_for_reports_page_ready(driver, timeout=40):
+    """Wait until the post-login report page is fully interactive."""
+    wait = WebDriverWait(driver, timeout)
+    try:
+        wait.until(lambda d: "closing-report/registers" in d.current_url)
+    except TimeoutException:
+        pass
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='header_select_location']")))
+
+def wait_for_blocking_ui_to_clear(driver, timeout=8):
+    """Wait briefly for overlays/snackbars that can intercept clicks."""
+    end = time.time() + timeout
+    while time.time() < end:
+        blocker_visible = False
+        for selector in BLOCKING_SELECTORS:
+            try:
+                elems = driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                elems = []
+            for elem in elems:
+                try:
+                    if elem.is_displayed():
+                        blocker_visible = True
+                        break
+                except StaleElementReferenceException:
+                    continue
+            if blocker_visible:
+                break
+        if not blocker_visible:
+            return True
+        time.sleep(0.2)
+    return False
+
+def is_loading_data_visible(driver):
+    """Return True if report-loading indicators are visible."""
+    for selector in LOADING_SELECTORS:
+        try:
+            elems = driver.find_elements(By.CSS_SELECTOR, selector)
+        except Exception:
+            elems = []
+        for elem in elems:
+            try:
+                if elem.is_displayed():
+                    return True
+            except StaleElementReferenceException:
+                continue
+
+    try:
+        text_nodes = driver.find_elements(
+            By.XPATH,
+            "//*[contains(normalize-space(), 'Loading data')]"
+        )
+    except Exception:
+        text_nodes = []
+    for node in text_nodes:
+        try:
+            if node.is_displayed():
+                return True
+        except StaleElementReferenceException:
+            continue
+
+    return False
+
+def wait_for_loading_data_cycle(driver, timeout=120, appear_wait=10, stable_seconds=1.2):
+    """
+    After clicking Run, wait for loading to settle.
+    - If loading appears, require it to disappear and stay clear.
+    - If it never appears quickly, continue.
+    """
+    start = time.time()
+    saw_loading = False
+    clear_since = None
+
+    while time.time() - start < timeout:
+        loading_visible = is_loading_data_visible(driver)
+
+        if loading_visible:
+            saw_loading = True
+            clear_since = None
+            time.sleep(0.25)
+            continue
+
+        if saw_loading:
+            if clear_since is None:
+                clear_since = time.time()
+            elif (time.time() - clear_since) >= stable_seconds:
+                return True
+        elif (time.time() - start) >= appear_wait:
+            return True
+
+        time.sleep(0.25)
+
+    return False
+
+def table_has_no_data(driver):
+    """Detect common empty-table messages."""
+    no_data_xpath = (
+        "//*[contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'no data') "
+        "or contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'no records') "
+        "or contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'no results')]"
+    )
+    try:
+        nodes = driver.find_elements(By.XPATH, no_data_xpath)
+    except Exception:
+        return False
+
+    for node in nodes:
+        try:
+            if node.is_displayed():
+                return True
+        except StaleElementReferenceException:
+            continue
+    return False
+
+def robust_click(driver, by, locator, label, timeout=12, attempts=4):
+    """Click helper with retry + JS fallback."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            wait_for_blocking_ui_to_clear(driver, timeout=3)
+            wait = WebDriverWait(driver, timeout)
+            elem = wait.until(EC.presence_of_element_located((by, locator)))
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", elem)
+            time.sleep(0.2)
+            elem = wait.until(EC.element_to_be_clickable((by, locator)))
+            elem.click()
+            return True
+        except (TimeoutException, ElementClickInterceptedException, StaleElementReferenceException) as e:
+            last_error = e
+            try:
+                elem = driver.find_element(by, locator)
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", elem)
+                driver.execute_script("arguments[0].click();", elem)
+                return True
+            except Exception as js_e:
+                last_error = js_e
+                print(f"[WARN] {label} click attempt {attempt}/{attempts} failed: {js_e}")
+                time.sleep(0.6)
+    raise TimeoutException(f"Could not click '{label}' after {attempts} attempts: {last_error}")
+
+def _canonical_store_name(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+def _get_store_options(driver):
+    wait = WebDriverWait(driver, 10)
+
+    def _visible_options(drv):
+        options = drv.find_elements(
+            By.XPATH,
+            "//li[@role='option' or contains(@data-testid,'rebrand-header_menu-item_')]"
+        )
+        visible = []
+        for opt in options:
+            try:
+                if opt.is_displayed():
+                    visible.append(opt)
+            except StaleElementReferenceException:
+                continue
+        return visible
+
+    return wait.until(lambda d: _visible_options(d) or False)
+
+def _select_store_option(driver, store_name):
+    target = _canonical_store_name(store_name)
+    options = _get_store_options(driver)
+    option_texts = []
+
+    exact_match = None
+    partial_match = None
+    for option in options:
+        try:
+            option_text = (option.text or option.get_attribute("innerText") or "").strip()
+        except StaleElementReferenceException:
+            continue
+
+        if option_text:
+            option_texts.append(option_text)
+
+        option_key = _canonical_store_name(option_text)
+        if not option_key:
+            continue
+        if option_key == target:
+            exact_match = option
+            break
+        if target in option_key or option_key in target:
+            partial_match = partial_match or option
+
+    chosen = exact_match or partial_match
+    if not chosen:
+        raise NoSuchElementException(
+            f"No dropdown option matched store '{store_name}'. "
+            f"Visible options: {option_texts}"
+        )
+
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", chosen)
+    time.sleep(0.2)
+    try:
+        chosen.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", chosen)
 
 def click_dropdown(driver):
     """ Click the store dropdown to open the list of store options. """
-    wait = WebDriverWait(driver, 10)
-    dropdown_xpath = "//div[@data-testid='header_select_location']"
-    try:
-        dropdown = wait.until(EC.element_to_be_clickable((By.XPATH, dropdown_xpath)))
-        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", dropdown)
-        dropdown.click()
-        wait.until(EC.presence_of_all_elements_located((By.XPATH, "//li[contains(text(), 'Buzz')]")))  # small delay for options to load
-    except TimeoutException:
-        print("Dropdown not found or not clickable")
+    dropdown_locators = [
+        (By.CSS_SELECTOR, "[data-testid='header_select_location']"),
+        (By.XPATH, "//div[@data-testid='header_select_location']"),
+        (By.XPATH, "//button[@data-testid='header_select_location']"),
+    ]
+
+    last_error = None
+    for by, locator in dropdown_locators:
+        try:
+            robust_click(driver, by, locator, "Store dropdown", timeout=15, attempts=4)
+            _get_store_options(driver)
+            return True
+        except Exception as e:
+            last_error = e
+
+    print(f"Dropdown not found or not clickable: {last_error}")
+    return False
 
 def select_store(driver, store_name):
-    wait = WebDriverWait(driver, 10)
-
-    try:
-        click_dropdown(driver)
-
-        xpath = f"//li[contains(text(), '{store_name}')]"
-        item = wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
-
-        # Scroll into view
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", item)
-        time.sleep(0.5)
-
-        # Wait until any overlay disappears
+    for attempt in range(1, 4):
         try:
-            WebDriverWait(driver, 5).until(
-                EC.invisibility_of_element_located((By.CLASS_NAME, "sc-crXKpg"))
+            wait_for_blocking_ui_to_clear(driver, timeout=4)
+            if not click_dropdown(driver):
+                raise TimeoutException("Store dropdown did not open.")
+            _select_store_option(driver, store_name)
+            time.sleep(0.8)
+
+            # Validate by checking the location control text after selection.
+            header_text = driver.find_element(
+                By.CSS_SELECTOR, "[data-testid='header_select_location']"
+            ).text
+            if _canonical_store_name(store_name) in _canonical_store_name(header_text):
+                return True
+
+            # Fallback success path: if dropdown is closed, assume click took effect.
+            if not driver.find_elements(By.XPATH, "//li[@role='option']"):
+                return True
+
+            raise TimeoutException(
+                f"Store header text did not update. Expected '{store_name}', got '{header_text}'."
             )
-        except TimeoutException:
-            print("[WARNING] Overlay still visible after timeout. Proceeding anyway...")
+        except (TimeoutException, NoSuchElementException, ElementClickInterceptedException, StaleElementReferenceException) as e:
+            print(f"[WARN] Store selection attempt {attempt}/3 failed for '{store_name}': {e}")
+            time.sleep(1)
 
-        # Now click safely
-        driver.execute_script("arguments[0].click();", item)
-
-        # Wait to confirm store was selected
-        wait.until(EC.presence_of_all_elements_located((By.XPATH, "//li[contains(text(), 'Buzz')]")))
-        return True
-
-    except (TimeoutException, NoSuchElementException, ElementClickInterceptedException) as e:
-        print(f"[ERROR] Could not select store '{store_name}': {e}")
-        return False
+    print(f"[ERROR] Could not select store '{store_name}' after retries.")
+    return False
 
 def click_date_input_field(driver):
     """ Click on the date input field to open the date-picker safely. """
@@ -136,23 +366,71 @@ def click_dates_in_calendar(driver, day_of_month):
         run_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Run')]")))
         driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", run_button)
         driver.execute_script("arguments[0].click();", run_button)
+        if not wait_for_loading_data_cycle(driver, timeout=120):
+            print("[WARN] Loading indicator did not fully settle after clicking Run.")
+        return True
 
     except (TimeoutException, ElementClickInterceptedException) as e:
         print("Could not click the day or the Run button.")
         print(f"Error details: {e}")
+        return False
 
 def extract_monetary_values(driver):
     """
-    Extract the first 3 right-aligned table cells and parse them as float. 
+    Extract the first 3 monetary cells and parse them as float.
+    Returns [] if the report has no data or cells never appear.
     """
-    css_selector = "[class$='table-cell-right-']"
-    time.sleep(4)
-    elements = WebDriverWait(driver, 35).until(
-        EC.presence_of_all_elements_located((By.CSS_SELECTOR, css_selector))
-    )
+    wait_for_loading_data_cycle(driver, timeout=120)
+    selectors = [
+        "[class*='table-cell-right-']",
+        "[class*='table-cell-right']",
+        "td[class*='right']",
+        "div[class*='right']",
+    ]
+
+    elements = []
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        wait_for_blocking_ui_to_clear(driver, timeout=2)
+
+        if table_has_no_data(driver):
+            print("[INFO] Report returned no data for this date/store.")
+            return []
+
+        for selector in selectors:
+            try:
+                found = driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                found = []
+
+            visible = []
+            for elem in found:
+                try:
+                    if elem.is_displayed():
+                        visible.append(elem)
+                except StaleElementReferenceException:
+                    continue
+
+            if visible:
+                elements = visible
+                break
+
+        if elements:
+            break
+
+        time.sleep(0.35)
+
+    if not elements:
+        print("[WARN] Timed out waiting for monetary cells in report table.")
+        return []
+
     monetary_values = []
-    for element in elements[:3]:
-        value_text = element.text
+    for element in elements:
+        value_text = (element.text or "").strip()
+        if not value_text:
+            continue
+        if not re.search(r"[\d$(),.-]", value_text):
+            continue
         try:
             numeric_value = float(value_text
                 .replace('$', '')
@@ -161,8 +439,10 @@ def extract_monetary_values(driver):
                 .replace(')', '')
             )
             monetary_values.append(numeric_value)
+            if len(monetary_values) >= 3:
+                break
         except ValueError:
-            print(f"Could not convert '{value_text}' to float.")
+            continue
     return monetary_values
 def change_month_if_needed(driver, target_date):
     import sys
@@ -236,7 +516,9 @@ def process_single_day(driver, date_to_run):
     # Click date input, then click the day in the datepicker
     click_date_input_field(driver)
     change_month_if_needed(driver, date_to_run)
-    click_dates_in_calendar(driver, day_str)
+    if not click_dates_in_calendar(driver, day_str):
+        print(f"{date_to_run.strftime('%m/%d')}: Skipping due to calendar/run click failure.")
+        return
 
     # Extract values
     gross = extract_monetary_values(driver)
@@ -434,7 +716,12 @@ def open_gui_and_run():
             for date_to_run in date_list:
                 # short delay between days (optional)
                 time.sleep(3)
-                process_single_day(driver, date_to_run)
+                try:
+                    process_single_day(driver, date_to_run)
+                except Exception:
+                    print(f"[ERROR] Failed processing {date_to_run.strftime('%Y-%m-%d')} for {store_name}")
+                    print(traceback.format_exc())
+                    continue
 
         # 8) Done
         driver.quit()
