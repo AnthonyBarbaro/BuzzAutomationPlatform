@@ -77,6 +77,18 @@ DAILY_UNITS_ROWS = 10
 CHART_DPI = 170
 CHART_JPEG_QUALITY = 86
 
+# Cart value distribution buckets (transaction-level net cart total)
+CART_VALUE_BUCKETS: List[Dict[str, Any]] = [
+    {"label": "$0-$1", "lower": 0.0, "upper": 1.0, "upper_inclusive": False},
+    {"label": "$1-$10", "lower": 1.0, "upper": 10.0, "upper_inclusive": False},
+    {"label": "$10-$20", "lower": 10.0, "upper": 20.0, "upper_inclusive": False},
+    {"label": "$20-$40", "lower": 20.0, "upper": 40.0, "upper_inclusive": False},
+    {"label": "$40-$60", "lower": 40.0, "upper": 60.0, "upper_inclusive": False},
+    {"label": "$60-$99", "lower": 60.0, "upper": 100.0, "upper_inclusive": False},
+    {"label": "$100-$200", "lower": 100.0, "upper": 200.0, "upper_inclusive": True},
+    {"label": "$200+", "lower": 200.0, "upper": None, "lower_inclusive": False},
+]
+
 # --- Dutchie export header row ---
 FORCE_HEADER_ROW = True
 EXPORT_HEADER_ROW_INDEX = 4  # Excel row 5
@@ -2107,6 +2119,63 @@ def compute_budtender_summary(df: pd.DataFrame, start: date, end: date) -> Optio
     out = out.sort_values("net_revenue", ascending=False).rename(columns={emp_col: "budtender"})
     return out
 
+def compute_cart_value_distribution(df: pd.DataFrame, start: date, end: date) -> Optional[pd.DataFrame]:
+    """
+    Returns transaction cart counts grouped by cart-value buckets.
+    Uses transaction-level net sales (sum of line items per transaction ID).
+    """
+    net_col = find_col(df, COLUMN_CANDIDATES["net_sales"])
+    tx_col = find_col(df, COLUMN_CANDIDATES["transaction_id"])
+    if not net_col:
+        return None
+
+    tmp = _filter_df_date_range(df, start, end)
+    if tmp.empty:
+        return pd.DataFrame(columns=["bucket", "count", "pct"])
+
+    tmp["_net"] = to_number(tmp[net_col]).fillna(0.0).astype(float)
+
+    if tx_col:
+        raw_tx = tmp[tx_col]
+        tx_txt = raw_tx.astype(str).str.strip()
+        tx_missing = raw_tx.isna() | tx_txt.eq("") | tx_txt.str.lower().isin({"nan", "none"})
+        tmp["_tx_key"] = tx_txt
+        # Keep missing IDs unique so one bad export cell does not collapse unrelated carts.
+        tmp.loc[tx_missing, "_tx_key"] = "__row_" + tmp.loc[tx_missing].index.astype(str)
+        cart_totals = tmp.groupby("_tx_key", as_index=False)["_net"].sum()["_net"].astype(float)
+    else:
+        # Fallback: treat each row as a cart when transaction ID is unavailable.
+        cart_totals = tmp["_net"].astype(float)
+
+    cart_totals = cart_totals[cart_totals >= 0.0]
+    total_carts = int(cart_totals.shape[0])
+
+    rows: List[Dict[str, Any]] = []
+    for bucket in CART_VALUE_BUCKETS:
+        lower = float(bucket["lower"])
+        upper = bucket.get("upper")
+        lower_inclusive = bool(bucket.get("lower_inclusive", True))
+        upper_inclusive = bool(bucket.get("upper_inclusive", False))
+
+        lower_mask = (cart_totals >= lower) if lower_inclusive else (cart_totals > lower)
+        if upper is None:
+            mask = lower_mask
+        elif upper_inclusive:
+            mask = lower_mask & (cart_totals <= float(upper))
+        else:
+            mask = lower_mask & (cart_totals < float(upper))
+
+        count = int(mask.sum())
+        rows.append({
+            "bucket": str(bucket["label"]),
+            "count": count,
+            "pct": (count / total_carts) if total_carts else 0.0,
+        })
+
+    out = pd.DataFrame(rows, columns=["bucket", "count", "pct"])
+    out.attrs["total_carts"] = total_carts
+    return out
+
 def compute_category_summary(df: pd.DataFrame, start: date, end: date) -> Optional[pd.DataFrame]:
     """
     Category-level metrics.
@@ -2497,6 +2566,78 @@ def chart_rank_barh(
     buf.seek(0)
     return buf
 
+def chart_cart_value_distribution(
+    dist_df: pd.DataFrame,
+    title: str,
+    figsize: Tuple[float, float] = (7.3, 4.35),
+) -> BytesIO:
+    _mpl_setup()
+    buf = BytesIO()
+    if dist_df is None or dist_df.empty:
+        return buf
+
+    d = dist_df.copy()
+    labels = d["bucket"].astype(str).tolist()
+    counts = d["count"].fillna(0).astype(float).tolist()
+    shares = d["pct"].fillna(0).astype(float).tolist() if "pct" in d.columns else [0.0] * len(labels)
+    if not labels:
+        return buf
+
+    palette = [
+        "#D1FAE5", "#A7F3D0", "#6EE7B7", "#34D399",
+        "#10B981", "#059669", "#047857", "#065F46",
+    ]
+    bar_colors = [palette[i % len(palette)] for i in range(len(labels))]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    x = np.arange(len(labels))
+    bars = ax.bar(
+        x,
+        counts,
+        width=0.74,
+        color=bar_colors,
+        edgecolor="#065F46",
+        linewidth=0.55,
+        zorder=2,
+    )
+
+    ax.set_title(title, pad=18)
+    ax.set_ylabel("Cart Count", fontsize=8.1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8.2)
+    ax.tick_params(axis="x", pad=5)
+    ax.tick_params(axis="y", pad=4)
+    ax.grid(True, axis="y", zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.margins(x=0.01)
+
+    y_max = max(counts) if counts else 0.0
+    if y_max > 0:
+        ax.set_ylim(0, y_max * 1.33)
+    else:
+        ax.set_ylim(0, 1.0)
+
+    label_pad = (y_max * 0.02) if y_max else 0.07
+    for bar, val, pct in zip(bars, counts, shares):
+        ax.text(
+            bar.get_x() + (bar.get_width() / 2.0),
+            val + label_pad,
+            f"{int(val):,}\n{pct1(pct)}",
+            ha="center",
+            va="bottom",
+            fontsize=7.9,
+            fontweight="bold",
+            color="#111827",
+            clip_on=False,
+        )
+
+    fig.subplots_adjust(left=0.07, right=0.992, bottom=0.18, top=0.82)
+    _save_chart_image(buf)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
 def chart_hourly_shadow_compare(
     this_day: pd.DataFrame,
     last_week: pd.DataFrame,
@@ -2720,6 +2861,41 @@ def build_table(headers: List[Any], rows: List[List[Any]], col_widths: Optional[
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return t
+
+def build_cart_distribution_strip(dist_df: pd.DataFrame, width: float = 7.3 * inch) -> Optional[Table]:
+    if dist_df is None or dist_df.empty:
+        return None
+
+    labels = dist_df["bucket"].astype(str).tolist()
+    counts = [f"{int(v):,}" for v in dist_df["count"].fillna(0).astype(float).tolist()]
+    shares = [pct1(float(v)) for v in dist_df["pct"].fillna(0).astype(float).tolist()]
+    if not labels:
+        return None
+
+    col_w = width / max(1, len(labels))
+    t = Table([labels, counts, shares], colWidths=[col_w] * len(labels))
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), THEME["black"]),
+        ("TEXTCOLOR", (0, 0), (-1, 0), THEME["yellow"]),
+        ("BACKGROUND", (0, 1), (-1, 1), THEME["light_bg"]),
+        ("BACKGROUND", (0, 2), (-1, 2), colors.white),
+        ("TEXTCOLOR", (0, 1), (-1, 1), THEME["black"]),
+        ("TEXTCOLOR", (0, 2), (-1, 2), THEME["muted"]),
+        ("FONTNAME", (0, 0), (-1, 0), BASE_FONT_BOLD),
+        ("FONTNAME", (0, 1), (-1, 1), BASE_FONT_BOLD),
+        ("FONTNAME", (0, 2), (-1, 2), BASE_FONT),
+        ("FONTSIZE", (0, 0), (-1, 0), 7.2),
+        ("FONTSIZE", (0, 1), (-1, 1), 8.8),
+        ("FONTSIZE", (0, 2), (-1, 2), 7.2),
+        ("GRID", (0, 0), (-1, -1), 0.45, THEME["border"]),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]))
     return t
 
@@ -2980,6 +3156,18 @@ def build_store_pdf(
         figsize=(7.3, 3.2),
     )
 
+    cart_dist = compute_cart_value_distribution(df_raw, end_day, end_day)
+    cart_dist_chart = BytesIO()
+    cart_dist_strip = None
+    cart_dist_mtd = compute_cart_value_distribution(df_raw, mtd_start, end_day)
+    if cart_dist is not None and not cart_dist.empty:
+        cart_dist_chart = chart_cart_value_distribution(
+            cart_dist,
+            f"Cart Value Distribution ({end_day.isoformat()} {dow_short(end_day)})",
+            figsize=(7.3, 4.35),
+        )
+        cart_dist_strip = build_cart_distribution_strip(cart_dist, width=7.3 * inch)
+
     hourly_today = compute_hourly_metrics(df_raw, end_day)
     hourly_last = compute_hourly_metrics(df_raw, last_week_day)
     if hourly_today is None:
@@ -3123,6 +3311,47 @@ def build_store_pdf(
         Image(net_trend, width=7.3 * inch, height=3.2 * inch) if net_trend.getbuffer().nbytes > 0 else Spacer(1, 0),
     ]))
     story.append(Spacer(1, SPACER["xs"]))
+
+    has_day_cart_chart = (
+        cart_dist is not None
+        and not cart_dist.empty
+        and cart_dist_chart.getbuffer().nbytes > 0
+    )
+    has_mtd_cart_table = cart_dist_mtd is not None and not cart_dist_mtd.empty
+
+    if has_day_cart_chart or has_mtd_cart_table:
+        story.append(CondPageBreak(5.5 * inch))
+        story.append(Paragraph("Cart Value Distribution", styles["TitleBig"]))
+        if has_day_cart_chart:
+            total_carts = int(cart_dist["count"].sum())
+            story.append(Paragraph(
+                f"Report Day carts grouped by net cart value • Total carts: {total_carts:,}",
+                styles["Tiny"],
+            ))
+            story.append(Spacer(1, 0.05 * inch))
+            if cart_dist_strip is not None:
+                story.append(cart_dist_strip)
+                story.append(Spacer(1, 0.08 * inch))
+            story.append(Image(cart_dist_chart, width=7.3 * inch, height=4.35 * inch))
+            story.append(Spacer(1, 0.06 * inch))
+
+        if has_mtd_cart_table:
+            mtd_rows = [
+                [str(r.bucket), f"{int(r.count):,}", pct1(float(r.pct))]
+                for r in cart_dist_mtd.itertuples(index=False)
+            ]
+            mtd_total_carts = int(cart_dist_mtd["count"].sum())
+            story.append(Paragraph(
+                f"Cart Value Distribution — MTD ({mtd_start.isoformat()} to {end_day.isoformat()}) • "
+                f"Total carts: {mtd_total_carts:,}",
+                styles["Section"],
+            ))
+            story.append(build_table(
+                ["Cart Range", "MTD Carts", "MTD Share"],
+                mtd_rows,
+                [4.10 * inch, 1.60 * inch, 1.60 * inch],
+            ))
+        story.append(Spacer(1, SPACER["sm"]))
 
     story.append(Paragraph(
         f"Hourly Snapshot (Report Day vs {last_week_day.isoformat()} {dow_short(last_week_day)})",

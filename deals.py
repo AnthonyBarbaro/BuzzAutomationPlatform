@@ -557,9 +557,9 @@ brand_criteria = {
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['JJ Dragon']},
-    'Sol Flora': {'vendors': ['Twisted Roots, Inc.'],
+    'Sol Flora': {'vendors': ['Twisted Roots, Inc.','Garden Of Weeden Inc.','Garden Of Weeden'],
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-           'discount': 0.5,
+           'discount': 0.3,
            'kickback': 0.0,
            'brands': ['Sol Flora']},
     'Planta': {'vendors': ['Higher Logic LLC','Garden Of Weeden Inc.'],
@@ -606,13 +606,19 @@ brand_criteria = {
     'Stiiizy': {'vendors': [''],
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
            'discount': 0.4,
-           'kickback': 0.28,
+           'kickback': 0.0,
            'brands': ['Stiiizy |']},
     'Lyfe Sauce': {'vendors': ['DYVINEL, INC.'],
            'days': ['Friday'],
            'discount': 0.5,
            'kickback': 0.30,
            'brands': ['Lyfe Sauce |']},
+    'Good Good': {'vendors': ['KMMK Distribution Inc.'],
+           'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+           'discount': 0.3,
+           'kickback': 0.0,
+           'brands': ['Goodgood |']},
+
 }
 
 def style_summary_sheet(sheet, brand_name):
