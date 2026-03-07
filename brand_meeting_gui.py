@@ -31,6 +31,9 @@ class BrandOption:
     scheduled_today: bool = False
 
 
+CUSTOM_BRANDS_PATH = Path(__file__).with_name("brand_meeting_gui_custom_brands.json")
+
+
 class BrandMeetingPacketGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -81,6 +84,7 @@ class BrandMeetingPacketGUI:
         self.xlsx_var = tk.BooleanVar(value=False)
         self.force_refresh_var = tk.BooleanVar(value=False)
         self.brand_search_var = tk.StringVar()
+        self.custom_brand_var = tk.StringVar()
 
         self.status_var = tk.StringVar(value="Ready")
         self.activity_var = tk.StringVar(value="Choose brands and run a packet.")
@@ -98,6 +102,7 @@ class BrandMeetingPacketGUI:
 
         self.brand_options = self._load_brand_options()
         self.brand_lookup = {item.name: item for item in self.brand_options}
+        self.brand_lookup_lower = {item.name.lower(): item for item in self.brand_options}
 
         self._configure_theme()
         self._build_ui()
@@ -466,7 +471,7 @@ class BrandMeetingPacketGUI:
             "Search, multi-select, or use the keyboard to jump directly to a brand. This tab is your queue builder.",
         )
         brand_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        brand_body.grid_rowconfigure(2, weight=1)
+        brand_body.grid_rowconfigure(3, weight=1)
         brand_body.grid_columnconfigure(0, weight=1)
 
         search_row = tk.Frame(brand_body, bg=self.colors["card"])
@@ -479,6 +484,22 @@ class BrandMeetingPacketGUI:
         ttk.Button(search_row, text="Visible", style="Ghost.TButton", command=self._select_all_visible_brands).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(search_row, text="Clear", style="Ghost.TButton", command=self._clear_brand_selection).grid(row=0, column=3)
 
+        add_row = tk.Frame(brand_body, bg=self.colors["card"])
+        add_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        add_row.grid_columnconfigure(0, weight=1)
+        self.custom_brand_entry = ttk.Entry(add_row, textvariable=self.custom_brand_var)
+        self.custom_brand_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(add_row, text="Add Brand", style="Secondary.TButton", command=self._add_custom_brand_from_entry).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(add_row, text="Remove Selected", style="Ghost.TButton", command=self._remove_selected_custom_brands).grid(row=0, column=2)
+        tk.Label(
+            add_row,
+            text="Not on the list? Add it here, for example: Papa's Herb. Remove Selected only deletes custom brands added in this GUI.",
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=self.fonts["small"],
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         tk.Label(
             brand_body,
             textvariable=self.brand_browser_summary_var,
@@ -486,10 +507,10 @@ class BrandMeetingPacketGUI:
             fg=self.colors["muted"],
             font=self.fonts["small"],
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=(10, 8))
+        ).grid(row=2, column=0, sticky="w", pady=(10, 8))
 
         brand_list_wrap = tk.Frame(brand_body, bg=self.colors["card"])
-        brand_list_wrap.grid(row=2, column=0, sticky="nsew")
+        brand_list_wrap.grid(row=3, column=0, sticky="nsew")
         brand_list_wrap.grid_rowconfigure(0, weight=1)
         brand_list_wrap.grid_columnconfigure(0, weight=1)
 
@@ -954,6 +975,7 @@ class BrandMeetingPacketGUI:
         self.brand_list.bind("<Control-a>", self._select_all_visible_brands_event)
 
         self.brand_search_entry.bind("<Escape>", self._clear_search_and_focus_list)
+        self.custom_brand_entry.bind("<Return>", self._add_custom_brand_event)
         self.root.bind("<Control-f>", self._focus_brand_search)
 
         self.store_list.bind("<<ListboxSelect>>", lambda _event: self._update_store_summary())
@@ -1008,6 +1030,16 @@ class BrandMeetingPacketGUI:
                     continue
                 brand_map.setdefault(name.lower(), BrandOption(name=name, source="deals"))
 
+        for name in self._load_custom_brand_names():
+            brand_map.setdefault(
+                name.lower(),
+                BrandOption(
+                    name=name,
+                    folder_name=name,
+                    source="custom",
+                ),
+            )
+
         if not brand_map:
             fallback = [
                 "Cold Fire",
@@ -1023,6 +1055,46 @@ class BrandMeetingPacketGUI:
             brand_map.values(),
             key=lambda item: (not item.scheduled_today, item.name.lower()),
         )
+
+    def _load_custom_brand_names(self) -> List[str]:
+        if not CUSTOM_BRANDS_PATH.exists():
+            return []
+        try:
+            payload = json.loads(CUSTOM_BRANDS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+        if isinstance(payload, dict):
+            raw_names = payload.get("brands", [])
+        elif isinstance(payload, list):
+            raw_names = payload
+        else:
+            raw_names = []
+
+        out: List[str] = []
+        seen: set[str] = set()
+        for value in raw_names:
+            name = str(value).strip()
+            if not name:
+                continue
+            lowered = name.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            out.append(name)
+        return out
+
+    def _save_custom_brand_names(self) -> None:
+        custom_names = sorted(
+            {
+                item.name
+                for item in self.brand_options
+                if str(item.source).strip().lower() == "custom" and item.name.strip()
+            },
+            key=str.casefold,
+        )
+        payload = {"brands": custom_names}
+        CUSTOM_BRANDS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _brand_matches_query(self, option: BrandOption, query: str) -> bool:
         if not query:
@@ -1118,6 +1190,98 @@ class BrandMeetingPacketGUI:
         self.brand_search_var.set("")
         self.selected_brand_names.update(today_names)
         self._restore_brand_selection()
+
+    def _add_custom_brand_event(self, _event: tk.Event) -> str:
+        self._add_custom_brand_from_entry()
+        return "break"
+
+    def _add_custom_brand_from_entry(self) -> None:
+        raw_name = self.custom_brand_var.get().strip()
+        if not raw_name:
+            messagebox.showwarning("Missing Brand", "Type a brand name before clicking Add Brand.")
+            return
+
+        existing = self.brand_lookup_lower.get(raw_name.lower())
+        if existing is not None:
+            self.selected_brand_names.add(existing.name)
+            self.custom_brand_var.set("")
+            self.brand_search_var.set(existing.name)
+            self._refresh_brand_list()
+            self._restore_brand_selection()
+            self.activity_var.set(f"{existing.name} is already available and has been added to the queue.")
+            return
+
+        option = BrandOption(
+            name=raw_name,
+            folder_name=raw_name,
+            source="custom",
+        )
+        self.brand_options.append(option)
+        self.brand_options = sorted(
+            self.brand_options,
+            key=lambda item: (not item.scheduled_today, item.name.lower()),
+        )
+        self.brand_lookup[option.name] = option
+        self.brand_lookup_lower[option.name.lower()] = option
+        self.selected_brand_names.add(option.name)
+        self.custom_brand_var.set("")
+        self.brand_search_var.set(option.name)
+        self._save_custom_brand_names()
+        self._refresh_brand_list()
+        self._restore_brand_selection()
+        self.activity_var.set(f"Added custom brand: {option.name}")
+
+    def _remove_selected_custom_brands(self) -> None:
+        selected_names = self._selected_brand_names_list()
+        if not selected_names:
+            messagebox.showwarning("No Brands Selected", "Select one or more brands to remove.")
+            return
+
+        custom_names: List[str] = []
+        protected_names: List[str] = []
+        for name in selected_names:
+            option = self.brand_lookup.get(name)
+            if option is not None and str(option.source).strip().lower() == "custom":
+                custom_names.append(name)
+            else:
+                protected_names.append(name)
+
+        if not custom_names:
+            messagebox.showinfo(
+                "Built-in Brands",
+                "Only custom brands added in this GUI can be removed here. Built-in brands from brand_config.json or deals can still be cleared from the queue.",
+            )
+            return
+
+        if len(custom_names) == 1:
+            prompt = f"Remove custom brand '{custom_names[0]}' from the saved GUI list?"
+        else:
+            prompt = f"Remove {len(custom_names)} custom brands from the saved GUI list?"
+        if protected_names:
+            prompt += f"\n\nBuilt-in brands will be kept: {', '.join(protected_names[:4])}"
+            if len(protected_names) > 4:
+                prompt += f", +{len(protected_names) - 4} more"
+
+        if not messagebox.askyesno("Remove Brand", prompt):
+            return
+
+        remove_set = set(custom_names)
+        self.brand_options = [item for item in self.brand_options if item.name not in remove_set]
+        for name in custom_names:
+            self.brand_lookup.pop(name, None)
+            self.brand_lookup_lower.pop(name.lower(), None)
+            self.selected_brand_names.discard(name)
+
+        self._save_custom_brand_names()
+        self._refresh_brand_list()
+        self._restore_brand_selection()
+
+        if protected_names:
+            self.activity_var.set(
+                f"Removed {len(custom_names)} custom brand(s). Built-in brands stayed in the queue."
+            )
+        else:
+            self.activity_var.set(f"Removed {len(custom_names)} custom brand(s).")
 
     def _clear_brand_selection(self) -> None:
         self.selected_brand_names.clear()

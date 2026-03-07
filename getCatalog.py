@@ -43,7 +43,7 @@ def launchBrowser():
     chrome_options = Options()
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("start-maximized")
-    # chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_experimental_option("detach", True)
     chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
