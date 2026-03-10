@@ -78,6 +78,31 @@ Recommended operational practice:
 - Keep credential/token files out of git and backed up securely.
 - Rotate secrets if shared accidentally.
 
+## Deals Brand Config Sync
+
+`deals.py` can load deal rules from a flat CSV/JSON config and keep a CSV snapshot in sync for sharing.
+
+Files:
+- `deals_brand_config_url.txt` - published Google Sheets CSV URL used as the live source
+- `deals_brand_config_sheet_url.txt` - editable Google Sheets tab to sync back to
+- `deals_brand_config.csv` - local flat export snapshot written on each run
+- `token_sheets.json` - OAuth token for Google Sheets sync
+
+Normal workflow:
+1. Edit the Google Sheet tab from `deals_brand_config_sheet_url.txt`.
+2. Make sure that tab is published as CSV and matches `deals_brand_config_url.txt`.
+3. Run `deals.py`.
+4. `deals.py` reloads the published CSV, writes `deals_brand_config.csv`, and syncs the flattened rows back to the editable sheet tab.
+
+Useful commands:
+```bash
+.venv/bin/python deals.py
+.venv/bin/python deals.py --sync-brand-config-only
+.venv/bin/python deals.py --seed-brand-config-sheet
+```
+
+`--seed-brand-config-sheet` overwrites the target sheet tab with the full built-in config from `deals.py`. Use that once if the shared sheet needs to be bootstrapped from the hardcoded rules.
+
 ## Common Runs
 
 ### 1) Sales exports (all stores)

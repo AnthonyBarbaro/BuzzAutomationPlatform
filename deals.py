@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import re
+import sys
 import pandas as pd
 from datetime import datetime
 from openpyxl import load_workbook
@@ -10,6 +11,7 @@ from pathlib import Path
 import locale
 import shutil
 import warnings
+from deals_brand_config_sync import load_brand_criteria, sync_brand_config_artifacts
 # Global dictionary to map real names -> pseudonyms
 NAME_MAP = {}
 GLOBAL_COUNTER = 1
@@ -146,7 +148,7 @@ def apply_discounts_and_kickbacks(data, discount, kickback):
 
     return data
 
-brand_criteria = {
+DEFAULT_BRAND_CRITERIA = {
     'Hashish': {
         'vendors': ['Zenleaf LLC','Center Street Investments Inc.','Garden Of Weeden Inc.','BTC Ventures'],
         'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
@@ -632,6 +634,55 @@ brand_criteria = {
 
 }
 
+brand_criteria = DEFAULT_BRAND_CRITERIA
+brand_config_source = "built-in deals.py"
+
+
+def refresh_brand_criteria(sync_reference=False, sync_sheet=False, log_source=True, log_errors=True):
+    global brand_criteria, brand_config_source
+
+    brand_criteria, brand_config_source = load_brand_criteria(
+        DEFAULT_BRAND_CRITERIA,
+        log_source=log_source,
+        log_errors=log_errors,
+    )
+
+    if len(brand_criteria) < len(DEFAULT_BRAND_CRITERIA):
+        print(
+            f"[WARN] Shared deals config currently has {len(brand_criteria)} brands; "
+            f"built-in deals.py has {len(DEFAULT_BRAND_CRITERIA)}. "
+            "Run `python3 deals.py --seed-brand-config-sheet` to push the full built-in config to the sheet."
+        )
+
+    if sync_reference:
+        try:
+            sync_result = sync_brand_config_artifacts(brand_criteria, sync_sheet=sync_sheet)
+            print(
+                f"[INFO] Wrote deals brand config CSV to {sync_result['csv_path']} "
+                f"({sync_result['row_count']} rows)."
+            )
+            if sync_result["sheet_synced"]:
+                print(f"[INFO] Synced deals brand config to Google Sheet tab '{sync_result['sheet_title']}'.")
+            elif sync_result.get("sheet_skip_reason"):
+                print(f"[WARN] {sync_result['sheet_skip_reason']}")
+        except Exception as exc:
+            print(f"[WARN] Could not sync deals brand config reference: {exc}")
+
+    return brand_criteria
+
+
+def seed_brand_config_reference(sync_sheet=True):
+    result = sync_brand_config_artifacts(DEFAULT_BRAND_CRITERIA, sync_sheet=sync_sheet)
+    print(
+        f"[INFO] Seeded deals brand config CSV at {result['csv_path']} "
+        f"({result['row_count']} rows)."
+    )
+    if result["sheet_synced"]:
+        print(f"[INFO] Seeded Google Sheet tab '{result['sheet_title']}' from built-in deals.py config.")
+    elif result.get("sheet_skip_reason"):
+        print(f"[WARN] {result['sheet_skip_reason']}")
+    return result
+
 def style_summary_sheet(sheet, brand_name):
     """
     Styles the Summary sheet:
@@ -1059,6 +1110,7 @@ def run_deals_reports():
     """
     output_dir = "brand_reports"
     old_dir = "old"
+    criteria_by_brand = refresh_brand_criteria(sync_reference=True, sync_sheet=True)
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     Path(old_dir).mkdir(parents=True, exist_ok=True)
@@ -1088,7 +1140,7 @@ def run_deals_reports():
     consolidated_summary = []
     results_for_app = []
 
-    for brand, criteria in brand_criteria.items():
+    for brand, criteria in criteria_by_brand.items():
         if not isinstance(criteria, (dict, list)):
             print(f"[SKIP] Brand '{brand}' has invalid criteria type. Skipping.")
             continue
@@ -1377,5 +1429,10 @@ def run_deals_reports():
     return results_for_app
 
 if __name__ == "__main__":
-    data = run_deals_reports()
-    print("Results for app:", data)
+    if "--seed-brand-config-sheet" in sys.argv:
+        seed_brand_config_reference(sync_sheet=True)
+    elif "--sync-brand-config-only" in sys.argv:
+        refresh_brand_criteria(sync_reference=True, sync_sheet=True)
+    else:
+        data = run_deals_reports()
+        print("Results for app:", data)
