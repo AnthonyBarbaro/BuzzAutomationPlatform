@@ -260,15 +260,26 @@ brand_criteria = {
         'kickback': 0.25, 
         'brands': ['TreeSap']
     },
-      'Made': { 
+      'Made': {
         'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
-        'days': ['Friday','Saturday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        'categories': ['Pre-Rolls','Flower','Eighths'], 
-        'brands': ['Made |']
-    }, 
-    
+        'categories': ['Pre-Rolls','Flower','Eighths'],
+        'brands': ['Made |'],
+        'rules': [
+            {
+                'rule_name': 'Made - Friday Saturday (50/30)',
+                'days': ['Friday','Saturday'],
+                'discount': 0.50,
+                'kickback': 0.30,
+            },
+            {
+                'rule_name': 'Made - Sun Thu SV WP (50/30)',
+                'days': ['Sunday','Monday','Tuesday','Wednesday','Thursday'],
+                'stores': ['SV','WP'],
+                'discount': 0.50,
+                'kickback': 0.30,
+            },
+        ],
+    },
       'Made-Eddys': { 
         'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
         'days': ['Friday','Saturday'],
@@ -451,7 +462,7 @@ brand_criteria = {
         'brands': ['Raw Garden |']
     }, 
     "Claybourne": {
-        'vendors': ['CI Distribution','Garden Of Weeden Inc.'],
+        'vendors': ['CI Distribution','Garden Of Weeden Inc.','Cinco Elementals LLC'],
         'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
         'discount': 0.50,
         'kickback': 0.30,
@@ -547,22 +558,17 @@ brand_criteria = {
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Nasha']},
-    'Ball Family Farms': {'vendors': ['Ball Family Farms Corporation'],
+    'Ball Family Farms': {'vendors': ['Ball Family Farms Corporation','Garden Of Weeden','Garden Of Weeden Inc.'],
            'days': ['Saturday'],
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Ball Family Farms']},
-    'Just J': {'vendors': ['Rukli Inc (Tyson)'],
-           'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-           'discount': 0.5,
-           'kickback': 0.3,
-           'brands': ['JJ Dragon']},
     'Sol Flora': {'vendors': ['Twisted Roots, Inc.','Garden Of Weeden Inc.','Garden Of Weeden'],
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
            'discount': 0.3,
            'kickback': 0.0,
            'brands': ['Sol Flora']},
-    'Planta': {'vendors': ['Higher Logic LLC','Garden Of Weeden Inc.'],
+    'Planta': {'vendors': ['Higher Logic LLC','Garden Of Weeden Inc.','Garden Of Weeden'],
            'days': ['Monday','Sunday'],
            'discount': 0.5,
            'kickback': 0.3,
@@ -618,6 +624,11 @@ brand_criteria = {
            'discount': 0.3,
            'kickback': 0.0,
            'brands': ['Goodgood |']},
+    'Lime': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+           'days': ['Monday','Sunday'],
+           'discount': 0.50,
+           'kickback': 0.30,
+           'brands': ['LIME |']},
 
 }
 

@@ -38,6 +38,7 @@ from openpyxl.styles import Font, Alignment, PatternFill
 # Folders for CSV input and XLSX output
 INPUT_DIRECTORY = "files"       # Where CSVs land
 LOCAL_REPORTS_FOLDER = "brand_reports_tmp"  # Local subfolder for generated reports
+INVENTORY_LINKS_DIR = "inventory_links"
 
 BRAND_CONFIG_JSON = "brand_config.json"
 
@@ -242,6 +243,39 @@ def safe_makedirs(path):
     """Create directory if it doesn't exist."""
     if not os.path.exists(path):
         os.makedirs(path)
+
+
+def write_inventory_link_manifest(date_str, today_name, brand_folder_links, brand_to_emails):
+    """
+    Persist Drive folder links so other scripts can reuse the inventory links
+    without scraping prior emails.
+    """
+    safe_makedirs(INVENTORY_LINKS_DIR)
+
+    manifest = {
+        "date": date_str,
+        "day": today_name,
+        "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "folders": {
+            folder_name: {
+                "link": link,
+                "emails": brand_to_emails.get(folder_name, []),
+            }
+            for folder_name, link in sorted(brand_folder_links.items())
+        },
+    }
+
+    dated_path = os.path.join(INVENTORY_LINKS_DIR, f"{date_str}.json")
+    latest_path = os.path.join(INVENTORY_LINKS_DIR, "latest.json")
+
+    with open(dated_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+
+    print(f"[INFO] Wrote inventory link manifest: {dated_path}")
+    print(f"[INFO] Updated inventory link manifest: {latest_path}")
 
 def extract_strain_type(product_name: str):
     if not isinstance(product_name, str):
@@ -662,6 +696,13 @@ def main():
         brand_folder_id = find_or_create_folder(drive_service, folder_name, parent_id=date_folder_id)
         link = f"https://drive.google.com/drive/folders/{brand_folder_id}"
         brand_folder_links[folder_name] = link
+
+    write_inventory_link_manifest(
+        date_str=date_str,
+        today_name=today_name,
+        brand_folder_links=brand_folder_links,
+        brand_to_emails=brand_to_emails,
+    )
 
     # Now, parse brand from each generated XLSX => find folder_name => upload
     brand_pattern = re.compile(r"^(.*?)_(.*?)_(\d{2}-\d{2}-\d{4})\.xlsx$", re.IGNORECASE)
