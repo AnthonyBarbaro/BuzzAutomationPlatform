@@ -79,6 +79,7 @@ class BrandMeetingPacketGUI:
         self.include_store_var = tk.BooleanVar(value=True)
         self.include_appendix_var = tk.BooleanVar(value=True)
         self.include_charts_var = tk.BooleanVar(value=True)
+        self.include_prior_var = tk.BooleanVar(value=True)
         self.include_kickback_var = tk.BooleanVar(value=False)
         self.email_var = tk.BooleanVar(value=True)
         self.xlsx_var = tk.BooleanVar(value=False)
@@ -411,8 +412,16 @@ class BrandMeetingPacketGUI:
         )
         self.btn_build_email.grid(row=2, column=0, columnspan=2, sticky="ew")
 
+        self.btn_all_store_slow = ttk.Button(
+            actions_body,
+            text="Store SKU Cuts",
+            style="Secondary.TButton",
+            command=self._on_all_store_slow_movers,
+        )
+        self.btn_all_store_slow.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
         self.progress = ttk.Progressbar(actions_body, mode="indeterminate")
-        self.progress.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 8))
+        self.progress.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 8))
 
         tk.Label(
             actions_body,
@@ -421,7 +430,7 @@ class BrandMeetingPacketGUI:
             fg=self.colors["text"],
             font=self.fonts["chip"],
             anchor="w",
-        ).grid(row=4, column=0, columnspan=2, sticky="w")
+        ).grid(row=5, column=0, columnspan=2, sticky="w")
         tk.Label(
             actions_body,
             textvariable=self.activity_var,
@@ -431,7 +440,7 @@ class BrandMeetingPacketGUI:
             justify="left",
             wraplength=520,
             anchor="w",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         help_card, _, help_body = self._make_card(
             parent,
@@ -459,6 +468,11 @@ class BrandMeetingPacketGUI:
             "Download + Build + Email",
             "Smart full run. Reuses the current run cache first and only downloads missing data unless Force Refresh is enabled in the Data tab.",
         ).pack(fill="x")
+        self._make_help_row(
+            help_body,
+            "Store SKU Cuts",
+            "Builds a store-by-store PDF plus XLSX that keeps every location separate and highlights which brand SKUs to cut or review inside each store. If email is enabled, it sends both files when the run finishes.",
+        ).pack(fill="x", pady=(10, 0))
 
     def _build_brands_tab(self, parent: tk.Widget) -> None:
         parent.grid_columnconfigure(0, weight=3)
@@ -714,43 +728,55 @@ class BrandMeetingPacketGUI:
         ).grid(row=2, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
-            text="Include kickback adjustments",
-            variable=self.include_kickback_var,
+            text="Include prior comparison data",
+            variable=self.include_prior_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
         ).grid(row=3, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
-            text="Email after full run",
-            variable=self.email_var,
+            text="Include kickback adjustments",
+            variable=self.include_kickback_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
         ).grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(
+            options_body,
+            text="Email supported runs",
+            variable=self.email_var,
+            style="Card.TCheckbutton",
+            command=self._update_header_summary,
+        ).grid(row=5, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Generate XLSX workbook",
             variable=self.xlsx_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=5, column=0, sticky="w", pady=2)
+        ).grid(row=6, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Force refresh downloads",
             variable=self.force_refresh_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=6, column=0, sticky="w", pady=(8, 8))
+        ).grid(row=7, column=0, sticky="w", pady=(8, 8))
 
         self._make_help_row(
             options_body,
             "Smart cache reuse",
             "Default mode. Existing sales and catalog files in the run folder are reused first so repeat runs are fast and do not keep downloading the same data.",
-        ).grid(row=7, column=0, sticky="ew", pady=(8, 8))
+        ).grid(row=8, column=0, sticky="ew", pady=(8, 8))
+        self._make_help_row(
+            options_body,
+            "Prior comparison data",
+            "When enabled, the app loads the prior comparable window so delta views can compare against it. Turn it off to keep downloads to the selected dates only.",
+        ).grid(row=9, column=0, sticky="ew", pady=(0, 8))
         self._make_help_row(
             options_body,
             "Force refresh downloads",
             "Use this only when you know the saved files are stale and want fresh exports. Build-only modes still stay build-only and reuse saved files.",
-        ).grid(row=8, column=0, sticky="ew")
+        ).grid(row=10, column=0, sticky="ew")
 
     def _build_activity_tab(self, parent: tk.Widget) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -1427,6 +1453,7 @@ class BrandMeetingPacketGUI:
             )
             email_state = "On" if self.email_var.get() else "Off"
             xlsx_state = "On" if self.xlsx_var.get() else "Off"
+            prior_state = "On" if self.include_prior_var.get() else "Off"
             next_step = ""
             if brand_count == 0:
                 next_step = "  •  Next: open Brands and queue at least one brand."
@@ -1434,7 +1461,7 @@ class BrandMeetingPacketGUI:
                 next_step = "  •  Next: pick at least one store in Data & Output."
             self.setup_summary_var.set(
                 f"Brands: {brand_count}  •  Stores: {store_count}  •  Window: {start_day.isoformat()} to {end_day.isoformat()}  •  "
-                f"Email: {email_state}  •  XLSX: {xlsx_state}  •  Cache: {'Force refresh' if self.force_refresh_var.get() else 'Smart reuse'}"
+                f"Email: {email_state}  •  XLSX: {xlsx_state}  •  Prior: {prior_state}  •  Cache: {'Force refresh' if self.force_refresh_var.get() else 'Smart reuse'}"
                 f"{next_step}"
             )
         except Exception:
@@ -1545,6 +1572,7 @@ class BrandMeetingPacketGUI:
             include_store_sections=self.include_store_var.get(),
             include_product_appendix=self.include_appendix_var.get(),
             include_charts=self.include_charts_var.get(),
+            include_prior_window_data=self.include_prior_var.get(),
             include_kickback_adjustments=self.include_kickback_var.get(),
             email_results=email_results,
             generate_xlsx=self.xlsx_var.get(),
@@ -1610,10 +1638,18 @@ class BrandMeetingPacketGUI:
         if raw.startswith("[START] Building Brand Meeting Packet for "):
             brand = raw.split(" for ", 1)[-1].strip("'")
             return f"Starting packet for {brand}", "info"
+        if raw.startswith("[START] Building store-level SKU cut report"):
+            return "Starting store SKU cut report", "info"
+        if raw.startswith("[START] Building all-store slow mover report"):
+            return "Starting all-store slow mover report", "info"
         if raw.startswith("[RUN] Build-only mode:"):
             return "Building packet from cached files only", "info"
         if raw.startswith("[RUN] Build + Email (No Download):"):
             return "Building and emailing from cached files only", "info"
+        if raw.startswith("[RUN] Store SKU cut report:"):
+            return "Running the store-by-store SKU cut report across all stores", "info"
+        if raw.startswith("[RUN] All-store slow mover report:"):
+            return "Running all-store slow mover report across all stores", "info"
         if raw.startswith("[SALES] Reusing"):
             return "Using saved sales files from this run", "info"
         if raw.startswith("[SALES] Seeded"):
@@ -1648,10 +1684,22 @@ class BrandMeetingPacketGUI:
             return "No matching sales rows were found for the selected brand and window", "warn"
         if raw.startswith("[STORE] Skipping"):
             return raw.replace("[STORE] ", ""), "warn"
+        if raw.startswith("[PDF] Created (Store SKU Cuts):"):
+            return "Store SKU cut PDF created", "success"
+        if raw.startswith("[PDF] Created (All-Store Slow Movers):"):
+            return "All-store slow mover PDF created", "success"
         if raw.startswith("[PDF] Created"):
             return "PDF packet created", "success"
         if raw.startswith("[XLSX] Created"):
             return "Workbook created", "success"
+        if raw.startswith("[DONE] Store SKU cut report ready:"):
+            return "Store SKU cut workbook created", "success"
+        if raw.startswith("[DONE] All-store slow mover report ready:"):
+            return "All-store slow mover workbook created", "success"
+        if raw.startswith("[EMAIL] Sent store SKU cut report to"):
+            return "Store SKU cut email sent", "success"
+        if raw.startswith("[EMAIL] Sent all-store slow mover report to"):
+            return "All-store slow mover email sent", "success"
         if raw.startswith("[EMAIL] Sent packet to"):
             return "Packet email sent", "success"
         if raw == "Done ✅":
@@ -1699,6 +1747,7 @@ class BrandMeetingPacketGUI:
         self.btn_build.configure(state=state)
         self.btn_build_email.configure(state=state)
         self.btn_all.configure(state=state)
+        self.btn_all_store_slow.configure(state=state)
 
     def _run_background(self, fn, start_message: str, finish_message: str) -> None:
         if self.worker_running:
@@ -1759,10 +1808,8 @@ class BrandMeetingPacketGUI:
         output_root: Path,
     ) -> None:
         paths = bmp.build_run_paths(output_root, brand, start_day, end_day)
-        n_days = bmp.window_days(start_day, end_day)
-        prior_report_end = start_day - timedelta(days=1)
-        prior_report_start = prior_report_end - timedelta(days=n_days - 1)
-        acquisition_start = min(start_day, prior_report_start)
+        prior_report_start, _prior_report_end = bmp.compute_prior_report_window(start_day, end_day)
+        acquisition_start = prior_report_start if self.include_prior_var.get() else start_day
         acquisition_end = end_day
 
         sales_paths, missing, _did_export = bmp.prepare_sales_exports(
@@ -1870,6 +1917,29 @@ class BrandMeetingPacketGUI:
             _task,
             start_message="Running cache-aware download, build, and email...",
             finish_message="Full run finished",
+        )
+
+    def _on_all_store_slow_movers(self) -> None:
+        def _task() -> None:
+            start_day, end_day = self._resolve_window()
+            output_root = Path(self.output_dir_var.get().strip() or bmp.DEFAULT_OUTPUT_ROOT).expanduser().resolve()
+            all_stores = bmp.order_store_codes(list(bmp.store_abbr_map.values()))
+            self._queue_log("[RUN] Store SKU cut report: using every store, but keeping each store separate.")
+            artifacts = bmp.generate_all_store_slow_mover_report(
+                start_day=start_day,
+                end_day=end_day,
+                output_root=output_root,
+                selected_store_codes=all_stores,
+                force_refresh_data=self.force_refresh_var.get(),
+                email_results=self.email_var.get(),
+                logger=self._queue_log,
+            )
+            self._queue_log(f"[DONE] Store SKU cut report ready: {artifacts.pdf_path}")
+
+        self._run_background(
+            _task,
+            start_message="Building the store-by-store SKU cut PDF and workbook...",
+            finish_message="Store SKU cut report finished",
         )
 
 

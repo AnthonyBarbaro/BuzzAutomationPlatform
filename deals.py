@@ -356,7 +356,7 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ['710']
     },
     "Blem": {
-        'vendors': ['SSAL HORTICULTURE LLC'],
+        'vendors': ['SSAL HORTICULTURE LLC','LB Atlantis LLC'],
         'days': ['Thursday'],
         'discount': 0.50,
         'kickback': 0.30,
@@ -376,24 +376,6 @@ DEFAULT_BRAND_CRITERIA = {
         'kickback': 0.30,
         'brands': ['Drops | ']
     },
-    # "Seed Junky": {
-    #     'vendors': ['Seed Junky | LCISM Corp','Garden Of Weeden Inc.','Vino & Cigarro, LLC','Garden Of Weeden'],
-    #     'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-    #     'discount': 0.50,
-    #     'kickback': 0.30,
-    #     'brands': ['Seed Junky'],
-    #     # 'rules': [
-    #     #     {
-    #     #         'rule_name': 'SeedJunky - Sunday (50/30)',
-    #     #         'days': ['Sunday'],
-    #     #     },
-    #     #     {
-    #     #         'rule_name': 'SeedJunky - 8ths (50/30))',
-    #     #         'days': ['Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday','Monday'],
-    
-    #     #     },
-    #     #         ]
-    # },
     "KEEF": {
         'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','GB2, LLC'],
         'days': ['Tuesday','Wednesday'],
@@ -458,7 +440,6 @@ DEFAULT_BRAND_CRITERIA = {
     "Raw Garden": {
         'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
         'days': ['Wednesday','Tuesday'],
-        #'days': ['Wednesday'],
         'discount': 0.50,
         'kickback': 0.30,
         'brands': ['Raw Garden |']
@@ -542,14 +523,7 @@ DEFAULT_BRAND_CRITERIA = {
                 # inherits base 0.40 / 0.00
             },
         ],
-    },
-    # "PBR-NYF-STIDES": {
-    #     'vendors': ['Garden Of Weeden','Garden Of Weeden Inc.'],
-    #     'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-    #     'discount': 0.50,
-    #     'kickback': 0.0,
-    #     'brands': ['NYF |','PBR |','St. Ides |'],
-    # },  
+    }, 
     'CLSICS': {'vendors': ['KIVA / LCISM CORP','Garden Of Weeden Inc.','Vino & Cigarro, LLC'],
             'days': ['Tuesday'],
             'discount': 0.5,
@@ -622,8 +596,9 @@ DEFAULT_BRAND_CRITERIA = {
            'kickback': 0.30,
            'brands': ['Lyfe Sauce |']},
     'Good Good': {'vendors': ['KMMK Distribution Inc.'],
-           'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-           'discount': 0.3,
+           #'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+           'days': ['Thursday','Friday','Saturday','Sunday'],
+           'discount': 0.5,
            'kickback': 0.0,
            'brands': ['Goodgood |']},
     'Lime': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
@@ -631,7 +606,6 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.50,
            'kickback': 0.30,
            'brands': ['LIME |']},
-
 }
 
 brand_criteria = DEFAULT_BRAND_CRITERIA
