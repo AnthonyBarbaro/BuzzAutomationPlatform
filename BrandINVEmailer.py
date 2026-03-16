@@ -39,7 +39,7 @@ from openpyxl.styles import Font, Alignment, PatternFill
 INPUT_DIRECTORY = "files"       # Where CSVs land
 LOCAL_REPORTS_FOLDER = "brand_reports_tmp"  # Local subfolder for generated reports
 INVENTORY_LINKS_DIR = "inventory_links"
-
+BASE_DIR = "/home/anthony/projects/BuzzPythonGUI"
 BRAND_CONFIG_JSON = "brand_config.json"
 
 # Google Drive parent folder name (where we create subfolders by date)
@@ -467,6 +467,14 @@ def process_file(file_path, output_directory, selected_brands):
 
     available_data.sort_values(by=sort_cols, inplace=True, na_position='last')
 
+    unavailable_sort_cols = []
+    if 'Category' in unavailable_data.columns:
+        unavailable_sort_cols.append('Category')
+    if 'Product' in unavailable_data.columns:
+        unavailable_sort_cols.append('Product')
+    if unavailable_sort_cols:
+        unavailable_data.sort_values(by=unavailable_sort_cols, inplace=True, na_position='last')
+
     # Drop Cost column after sorting
     if 'Cost' in available_data.columns:
         available_data = available_data.drop(columns=['Cost'])
@@ -577,7 +585,7 @@ def process_files(input_directory, output_directory, selected_brands):
 # ------------------------------------------------------------------------------
 
 def main():
-    # 1) Clear out old CSVs from the "files" directory
+    # # 1) Clear out old CSVs from the "files" directory
     if os.path.exists(INPUT_DIRECTORY):
         for filename in os.listdir(INPUT_DIRECTORY):
             file_path = os.path.join(INPUT_DIRECTORY, filename)
@@ -665,7 +673,7 @@ def main():
     # 5) Optionally call getCatalog.py
     try:
         print("[INFO] Running getCatalog.py to fetch latest CSV files ...")
-        subprocess.check_call(["python", "getCatalog.py", INPUT_DIRECTORY])
+        subprocess.check_call([sys.executable, os.path.join(BASE_DIR, "getCatalog.py"), INPUT_DIRECTORY])
         print("[INFO] CSV fetch complete.")
     except FileNotFoundError:
         print("[WARN] getCatalog.py not found, skipping CSV fetch step.")
