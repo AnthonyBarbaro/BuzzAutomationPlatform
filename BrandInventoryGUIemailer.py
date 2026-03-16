@@ -29,7 +29,7 @@ import pandas as pd
 import traceback
 from datetime import datetime
 import subprocess
-
+import sys
 # For Excel formatting
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
@@ -644,7 +644,7 @@ class BrandInventoryGUI:
             print(f"[INFO] Cleared files in input folder: {in_dir}")
 
             # Run getCatalog
-            subprocess.check_call(["python", "getCatalog.py", in_dir])
+            subprocess.check_call([sys.executable, "getCatalog.py", in_dir])
             self.hide_loading()
             messagebox.showinfo("Success", "CSV files fetched from getCatalog.py (after clearing input folder).")
         except subprocess.CalledProcessError as e:
