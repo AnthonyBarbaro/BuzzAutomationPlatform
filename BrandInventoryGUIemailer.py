@@ -34,6 +34,11 @@ import sys
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
+from inventory_order_reports import (
+    build_brand_order_sections,
+    extract_store_code_from_filename,
+    summarize_order_report_files,
+)
 
 # Google API imports
 import google.auth.transport.requests
@@ -60,6 +65,7 @@ DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 # Gmail API Scopes
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+ORDER_REPORT_SCRIPT = "getInventoryOrderReport.py"
 
 # Required CSV columns + optional
 REQUIRED_COLUMNS = ["Available", "Product", "Brand"]
@@ -85,7 +91,8 @@ def load_config():
     Reads the first two lines of config.txt:
         1) input_dir
         2) output_dir
-    If missing or invalid, returns (None, None).
+        3) optional fetch_order_reports flag
+    If missing or invalid, returns (None, None, True).
     """
     if os.path.exists(CONFIG_FILE):
         try:
@@ -94,12 +101,56 @@ def load_config():
                 if len(lines) >= 2:
                     input_dir = lines[0].strip()
                     output_dir = lines[1].strip()
-                    return input_dir, output_dir
+                    fetch_order_reports = True
+                    if len(lines) >= 3:
+                        raw_flag = lines[2].strip()
+                        if "=" in raw_flag:
+                            raw_flag = raw_flag.split("=", 1)[1].strip()
+                        fetch_order_reports = raw_flag.lower() not in ("0", "false", "no", "off")
+                    return input_dir, output_dir, fetch_order_reports
         except:
             pass
-    return None, None
+    return None, None, True
 
-def save_config(input_dir, output_dir):
+
+def clear_old_input_exports(directory, clear_order_reports=True):
+    if not directory or not os.path.isdir(directory):
+        return
+
+    order_pattern = re.compile(
+        r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
+        re.IGNORECASE,
+    )
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        if not os.path.isfile(file_path):
+            continue
+        should_delete = filename.lower().endswith(".csv")
+        if clear_order_reports and order_pattern.match(filename):
+            should_delete = True
+        if should_delete:
+            os.remove(file_path)
+            print(f"[INFO] Deleted old source export: {file_path}")
+
+
+def fetch_inventory_order_reports(output_directory):
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ORDER_REPORT_SCRIPT)
+    if not os.path.exists(script_path):
+        print(f"[WARN] {ORDER_REPORT_SCRIPT} not found, skipping order-report fetch.")
+        return False
+
+    try:
+        print("[INFO] Running getInventoryOrderReport.py for 7d/14d/30d source files ...")
+        subprocess.check_call([sys.executable, script_path, output_directory])
+        print("[INFO] Inventory order report fetch complete.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] {ORDER_REPORT_SCRIPT} failed: {e}")
+    except Exception as e:
+        print(f"[ERROR] Unexpected order-report fetch failure: {e}")
+    return False
+
+def save_config(input_dir, output_dir, fetch_order_reports=True):
     """
     Writes input_dir and output_dir to config.txt so next run loads them automatically.
     """
@@ -107,6 +158,7 @@ def save_config(input_dir, output_dir):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             f.write(input_dir + "\n")
             f.write(output_dir + "\n")
+            f.write(f"fetch_order_reports={'1' if fetch_order_reports else '0'}\n")
     except Exception as e:
         print(f"[ERROR] Could not write config.txt: {e}")
 
@@ -241,6 +293,12 @@ def advanced_format_excel(xlsx_path):
             cell.alignment = Alignment(horizontal='center', vertical='center')
             cell.fill = header_fill
 
+        header_map = {
+            (cell.value or "").strip().lower(): idx
+            for idx, cell in enumerate(ws[1], start=1)
+            if cell.value
+        }
+
         # Auto-fit columns
         for col in ws.columns:
             max_len = 0
@@ -253,12 +311,57 @@ def advanced_format_excel(xlsx_path):
                         max_len = length
             ws.column_dimensions[col_letter].width = max_len + 3
 
+        product_col_idx = header_map.get("product name") or header_map.get("product")
+        if product_col_idx:
+            product_letter = get_column_letter(product_col_idx)
+            ws.column_dimensions[product_letter].width = max(
+                42,
+                min(ws.column_dimensions[product_letter].width or 42, 52),
+            )
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=product_col_idx).alignment = Alignment(
+                    wrap_text=True,
+                    vertical="top",
+                )
+
+        notes_col_idx = header_map.get("reorder notes")
+        if notes_col_idx:
+            notes_letter = get_column_letter(notes_col_idx)
+            ws.column_dimensions[notes_letter].width = max(
+                28,
+                min(ws.column_dimensions[notes_letter].width or 28, 34),
+            )
+
+        suggested_col_idx = next(
+            (
+                idx for name, idx in header_map.items()
+                if name.startswith("suggested order qty")
+            ),
+            None,
+        )
+        if suggested_col_idx:
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=suggested_col_idx).font = Font(bold=True)
+
+        priority_col_idx = header_map.get("reorder priority")
+        if priority_col_idx:
+            color_rules = {
+                "Urgent": "FECACA",
+                "Reorder Now": "FED7AA",
+                "Reorder Soon": "FEF08A",
+                "Check PO": "BFDBFE",
+                "Watch": "FDE68A",
+                "Healthy": "BBF7D0",
+                "No Recent Sales": "E5E7EB",
+            }
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row, column=priority_col_idx)
+                color = color_rules.get(str(cell.value or "").strip())
+                if color:
+                    cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+
         # Insert grouping rows for 'Category'
-        category_index = None
-        for i, cell in enumerate(ws[1], start=1):
-            if (cell.value or "").lower() == "category":
-                category_index = i
-                break
+        category_index = header_map.get("category")
         if category_index:
             rows_data = list(ws.iter_rows(min_row=2, values_only=True))
             if rows_data:
@@ -313,7 +416,7 @@ def extract_strain_type(product_name):
     return ""
 
 # ----------------- CSV -> XLSX: Avail + Unavail -----------------
-def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True):
+def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True, order_reports_dir=None):
     """
     Splits CSV rows into:
       - Available: Available>2
@@ -393,9 +496,18 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
     # Also normalize brand in the unavailable set
     if "Brand" in unavailable_df.columns and not unavailable_df.empty:
         unavailable_df.loc[:, "Brand"] = unavailable_df["Brand"].astype(str).str.strip().str.lower()
+    if not unavailable_df.empty:
+        unavailable_sort_cols = []
+        if "Category" in unavailable_df.columns:
+            unavailable_sort_cols.append("Category")
+        if "Product" in unavailable_df.columns:
+            unavailable_sort_cols.append("Product")
+        if unavailable_sort_cols:
+            unavailable_df = unavailable_df.sort_values(by=unavailable_sort_cols, na_position="last")
 
     os.makedirs(out_dir, exist_ok=True)
     base_csv_name = os.path.splitext(os.path.basename(csv_path))[0]
+    store_code = extract_store_code_from_filename(base_csv_name)
 
     # Group the *available* portion by brand
     brand_map = {}
@@ -411,6 +523,11 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
 
         out_name = f"{base_csv_name}_{safe_brand}.xlsx"
         out_path = os.path.join(out_dir, out_name)
+        order_sections = build_brand_order_sections(
+            order_reports_dir or os.path.dirname(csv_path),
+            brand_aliases=[brand_name_lower],
+            store_code=store_code,
+        )
 
         # Ensure output directory exists (extra safety)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -418,6 +535,8 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
             brand_data.to_excel(writer, index=False, sheet_name="Available")
             if not brand_unavail.empty:
                 brand_unavail.to_excel(writer, index=False, sheet_name="Unavailable")
+            for sheet_name, section_df in order_sections.items():
+                section_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
         advanced_format_excel(out_path)
 
@@ -488,11 +607,12 @@ class BrandInventoryGUI:
         self.master.option_add("*Button.Foreground", "white")
         self.master.option_add("*Button.Font", ("Segoe UI", 10, "bold"))
         # Load config, if present
-        init_in, init_out = load_config()
+        init_in, init_out, init_fetch_order_reports = load_config()
 
         self.input_dir_var = tk.StringVar(value=init_in if init_in else "")
         self.output_dir_var = tk.StringVar(value=init_out if init_out else "")
         self.emails_var = tk.StringVar()
+        self.fetch_order_reports_var = tk.BooleanVar(value=init_fetch_order_reports)
         
         # Row 1: input folder
         row1 = tk.Frame(self.frame)
@@ -513,6 +633,12 @@ class BrandInventoryGUI:
         row3.pack(pady=5, fill="x")
         tk.Button(row3, text="Update Files", command=self.get_files, width=15).pack(side="left", padx=10)
         tk.Button(row3, text="Load Brands", command=self.load_brands, width=15).pack(side="left", padx=10)
+        tk.Checkbutton(
+            row3,
+            text="Update Order Reports",
+            variable=self.fetch_order_reports_var,
+            bg="#f5f5f5",
+        ).pack(side="left", padx=10)
                 # Row 5: emails
         row5 = tk.Frame(self.frame)
         row5.pack(pady=5, fill="x")
@@ -620,10 +746,13 @@ class BrandInventoryGUI:
 
     def get_files(self):
         """
-        Clears the input folder and calls getCatalog.py to fetch new CSVs.
+        Clears prior source exports and refreshes catalog CSVs, with an
+        optional inventory-order report refresh.
         Shows a loading screen while running.
         """
         in_dir = self.input_dir_var.get().strip()
+        out_dir = self.output_dir_var.get().strip()
+        fetch_order_reports = self.fetch_order_reports_var.get()
 
         if not in_dir or not os.path.isdir(in_dir):
             messagebox.showerror("Error", "Please choose a valid input folder first.")
@@ -636,17 +765,30 @@ class BrandInventoryGUI:
         self.show_loading("Updating files...")
 
         try:
-            # Clear the input folder
-            for file in os.listdir(in_dir):
-                file_path = os.path.join(in_dir, file)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-            print(f"[INFO] Cleared files in input folder: {in_dir}")
+            clear_old_input_exports(in_dir, clear_order_reports=fetch_order_reports)
 
             # Run getCatalog
             subprocess.check_call([sys.executable, "getCatalog.py", in_dir])
+            order_reports_ok = True
+            if fetch_order_reports:
+                order_reports_ok = fetch_inventory_order_reports(in_dir)
             self.hide_loading()
-            messagebox.showinfo("Success", "CSV files fetched from getCatalog.py (after clearing input folder).")
+            save_config(in_dir, out_dir, fetch_order_reports)
+            if not fetch_order_reports:
+                messagebox.showinfo(
+                    "Success",
+                    "Catalog CSVs were refreshed. Inventory order report refresh was skipped.",
+                )
+            elif order_reports_ok:
+                messagebox.showinfo(
+                    "Success",
+                    "Catalog CSVs and inventory order report files were refreshed.",
+                )
+            else:
+                messagebox.showwarning(
+                    "Partial Success",
+                    "Catalog CSVs were refreshed, but the inventory order report refresh failed.",
+                )
         except subprocess.CalledProcessError as e:
             self.hide_loading()
             messagebox.showerror("Error", f"getCatalog.py failed:\n{e}")
@@ -729,7 +871,13 @@ class BrandInventoryGUI:
             for fname in os.listdir(in_dir):
                 if fname.lower().endswith(".csv"):
                     path = os.path.join(in_dir, fname)
-                    brand_map = generate_brand_reports( path, out_dir, selected_brands, include_cost=self.include_cost_var.get())
+                    brand_map = generate_brand_reports(
+                        path,
+                        out_dir,
+                        selected_brands,
+                        include_cost=self.include_cost_var.get(),
+                        order_reports_dir=in_dir,
+                    )
                     # Merge
                     for b_name, xlsx_list in brand_map.items():
                         if b_name not in all_brand_map:
@@ -753,11 +901,20 @@ class BrandInventoryGUI:
                 lines.append(f"<p><a href='{link}'>{link}</a></p>")
 
             joined = "\n".join(lines)
+            order_summary = summarize_order_report_files(in_dir)
+            order_note = ""
+            if order_summary:
+                order_note = (
+                    "<p>Matching Dutchie order-report rows were added to the "
+                    "<strong>Order_7d</strong>, <strong>Order_14d</strong>, and "
+                    f"<strong>Order_30d</strong> tabs when available. Source windows found: {order_summary}.</p>"
+                )
             body_html = f"""
             <html>
               <body>
                 <p>Hello,</p>
                 <p>Here are the public Drive folders (with Available & Unavailable reports) for each brand:</p>
+                {order_note}
                 {joined}
                 <p>Anyone with these links can download the XLSX files.</p>
                 <p>Regards,<br>Brand Inventory Bot</p>
@@ -768,7 +925,7 @@ class BrandInventoryGUI:
             send_email_with_gmail_html(subject, body_html, emails)
 
             # 4) Save the chosen input/output folders to config.txt for next run
-            save_config(in_dir, out_dir)
+            save_config(in_dir, out_dir, self.fetch_order_reports_var.get())
 
             messagebox.showinfo("Success", "All done! Folders uploaded & email sent.")
         except Exception as e:

@@ -27,6 +27,7 @@ This repository is a Python automation stack (not a web backend) that:
 
 ### Core export/reporting
 - `getSalesReport.py` - Dutchie sales export automation for all stores/date range
+- `getInventoryOrderReport.py` - Dutchie inventory order report export automation for 7d/14d/30d windows
 - `getCatalog.py` - Dutchie catalog export automation
 - `getClosingReport.py` - closing report by day/store (GUI)
 - `owner_snapshot.py` - builds owner snapshot PDFs + summary email; can run fresh exports
@@ -113,6 +114,11 @@ Useful commands:
 ### 2) Owner snapshot (default window)
 ```bash
 .venv/bin/python owner_snapshot.py
+```
+
+### 2b) Inventory order reports (7d / 14d / 30d)
+```bash
+.venv/bin/python getInventoryOrderReport.py
 ```
 
 ### 3) Owner snapshot for one specific report day (example: Jan 31, 2026)

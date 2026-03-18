@@ -30,6 +30,11 @@ import time
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
+from inventory_order_reports import (
+    build_brand_order_sections,
+    extract_store_code_from_filename,
+    summarize_order_report_files,
+)
 
 # ------------------------------------------------------------------------------
 # ------------------------- CONFIG / CONSTANTS ----------------------------------
@@ -41,6 +46,7 @@ LOCAL_REPORTS_FOLDER = "brand_reports_tmp"  # Local subfolder for generated repo
 INVENTORY_LINKS_DIR = "inventory_links"
 BASE_DIR = "/home/anthony/projects/BuzzPythonGUI"
 BRAND_CONFIG_JSON = "brand_config.json"
+ORDER_REPORT_SCRIPT = "getInventoryOrderReport.py"
 
 # Google Drive parent folder name (where we create subfolders by date)
 DRIVE_PARENT_FOLDER_NAME = "INVENTORY"
@@ -243,6 +249,48 @@ def safe_makedirs(path):
     """Create directory if it doesn't exist."""
     if not os.path.exists(path):
         os.makedirs(path)
+
+
+def clear_old_input_exports(directory):
+    """
+    Remove prior catalog CSVs and prior inventory-order exports so a fresh run
+    does not mix old and new source data.
+    """
+    if not os.path.exists(directory):
+        return
+
+    order_pattern = re.compile(
+        r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
+        re.IGNORECASE,
+    )
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        if not os.path.isfile(file_path):
+            continue
+        if filename.lower().endswith(".csv") or order_pattern.match(filename):
+            try:
+                os.remove(file_path)
+                print(f"[INFO] Deleted old source export: {file_path}")
+            except Exception as e:
+                print(f"[ERROR] Could not delete {file_path}: {e}")
+
+
+def fetch_inventory_order_reports(output_directory):
+    script_path = os.path.join(BASE_DIR, ORDER_REPORT_SCRIPT)
+    if not os.path.exists(script_path):
+        print(f"[WARN] {ORDER_REPORT_SCRIPT} not found, skipping order-report fetch.")
+        return False
+
+    try:
+        print("[INFO] Running getInventoryOrderReport.py to fetch 7d/14d/30d order reports ...")
+        subprocess.check_call([sys.executable, script_path, output_directory])
+        print("[INFO] Inventory order report fetch complete.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] {ORDER_REPORT_SCRIPT} failed: {e}")
+    except Exception as e:
+        print(f"[ERROR] Unexpected order-report fetch failure: {e}")
+    return False
 
 
 def write_inventory_link_manifest(date_str, today_name, brand_folder_links, brand_to_emails):
@@ -485,6 +533,7 @@ def process_file(file_path, output_directory, selected_brands):
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     parts = base_name.split('_')
     store_name = parts[-1] if len(parts) > 1 else "Unknown"
+    store_code = extract_store_code_from_filename(base_name)
 
     # Create subfolder for this CSV
     sub_out = os.path.join(output_directory, base_name)
@@ -506,12 +555,19 @@ def process_file(file_path, output_directory, selected_brands):
         else:
             for brand_name, brand_data in available_data.groupby('Brand'):
                 out_xlsx = os.path.join(sub_out, f"{store_name}_{brand_name}_{today_str}.xlsx")
+                order_sections = build_brand_order_sections(
+                    INPUT_DIRECTORY,
+                    brand_aliases=[brand_name],
+                    store_code=store_code,
+                )
                 with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
                     brand_data.to_excel(writer, index=False, sheet_name="Available")
                     if not unavailable_data.empty and 'Brand' in unavailable_data.columns:
                         brand_unavail = unavailable_data[unavailable_data['Brand'] == brand_name]
                         if not brand_unavail.empty:
                             brand_unavail.to_excel(writer, index=False, sheet_name="Unavailable")
+                    for sheet_name, section_df in order_sections.items():
+                        section_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
                 format_excel_file(out_xlsx)
                 print(f"[INFO] Created {out_xlsx}")
@@ -585,16 +641,8 @@ def process_files(input_directory, output_directory, selected_brands):
 # ------------------------------------------------------------------------------
 
 def main():
-    # # 1) Clear out old CSVs from the "files" directory
-    if os.path.exists(INPUT_DIRECTORY):
-        for filename in os.listdir(INPUT_DIRECTORY):
-            file_path = os.path.join(INPUT_DIRECTORY, filename)
-            try:
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-                    print(f"[INFO] Deleted old CSV: {file_path}")
-            except Exception as e:
-                print(f"[ERROR] Could not delete {file_path}: {e}")
+    # 1) Clear out prior catalog/order source exports from the input directory.
+    clear_old_input_exports(INPUT_DIRECTORY)
 
     # 2) Determine today's day name
     today_name = datetime.datetime.now().strftime("%A")  # e.g. "Monday", "Tuesday"
@@ -680,6 +728,8 @@ def main():
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] getCatalog.py failed: {e}")
 
+    fetch_inventory_order_reports(INPUT_DIRECTORY)
+
     # ----------------------------------------------------------------
     # 6) synonyms_for_today => process CSV
     #    We pass ALL synonyms from synonym_to_folder
@@ -758,6 +808,15 @@ def main():
         email_groups[email_key].append(folder_name)
 
     for email_key, folder_list in email_groups.items():
+        order_summary = summarize_order_report_files(INPUT_DIRECTORY)
+        order_note = ""
+        if order_summary:
+            order_note = (
+                "<p>Matching Dutchie order-report rows were added to the "
+                "<strong>Order_7d</strong>, <strong>Order_14d</strong>, and "
+                f"<strong>Order_30d</strong> tabs when available. Source windows found: {order_summary}.</p>"
+            )
+
         brand_lines = []
         for f_name in folder_list:
             link = brand_folder_links.get(f_name)
@@ -774,6 +833,7 @@ def main():
         <body>
           <p>Hello,</p>
           <p>Below are your brand inventory reports for <strong>{today_name}</strong>.</p>
+          {order_note}
           {brand_html}
           <p>All files in that Drive folder are viewable by anyone with the link.</p>
           <p>Regards,<br>Buzz Cannabis</p>
