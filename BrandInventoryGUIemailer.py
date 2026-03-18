@@ -24,12 +24,14 @@ import os
 import re
 import shutil
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
 import pandas as pd
 import traceback
 from datetime import datetime
 import subprocess
 import sys
+import time
 # For Excel formatting
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
@@ -74,6 +76,20 @@ OPTIONAL_COLUMNS = ["Category", "Cost"]
 # We'll consider Available <= 2 => "Unavailable"
 MAX_AVAIL_FOR_UNAVAILABLE = 2
 
+DEFAULT_GUI_CONFIG = {
+    "input_dir": "",
+    "output_dir": "",
+    "fetch_order_reports": True,
+    "emails": "",
+    "include_cost": True,
+}
+
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+ORDER_REPORT_FILE_PATTERN = re.compile(
+    r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
+    re.IGNORECASE,
+)
+
 # ----------------------------------------------------------------------
 #                  CONFIG.TXT load/save
 # ----------------------------------------------------------------------
@@ -86,31 +102,53 @@ def safe_filename(name: str) -> str:
     name = name.strip()
     name = re.sub(r"[^\w\-]+", "_", name)
     return name
+
+
+def parse_bool_value(value, default=True):
+    if value is None:
+        return default
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def load_config():
     """
-    Reads the first two lines of config.txt:
+    Reads config.txt in a backwards-compatible format.
+    Legacy shape:
         1) input_dir
         2) output_dir
         3) optional fetch_order_reports flag
-    If missing or invalid, returns (None, None, True).
+    Newer shape:
+        key=value lines after the first two path lines
     """
+    cfg = dict(DEFAULT_GUI_CONFIG)
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                lines = f.read().strip().split("\n")
-                if len(lines) >= 2:
-                    input_dir = lines[0].strip()
-                    output_dir = lines[1].strip()
-                    fetch_order_reports = True
-                    if len(lines) >= 3:
-                        raw_flag = lines[2].strip()
-                        if "=" in raw_flag:
-                            raw_flag = raw_flag.split("=", 1)[1].strip()
-                        fetch_order_reports = raw_flag.lower() not in ("0", "false", "no", "off")
-                    return input_dir, output_dir, fetch_order_reports
+                lines = [line.rstrip("\n") for line in f.readlines() if line.strip()]
+
+            if len(lines) >= 1 and "=" not in lines[0]:
+                cfg["input_dir"] = lines[0].strip()
+            if len(lines) >= 2 and "=" not in lines[1]:
+                cfg["output_dir"] = lines[1].strip()
+
+            extra_lines = lines[2:] if len(lines) >= 2 else lines
+            for raw_line in extra_lines:
+                if "=" not in raw_line:
+                    cfg["fetch_order_reports"] = parse_bool_value(raw_line, True)
+                    continue
+
+                key, value = raw_line.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key == "fetch_order_reports":
+                    cfg["fetch_order_reports"] = parse_bool_value(value, True)
+                elif key == "emails":
+                    cfg["emails"] = value
+                elif key == "include_cost":
+                    cfg["include_cost"] = parse_bool_value(value, True)
         except:
             pass
-    return None, None, True
+    return cfg
 
 
 def clear_old_input_exports(directory, clear_order_reports=True):
@@ -150,15 +188,24 @@ def fetch_inventory_order_reports(output_directory):
         print(f"[ERROR] Unexpected order-report fetch failure: {e}")
     return False
 
-def save_config(input_dir, output_dir, fetch_order_reports=True):
+def save_config(
+    input_dir,
+    output_dir,
+    fetch_order_reports=True,
+    emails="",
+    include_cost=True,
+):
     """
-    Writes input_dir and output_dir to config.txt so next run loads them automatically.
+    Writes GUI settings to config.txt while keeping the first two lines as
+    plain paths for backwards compatibility with older runs.
     """
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             f.write(input_dir + "\n")
             f.write(output_dir + "\n")
             f.write(f"fetch_order_reports={'1' if fetch_order_reports else '0'}\n")
+            f.write(f"emails={emails.strip()}\n")
+            f.write(f"include_cost={'1' if include_cost else '0'}\n")
     except Exception as e:
         print(f"[ERROR] Could not write config.txt: {e}")
 
@@ -591,167 +638,1457 @@ def upload_brand_reports_to_drive(brand_reports_map):
 class BrandInventoryGUI:
     def __init__(self, master):
         self.master = master
-        
-        master.title("Brand Inventory Uploader")
-        master.geometry("800x600")  # Default window size
-        master.resizable(True, True)  # Allow resizing
-        self.frame = tk.Frame(master)
-        self.frame.pack(padx=10, pady=10)
-        self.master.configure(bg="#f5f5f5")
-        self.frame.configure(bg="#f5f5f5")
+        self.colors = {
+            "bg": "#EEF3EF",
+            "card": "#FFFFFF",
+            "hero": "#153B34",
+            "text": "#15312C",
+            "muted": "#64756F",
+            "border": "#D7E2DC",
+            "accent": "#177A69",
+            "accent_dark": "#115E53",
+            "accent_soft": "#E3F4EF",
+            "log_bg": "#F7FAF8",
+            "tab_idle": "#DCE7E2",
+            "tab_active": "#F6FBF8",
+        }
+        self.all_brands = []
+        self.filtered_brands = []
+        self.selected_brand_names = set()
+        self.autosave_job = None
+        self.jump_reset_job = None
+        self.quick_jump_buffer = ""
+        self.quick_jump_last_ts = 0.0
 
-        default_font = ("Segoe UI", 11)
-        self.master.option_add("*Font", default_font)
-        self.master.option_add("*Background", "#f5f5f5")
-        self.master.option_add("*Button.Background", "#4CAF50")
-        self.master.option_add("*Button.Foreground", "white")
-        self.master.option_add("*Button.Font", ("Segoe UI", 10, "bold"))
-        # Load config, if present
-        init_in, init_out, init_fetch_order_reports = load_config()
+        cfg = load_config()
 
-        self.input_dir_var = tk.StringVar(value=init_in if init_in else "")
-        self.output_dir_var = tk.StringVar(value=init_out if init_out else "")
-        self.emails_var = tk.StringVar()
-        self.fetch_order_reports_var = tk.BooleanVar(value=init_fetch_order_reports)
-        
-        # Row 1: input folder
-        row1 = tk.Frame(self.frame)
-        row1.pack(pady=5, fill="x")
-        tk.Label(row1, text="Input Folder:").pack(side="left")
-        tk.Entry(row1, textvariable=self.input_dir_var, width=50, relief="solid", bd=1).pack(side="left", padx=5)
-        tk.Button(row1, text="Browse", command=self.browse_input).pack(side="left")
+        self.master.title("Buzz Brand Inventory Studio")
+        self.master.geometry("980x620")
+        self.master.minsize(900, 520)
+        self.master.configure(bg=self.colors["bg"])
 
-        # Row 2: output folder
-        row2 = tk.Frame(self.frame)
-        row2.pack(pady=5, fill="x")
-        tk.Label(row2, text="Output Folder:").pack(side="left")
-        tk.Entry(row2, textvariable=self.output_dir_var, width=50, relief="solid", bd=1).pack(side="left", padx=5)
-        tk.Button(row2, text="Browse", command=self.browse_output).pack(side="left")
+        self.input_dir_var = tk.StringVar(value=cfg.get("input_dir", ""))
+        self.output_dir_var = tk.StringVar(value=cfg.get("output_dir", ""))
+        self.emails_var = tk.StringVar(value=cfg.get("emails", ""))
+        self.fetch_order_reports_var = tk.BooleanVar(value=cfg.get("fetch_order_reports", True))
+        self.include_cost_var = tk.BooleanVar(value=cfg.get("include_cost", True))
+        self.brand_search_var = tk.StringVar()
 
-        # Row 3: Buttons => get files, load brands
-        row3 = tk.Frame(self.frame)
-        row3.pack(pady=5, fill="x")
-        tk.Button(row3, text="Update Files", command=self.get_files, width=15).pack(side="left", padx=10)
-        tk.Button(row3, text="Load Brands", command=self.load_brands, width=15).pack(side="left", padx=10)
-        tk.Checkbutton(
-            row3,
-            text="Update Order Reports",
-            variable=self.fetch_order_reports_var,
-            bg="#f5f5f5",
-        ).pack(side="left", padx=10)
-                # Row 5: emails
-        row5 = tk.Frame(self.frame)
-        row5.pack(pady=5, fill="x")
-        tk.Label(row5, text="Email(s) (comma-separated):").pack(anchor="w")
-        tk.Entry(row5, textvariable=self.emails_var, width=60, relief="solid", bd=1).pack()
-        # Row 5b: Cost toggle
-        self.include_cost_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-           row5,
-           text="Include Cost Column",
-           variable=self.include_cost_var,
-           bg="#f5f5f5"
-       ).pack(anchor="w", pady=3)
-        # Row 6: final run
-        row6 = tk.Frame(self.frame)
-        row6.pack(pady=1)
-        tk.Button(row6, text="Generate & Upload & Email", command=self.run_process, width=30).pack(padx=3, pady=5)
-        # Row 4: brand listbox
-        row4 = tk.Frame(self.frame)
-        row4.pack(pady=0, fill="both")
-        alpha_sidebar = tk.Frame(row4)
-        alpha_sidebar.pack(side="right", padx=5, pady=5)
-
-        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        cols = 4
-        for i, letter in enumerate(letters):
-            btn = tk.Button(alpha_sidebar, text=letter, width=3, command=lambda l=letter: self.scroll_to_letter(l))
-            btn.grid(row=i % 7, column=i // 7, padx=1, pady=1)  # 7 rows max
-
-        tk.Label(row4, text="Select brand(s):").pack(anchor="w")
-        self.brand_listbox = tk.Listbox(row4, selectmode=tk.MULTIPLE, height=18, width=50)
-        self.brand_listbox.pack(side="left", fill="both", expand=True)
-        scroll = tk.Scrollbar(row4, command=self.brand_listbox.yview)
-        scroll.pack(side="right", fill="y")
-        self.brand_listbox.config(borderwidth=1, relief="solid", highlightthickness=0, bg="white", selectbackground="#4CAF50", selectforeground="white")
-        scroll.config(bg="#f5f5f5", troughcolor="#e0e0e0", borderwidth=0)
-        self.brand_listbox.bind("<Key>", self.on_listbox_keypress)
-
-    def show_loading(self, message="Processing..."):
-        if hasattr(self, "loading_overlay") and self.loading_overlay.winfo_exists():
-            return  # Already shown
-
-        self.loading_overlay = tk.Frame(self.master, bg="#ffffff", bd=2, relief="ridge")
-        self.loading_overlay.place(relx=0.25, rely=0.4, relwidth=0.5, relheight=0.2)
-
-        self.loading_label = tk.Label(
-            self.loading_overlay,
-            text=message,
-            font=("Segoe UI", 14, "bold"),
-            bg="#ffffff",
-            fg="#333333"
+        self.status_var = tk.StringVar(value="Ready to refresh exports and build reports.")
+        self.status_detail_var = tk.StringVar(
+            value="Choose your source folders, review recipients, then refresh files or generate the report package."
         )
-        self.loading_label.place(relx=0.5, rely=0.5, anchor="center")
+        self.input_summary_var = tk.StringVar()
+        self.output_summary_var = tk.StringVar()
+        self.brand_summary_var = tk.StringVar(value="No brands loaded yet.")
+        self.email_summary_var = tk.StringVar(value="No recipients saved yet.")
+        self.order_reports_caption_var = tk.StringVar()
+        self.settings_state_var = tk.StringVar(
+            value="Auto-save is on. Folder choices, recipients, and toggles are stored as you work."
+        )
+        self.date_var = tk.StringVar(value=datetime.now().strftime("%A, %B %d, %Y"))
+        self.source_snapshot_var = tk.StringVar(value="No source folder scanned yet.")
+        self.order_window_summary_var = tk.StringVar(value="Dutchie order windows: none detected yet.")
+        self.brand_load_status_var = tk.StringVar(value="Brand library not loaded yet.")
+        self.brand_hint_var = tk.StringVar(
+            value="Ctrl+F focuses search. Type in the list for a quick prefix jump. Space toggles the active brand."
+        )
+        self.brand_total_var = tk.StringVar(value="0")
+        self.brand_visible_var = tk.StringVar(value="0")
+        self.brand_selected_var = tk.StringVar(value="0")
+        self.catalog_count_var = tk.StringVar(value="0")
+        self.order_file_count_var = tk.StringVar(value="0")
+        self.recipient_count_var = tk.StringVar(value="0")
 
-        self.master.update()  # Force GUI redraw
+        self._configure_styles()
+        self._build_layout()
+        self._bind_events()
+        self._refresh_path_summaries()
+        self._refresh_source_snapshot()
+        self._update_email_display()
+        self._update_order_report_caption()
+        self._update_brand_summary()
+        self.append_log("Workspace ready.")
+        self.master.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.master.after(150, self._autoload_saved_workspace)
 
-    def hide_loading(self):
-        if hasattr(self, "loading_overlay") and self.loading_overlay.winfo_exists():
-            self.loading_overlay.destroy()
-    def scroll_to_letter(self, letter):
-        for i in range(self.brand_listbox.size()):
-            item = self.brand_listbox.get(i)
-            if item.lower().startswith(letter.lower()):
-                self._flash_listbox_item(i)
-                break
+    def _configure_styles(self):
+        self.style = ttk.Style(self.master)
+        if "clam" in self.style.theme_names():
+            self.style.theme_use("clam")
 
-    def on_listbox_keypress(self, event):
-        typed_char = event.char.lower()
-        if not typed_char.isalpha():
+        self.style.configure(
+            "App.TButton",
+            font=("Segoe UI", 10, "bold"),
+            padding=(14, 10),
+            background=self.colors["card"],
+            foreground=self.colors["text"],
+            borderwidth=0,
+        )
+        self.style.map(
+            "App.TButton",
+            background=[("active", "#F1F5F2"), ("pressed", "#E4EBE7")],
+        )
+
+        self.style.configure(
+            "Primary.TButton",
+            font=("Segoe UI", 10, "bold"),
+            padding=(16, 12),
+            background=self.colors["accent"],
+            foreground="#FFFFFF",
+            borderwidth=0,
+        )
+        self.style.map(
+            "Primary.TButton",
+            background=[("active", self.colors["accent_dark"]), ("pressed", self.colors["accent_dark"])],
+            foreground=[("disabled", "#FFFFFF")],
+        )
+
+        self.style.configure(
+            "Quiet.TButton",
+            font=("Segoe UI", 9, "bold"),
+            padding=(10, 7),
+            background=self.colors["accent_soft"],
+            foreground=self.colors["accent_dark"],
+            borderwidth=0,
+        )
+        self.style.map(
+            "Quiet.TButton",
+            background=[("active", "#D6EEE7"), ("pressed", "#C8E8DE")],
+        )
+
+        self.style.configure(
+            "App.TEntry",
+            fieldbackground="#FFFFFF",
+            bordercolor=self.colors["border"],
+            lightcolor=self.colors["border"],
+            darkcolor=self.colors["border"],
+            insertcolor=self.colors["text"],
+            padding=8,
+        )
+        self.style.configure(
+            "Card.TCheckbutton",
+            background=self.colors["card"],
+            foreground=self.colors["text"],
+            font=("Segoe UI", 10),
+        )
+        self.style.map(
+            "Card.TCheckbutton",
+            background=[("active", self.colors["card"])],
+        )
+        self.style.configure(
+            "App.TNotebook",
+            background=self.colors["bg"],
+            borderwidth=0,
+            tabmargins=(0, 0, 0, 0),
+        )
+        self.style.configure(
+            "App.TNotebook.Tab",
+            background=self.colors["tab_idle"],
+            foreground=self.colors["text"],
+            padding=(16, 9),
+            font=("Segoe UI", 10, "bold"),
+            borderwidth=0,
+        )
+        self.style.map(
+            "App.TNotebook.Tab",
+            background=[
+                ("selected", "#FFFFFF"),
+                ("active", self.colors["tab_active"]),
+            ],
+            foreground=[
+                ("selected", self.colors["accent_dark"]),
+                ("active", self.colors["text"]),
+            ],
+        )
+
+    def _create_card(self, parent, title, subtitle=None):
+        card = tk.Frame(
+            parent,
+            bg=self.colors["card"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            bd=0,
+        )
+        accent_bar = tk.Frame(card, bg=self.colors["accent"], height=4)
+        accent_bar.pack(fill="x")
+
+        header = tk.Frame(card, bg=self.colors["card"])
+        header.pack(fill="x", padx=16, pady=(12, 4))
+
+        tk.Label(
+            header,
+            text=title,
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor="w")
+        if subtitle:
+            tk.Label(
+                header,
+                text=subtitle,
+                bg=self.colors["card"],
+                fg=self.colors["muted"],
+                font=("Segoe UI", 9),
+                wraplength=520,
+                justify="left",
+            ).pack(anchor="w", pady=(4, 0))
+
+        body = tk.Frame(card, bg=self.colors["card"])
+        body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+        return card, body
+
+    def _build_layout(self):
+        self.shell = tk.Frame(self.master, bg=self.colors["bg"])
+        self.shell.pack(fill="both", expand=True, padx=10, pady=10)
+        self.shell.grid_columnconfigure(0, weight=1)
+        self.shell.grid_rowconfigure(1, weight=1)
+
+        self._build_header()
+        self._build_tabs()
+
+    def _build_header(self):
+        header = tk.Frame(
+            self.shell,
+            bg=self.colors["card"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=12,
+            pady=10,
+        )
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            header,
+            text="Buzz Brand Inventory Studio",
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI Semibold", 15),
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            header,
+            textvariable=self.date_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        status_box = tk.Frame(header, bg="#F7FAF8", padx=10, pady=7)
+        status_box.grid(row=0, column=2, rowspan=2, sticky="e")
+        tk.Label(
+            status_box,
+            textvariable=self.status_var,
+            bg="#F7FAF8",
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            status_box,
+            textvariable=self.status_detail_var,
+            bg="#F7FAF8",
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            justify="left",
+            wraplength=280,
+        ).pack(anchor="w", pady=(2, 0))
+
+    def _build_summary_bar(self):
+        summary = tk.Frame(self.shell, bg=self.colors["bg"])
+        summary.grid(row=1, column=0, sticky="ew", pady=(14, 14))
+        for col in range(4):
+            summary.grid_columnconfigure(col, weight=1)
+
+        self._create_metric_tile(summary, "Catalog Exports", self.catalog_count_var).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 8),
+        )
+        self._create_metric_tile(summary, "Order Exports", self.order_file_count_var).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=4,
+        )
+        self._create_metric_tile(summary, "Recipients", self.recipient_count_var).grid(
+            row=0,
+            column=2,
+            sticky="ew",
+            padx=4,
+        )
+        self._create_metric_tile(summary, "Selected Brands", self.brand_selected_var).grid(
+            row=0,
+            column=3,
+            sticky="ew",
+            padx=(8, 0),
+        )
+
+    def _build_tabs(self):
+        self.notebook = ttk.Notebook(self.shell, style="App.TNotebook")
+        self.notebook.grid(row=1, column=0, sticky="nsew")
+
+        self.overview_tab = tk.Frame(self.notebook, bg=self.colors["bg"])
+        self.brands_tab = tk.Frame(self.notebook, bg=self.colors["bg"])
+        self.activity_tab = tk.Frame(self.notebook, bg=self.colors["bg"])
+
+        self.notebook.add(self.overview_tab, text="Run")
+        self.notebook.add(self.brands_tab, text="Brands")
+        self.notebook.add(self.activity_tab, text="Activity")
+
+        self._build_overview_tab()
+        self._build_brand_tab()
+        self._build_activity_tab()
+
+    def _build_overview_tab(self):
+        self.overview_tab.grid_columnconfigure(0, weight=1)
+        self.overview_tab.grid_rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(
+            self.overview_tab,
+            bg=self.colors["bg"],
+            highlightthickness=0,
+            bd=0,
+        )
+        scrollbar = ttk.Scrollbar(self.overview_tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = tk.Frame(canvas, bg=self.colors["bg"])
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+
+        content.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(content_window, width=event.width))
+
+        metrics = tk.Frame(content, bg=self.colors["bg"])
+        metrics.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        for col in range(4):
+            metrics.grid_columnconfigure(col, weight=1)
+        self._create_metric_tile(metrics, "Catalog", self.catalog_count_var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self._create_metric_tile(metrics, "Order", self.order_file_count_var).grid(row=0, column=1, sticky="ew", padx=2)
+        self._create_metric_tile(metrics, "Recipients", self.recipient_count_var).grid(row=0, column=2, sticky="ew", padx=2)
+        self._create_metric_tile(metrics, "Selected", self.brand_selected_var).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        workspace_card, workspace_body = self._create_card(
+            content,
+            "Workspace",
+            "Choose folders and save the setup you want to reopen next time.",
+        )
+        workspace_card.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 10))
+        self._build_settings_card(workspace_body)
+
+        actions_card, actions_body = self._create_card(
+            content,
+            "Workflow",
+            "Refresh files, load brands, then generate and email the finished reports.",
+        )
+        actions_card.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 10))
+        self._build_actions_card(actions_body)
+
+        delivery_card, delivery_body = self._create_card(
+            content,
+            "Recipients",
+            "Recipient emails save automatically and show up below in an easy-to-check list.",
+        )
+        delivery_card.grid(row=2, column=0, sticky="nsew", padx=(0, 6), pady=(0, 10))
+        self._build_delivery_card(delivery_body)
+
+        status_card, status_body = self._create_card(
+            content,
+            "Source Snapshot",
+            "A quick check of source files, order windows, and the last brand-library refresh.",
+        )
+        status_card.grid(row=2, column=1, sticky="nsew", padx=(6, 0), pady=(0, 10))
+        self._build_snapshot_card(status_body)
+
+    def _build_settings_card(self, body):
+        body.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            body,
+            text="Input Folder",
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Entry(body, textvariable=self.input_dir_var, style="App.TEntry").grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(4, 0),
+        )
+        ttk.Button(body, text="Browse", style="Quiet.TButton", command=self.browse_input).grid(
+            row=1,
+            column=2,
+            sticky="ew",
+            padx=(8, 0),
+        )
+        tk.Label(
+            body,
+            textvariable=self.input_summary_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            justify="left",
+            wraplength=420,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        tk.Label(
+            body,
+            text="Output Folder",
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=3, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(body, textvariable=self.output_dir_var, style="App.TEntry").grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(4, 0),
+        )
+        ttk.Button(body, text="Browse", style="Quiet.TButton", command=self.browse_output).grid(
+            row=4,
+            column=2,
+            sticky="ew",
+            padx=(8, 0),
+        )
+        tk.Label(
+            body,
+            textvariable=self.output_summary_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            justify="left",
+            wraplength=420,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        button_row = tk.Frame(body, bg=self.colors["card"])
+        button_row.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        button_row.grid_columnconfigure(0, weight=1)
+        ttk.Button(button_row, text="Save Settings", style="App.TButton", command=self.save_settings).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+        )
+        ttk.Button(
+            button_row,
+            text="Open Brands Tab",
+            style="Quiet.TButton",
+            command=lambda: self._select_tab(self.brands_tab),
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        tk.Label(
+            body,
+            textvariable=self.settings_state_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            justify="left",
+            wraplength=420,
+        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def _build_actions_card(self, body):
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            body,
+            text="Refresh 7d / 14d / 30d Dutchie order reports with Update Files",
+            variable=self.fetch_order_reports_var,
+            style="Card.TCheckbutton",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(
+            body,
+            textvariable=self.order_reports_caption_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=440,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        ttk.Checkbutton(
+            body,
+            text="Include Cost column in generated brand workbooks",
+            variable=self.include_cost_var,
+            style="Card.TCheckbutton",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        ttk.Button(body, text="Update Files", style="App.TButton", command=self.get_files).grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            pady=(14, 0),
+        )
+        ttk.Button(body, text="Load Brands", style="App.TButton", command=self.load_brands).grid(
+            row=3,
+            column=1,
+            sticky="ew",
+            padx=(8, 0),
+            pady=(14, 0),
+        )
+        ttk.Button(
+            body,
+            text="Generate, Upload & Email",
+            style="Primary.TButton",
+            command=self.run_process,
+        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        tk.Label(
+            body,
+            text="Shortcuts: Ctrl+F search brands • Ctrl+U update files • Ctrl+L load brands • Ctrl+Enter send reports",
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=440,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+    def _build_delivery_card(self, body):
+        body.grid_columnconfigure(0, weight=1)
+
+        tk.Label(
+            body,
+            text="Recipient Emails",
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Entry(body, textvariable=self.emails_var, style="App.TEntry").grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(4, 0),
+        )
+        tk.Label(
+            body,
+            text="Separate multiple addresses with commas. Invalid entries are highlighted before send.",
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=420,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        tk.Label(
+            body,
+            text="Saved Recipients",
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=3, column=0, sticky="w", pady=(12, 0))
+        self.email_chip_frame = tk.Frame(body, bg=self.colors["card"])
+        self.email_chip_frame.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+
+        tk.Label(
+            body,
+            textvariable=self.email_summary_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=420,
+            justify="left",
+        ).grid(row=5, column=0, sticky="w", pady=(8, 0))
+
+    def _build_snapshot_card(self, body):
+        body.grid_columnconfigure(0, weight=1)
+
+        snapshot_box = tk.Frame(
+            body,
+            bg="#F7FAF8",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=12,
+            pady=12,
+        )
+        snapshot_box.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            snapshot_box,
+            text="Source Files",
+            bg="#F7FAF8",
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            snapshot_box,
+            textvariable=self.source_snapshot_var,
+            bg="#F7FAF8",
+            fg=self.colors["text"],
+            font=("Segoe UI", 9),
+            wraplength=430,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        order_box = tk.Frame(
+            body,
+            bg="#F7FAF8",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=12,
+            pady=12,
+        )
+        order_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        tk.Label(
+            order_box,
+            text="Order Report Coverage",
+            bg="#F7FAF8",
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            order_box,
+            textvariable=self.order_window_summary_var,
+            bg="#F7FAF8",
+            fg=self.colors["text"],
+            font=("Segoe UI", 9),
+            wraplength=430,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        brand_box = tk.Frame(
+            body,
+            bg="#F7FAF8",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=12,
+            pady=12,
+        )
+        brand_box.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        tk.Label(
+            brand_box,
+            text="Brand Library",
+            bg="#F7FAF8",
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            brand_box,
+            textvariable=self.brand_load_status_var,
+            bg="#F7FAF8",
+            fg=self.colors["text"],
+            font=("Segoe UI", 9),
+            wraplength=430,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+    def _build_brand_tab(self):
+        self.brands_tab.grid_columnconfigure(0, weight=1)
+        self.brands_tab.grid_rowconfigure(1, weight=1)
+
+        toolbar_card, toolbar_body = self._create_card(
+            self.brands_tab,
+            "Brand Finder",
+            "Keyboard-first search and selection. Hidden selections stay saved even when you filter the list.",
+        )
+        toolbar_card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        toolbar_body.grid_columnconfigure(1, weight=1)
+
+        tk.Label(
+            toolbar_body,
+            text="Search",
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        self.brand_search_entry = ttk.Entry(
+            toolbar_body,
+            textvariable=self.brand_search_var,
+            style="App.TEntry",
+        )
+        self.brand_search_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(
+            toolbar_body,
+            text="Focus Search",
+            style="Quiet.TButton",
+            command=self.focus_brand_search,
+        ).grid(row=0, column=2, sticky="ew")
+        ttk.Button(
+            toolbar_body,
+            text="Select Visible",
+            style="Quiet.TButton",
+            command=self.select_all_brands,
+        ).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+        ttk.Button(
+            toolbar_body,
+            text="Clear All",
+            style="Quiet.TButton",
+            command=self.clear_selected_brands,
+        ).grid(row=0, column=4, sticky="ew", padx=(8, 0))
+
+        tk.Label(
+            toolbar_body,
+            textvariable=self.brand_hint_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=760,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        tk.Label(
+            toolbar_body,
+            textvariable=self.brand_load_status_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=760,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
+
+        browser_card, browser_body = self._create_card(
+            self.brands_tab,
+            "Brand Library",
+            "Use the A-Z rail, type directly in the list, or press Enter from search to jump to the first visible match.",
+        )
+        browser_card.grid(row=1, column=0, sticky="nsew")
+        browser_body.grid_rowconfigure(1, weight=1)
+        browser_body.grid_columnconfigure(0, weight=1)
+
+        stats_row = tk.Frame(browser_body, bg=self.colors["card"])
+        stats_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        for col in range(3):
+            stats_row.grid_columnconfigure(col, weight=1)
+        self._create_metric_tile(stats_row, "Loaded", self.brand_total_var).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 8),
+        )
+        self._create_metric_tile(stats_row, "Visible", self.brand_visible_var).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=4,
+        )
+        self._create_metric_tile(stats_row, "Selected", self.brand_selected_var).grid(
+            row=0,
+            column=2,
+            sticky="ew",
+            padx=(8, 0),
+        )
+
+        browser = tk.Frame(browser_body, bg=self.colors["card"])
+        browser.grid(row=1, column=0, sticky="nsew")
+        browser.grid_rowconfigure(0, weight=1)
+        browser.grid_columnconfigure(0, weight=1)
+
+        list_container = tk.Frame(
+            browser,
+            bg="#FFFFFF",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+        )
+        list_container.grid(row=0, column=0, sticky="nsew")
+        list_container.grid_rowconfigure(0, weight=1)
+        list_container.grid_columnconfigure(0, weight=1)
+
+        self.brand_listbox = tk.Listbox(
+            list_container,
+            selectmode=tk.MULTIPLE,
+            activestyle="none",
+            bg="#FFFFFF",
+            fg=self.colors["text"],
+            selectbackground=self.colors["accent"],
+            selectforeground="#FFFFFF",
+            highlightthickness=0,
+            borderwidth=0,
+            font=("Segoe UI", 10),
+            exportselection=False,
+        )
+        self.brand_listbox.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(list_container, orient="vertical", command=self.brand_listbox.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.brand_listbox.config(yscrollcommand=scroll.set)
+        self.brand_listbox.bind("<<ListboxSelect>>", self._on_brand_listbox_select)
+        self.brand_listbox.bind("<Key>", self.on_listbox_keypress)
+        self.brand_listbox.bind("<space>", self.toggle_active_brand_selection)
+        self.brand_listbox.bind("<Return>", self.toggle_active_brand_selection)
+
+        alpha_panel = tk.Frame(browser, bg=self.colors["card"])
+        alpha_panel.grid(row=0, column=1, sticky="ns", padx=(10, 0))
+        for idx, label in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+            ttk.Button(
+                alpha_panel,
+                text=label,
+                style="Quiet.TButton",
+                width=3,
+                command=lambda letter=label: self.scroll_to_letter(letter),
+            ).grid(row=idx % 9, column=idx // 9, padx=2, pady=2, sticky="ew")
+
+        footer = tk.Frame(browser_body, bg=self.colors["card"])
+        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        tk.Label(
+            footer,
+            textvariable=self.brand_summary_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+        ttk.Button(
+            footer,
+            text="Load Brands",
+            style="Quiet.TButton",
+            command=self.load_brands,
+        ).pack(side="right")
+
+    def _build_activity_tab(self):
+        self.activity_tab.grid_columnconfigure(0, weight=3)
+        self.activity_tab.grid_columnconfigure(1, weight=2)
+        self.activity_tab.grid_rowconfigure(0, weight=1)
+
+        log_card, log_body = self._create_card(
+            self.activity_tab,
+            "Activity Log",
+            "Recent actions in this session. Use this to confirm refreshes, loads, saves, and delivery steps.",
+        )
+        log_card.grid(row=0, column=0, sticky="nsew", padx=(0, 9))
+        self._build_log_card(log_body)
+
+        right_stack = tk.Frame(self.activity_tab, bg=self.colors["bg"])
+        right_stack.grid(row=0, column=1, sticky="nsew", padx=(9, 0))
+        right_stack.grid_rowconfigure(1, weight=1)
+        right_stack.grid_columnconfigure(0, weight=1)
+
+        session_card, session_body = self._create_card(
+            right_stack,
+            "Session Snapshot",
+            "A quick view of the saved workspace and what files are available right now.",
+        )
+        session_card.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            session_body,
+            textvariable=self.source_snapshot_var,
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9),
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w")
+        tk.Label(
+            session_body,
+            textvariable=self.order_window_summary_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+        tk.Label(
+            session_body,
+            textvariable=self.brand_load_status_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+        tk.Label(
+            session_body,
+            textvariable=self.settings_state_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+        help_card, help_body = self._create_card(
+            right_stack,
+            "Keyboard Shortcuts",
+            "Fast paths for common tasks when you are moving through the app all day.",
+        )
+        help_card.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        tk.Label(
+            help_body,
+            text=(
+                "Ctrl+F  Focus brand search\n"
+                "Ctrl+U  Update files\n"
+                "Ctrl+L  Load brands\n"
+                "Ctrl+Enter  Generate, upload, and email\n"
+                "Alt+1 / Alt+2 / Alt+3  Switch tabs\n"
+                "Enter on search  Jump to first visible brand\n"
+                "Type in list  Quick prefix jump\n"
+                "Space on list  Toggle active brand"
+            ),
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Consolas", 9),
+            justify="left",
+            anchor="nw",
+        ).pack(fill="both", expand=True, anchor="nw")
+
+    def _build_log_card(self, body):
+        self.log_text = ScrolledText(
+            body,
+            height=14,
+            wrap="word",
+            bg=self.colors["log_bg"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+            font=("Consolas", 10),
+            padx=10,
+            pady=10,
+        )
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.configure(state="disabled")
+
+    def _bind_events(self):
+        self.input_dir_var.trace_add("write", lambda *_: self._refresh_path_summaries())
+        self.output_dir_var.trace_add("write", lambda *_: self._refresh_path_summaries())
+        self.emails_var.trace_add("write", lambda *_: self._update_email_display())
+        self.brand_search_var.trace_add("write", lambda *_: self.filter_brand_list())
+        self.fetch_order_reports_var.trace_add("write", lambda *_: self._update_order_report_caption())
+
+        for var in (
+            self.input_dir_var,
+            self.output_dir_var,
+            self.emails_var,
+            self.fetch_order_reports_var,
+            self.include_cost_var,
+        ):
+            var.trace_add("write", lambda *_: self._schedule_autosave())
+
+        self.brand_search_entry.bind("<Return>", self._select_first_visible_brand)
+        self.brand_search_entry.bind("<Down>", self._move_focus_to_brand_list)
+        self.brand_search_entry.bind("<Escape>", self._clear_brand_search)
+
+        self.master.bind_all("<Control-f>", self.focus_brand_search)
+        self.master.bind_all("<Control-u>", self._shortcut_update_files)
+        self.master.bind_all("<Control-l>", self._shortcut_load_brands)
+        self.master.bind_all("<Control-Return>", self._shortcut_run_process)
+        self.master.bind_all("<Alt-1>", lambda event: self._select_tab(self.overview_tab))
+        self.master.bind_all("<Alt-2>", lambda event: self._select_tab(self.brands_tab))
+        self.master.bind_all("<Alt-3>", lambda event: self._select_tab(self.activity_tab))
+        self.master.bind_all("<Escape>", self._global_escape)
+
+    def _set_status(self, headline, detail=None):
+        self.status_var.set(headline)
+        if detail is not None:
+            self.status_detail_var.set(detail)
+
+    def append_log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{timestamp}] {message}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _refresh_path_summaries(self):
+        input_dir = self.input_dir_var.get().strip()
+        output_dir = self.output_dir_var.get().strip()
+        self.input_summary_var.set(
+            input_dir if input_dir else "Choose the folder where catalog CSVs and optional order-report source files live."
+        )
+        self.output_summary_var.set(
+            output_dir if output_dir else "Choose the folder where the generated brand workbooks should be written."
+        )
+        self._refresh_source_snapshot()
+
+    def _refresh_source_snapshot(self):
+        input_dir = self.input_dir_var.get().strip()
+        if not input_dir or not os.path.isdir(input_dir):
+            self.catalog_count_var.set("0")
+            self.order_file_count_var.set("0")
+            self.source_snapshot_var.set("Choose a valid input folder to scan catalog CSVs and Dutchie order reports.")
+            self.order_window_summary_var.set("Dutchie order windows: none detected yet.")
             return
 
-        # Don't deselect current selection
-        for i in range(self.brand_listbox.size()):
-            item = self.brand_listbox.get(i)
-            if item.lower().startswith(typed_char):
-                self._flash_listbox_item(i)
-                break
-    def _flash_listbox_item(self, index):
-        # Save current selection
-        current_selection = self.brand_listbox.curselection()
+        try:
+            filenames = os.listdir(input_dir)
+        except Exception:
+            self.catalog_count_var.set("0")
+            self.order_file_count_var.set("0")
+            self.source_snapshot_var.set("The input folder could not be read.")
+            self.order_window_summary_var.set("Dutchie order windows: unavailable.")
+            return
 
-        # Highlight item visually
-        self.brand_listbox.selection_clear(0, tk.END)
-        self.brand_listbox.selection_set(index)
+        csv_files = sorted(fn for fn in filenames if fn.lower().endswith(".csv"))
+        order_files = sorted(fn for fn in filenames if ORDER_REPORT_FILE_PATTERN.match(fn))
+        self.catalog_count_var.set(str(len(csv_files)))
+        self.order_file_count_var.set(str(len(order_files)))
+
+        latest_paths = [
+            os.path.join(input_dir, fn)
+            for fn in csv_files + order_files
+            if os.path.isfile(os.path.join(input_dir, fn))
+        ]
+        if latest_paths:
+            latest_mtime = max(os.path.getmtime(path) for path in latest_paths)
+            latest_text = datetime.fromtimestamp(latest_mtime).strftime("%b %d, %Y %I:%M %p").lstrip("0")
+        else:
+            latest_text = "No source files yet"
+
+        if csv_files or order_files:
+            self.source_snapshot_var.set(
+                f"{len(csv_files)} catalog CSVs and {len(order_files)} order-report files found. Latest file activity: {latest_text}."
+            )
+        else:
+            self.source_snapshot_var.set("The selected input folder is valid, but it does not contain catalog CSVs or inventory order reports yet.")
+
+        order_windows = summarize_order_report_files(input_dir)
+        if order_windows:
+            self.order_window_summary_var.set(f"Dutchie order windows available: {order_windows}.")
+        else:
+            self.order_window_summary_var.set("Dutchie order windows: none detected yet.")
+
+    def _parse_recipients(self):
+        return [item.strip() for item in self.emails_var.get().split(",") if item.strip()]
+
+    def _invalid_recipients(self):
+        return [email for email in self._parse_recipients() if not EMAIL_REGEX.match(email)]
+
+    def _update_email_display(self):
+        for child in self.email_chip_frame.winfo_children():
+            child.destroy()
+
+        recipients = self._parse_recipients()
+        invalid = set(self._invalid_recipients())
+        self.recipient_count_var.set(str(len(recipients)))
+
+        if not recipients:
+            tk.Label(
+                self.email_chip_frame,
+                text="No recipients entered yet.",
+                bg=self.colors["card"],
+                fg=self.colors["muted"],
+                font=("Segoe UI", 9),
+            ).grid(row=0, column=0, sticky="w")
+            self.email_summary_var.set("No recipients saved yet.")
+            return
+
+        max_cols = 2
+        for idx, email in enumerate(recipients):
+            row = idx // max_cols
+            col = idx % max_cols
+            is_invalid = email in invalid
+            chip = tk.Label(
+                self.email_chip_frame,
+                text=email,
+                bg="#FDE7E7" if is_invalid else self.colors["accent_soft"],
+                fg="#9F1239" if is_invalid else self.colors["accent_dark"],
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=5,
+            )
+            chip.grid(row=row, column=col, sticky="w", padx=(0, 8), pady=(0, 8))
+
+        if invalid:
+            self.email_summary_var.set(
+                f"{len(recipients)} recipient entries saved. {len(invalid)} need attention before sending."
+            )
+        else:
+            self.email_summary_var.set(
+                f"{len(recipients)} recipient{'s' if len(recipients) != 1 else ''} ready for the outgoing Drive-link email."
+            )
+
+    def _update_order_report_caption(self):
+        if self.fetch_order_reports_var.get():
+            self.order_reports_caption_var.set(
+                "Update Files will refresh catalog CSVs and also download the Dutchie 7d, 14d, and 30d order-report exports."
+            )
+        else:
+            self.order_reports_caption_var.set(
+                "Update Files will refresh only catalog CSVs and leave existing Dutchie order-report files untouched."
+            )
+
+    def _current_selected_brands(self):
+        return set(self.selected_brand_names)
+
+    def _populate_brand_listbox(self, items):
+        self.brand_listbox.delete(0, tk.END)
+
+        if not self.all_brands:
+            self.filtered_brands = []
+            self.brand_listbox.insert(tk.END, "No brands found.")
+            return
+
+        if not items:
+            self.filtered_brands = []
+            self.brand_listbox.insert(tk.END, "No matching brands.")
+            return
+
+        self.filtered_brands = list(items)
+        for idx, brand in enumerate(self.filtered_brands):
+            self.brand_listbox.insert(tk.END, brand)
+            if brand in self.selected_brand_names:
+                self.brand_listbox.selection_set(idx)
+
+    def _update_brand_summary(self):
+        total = len(self.all_brands)
+        visible = len(self.filtered_brands)
+        selected = len(self.selected_brand_names)
+        query = self.brand_search_var.get().strip()
+
+        self.brand_total_var.set(str(total))
+        self.brand_visible_var.set(str(visible))
+        self.brand_selected_var.set(str(selected))
+
+        if total == 0:
+            self.brand_summary_var.set("No brands loaded yet.")
+            return
+
+        base = f"{selected} selected • {visible} visible • {total} total"
+        if query:
+            base += f" • filtered by \"{query}\""
+        self.brand_summary_var.set(base)
+
+    def _set_default_brand_hint(self):
+        self.brand_hint_var.set(
+            "Ctrl+F focuses search. Type in the list for a quick prefix jump. Space toggles the active brand."
+        )
+
+    def filter_brand_list(self):
+        query = self.brand_search_var.get().strip().lower()
+        if not query:
+            visible = list(self.all_brands)
+        else:
+            visible = [brand for brand in self.all_brands if query in brand.lower()]
+
+        self._populate_brand_listbox(visible)
+        self._update_brand_summary()
+        if not self.quick_jump_buffer:
+            self._set_default_brand_hint()
+
+    def _on_brand_listbox_select(self, _event=None):
+        if not self.filtered_brands:
+            self._update_brand_summary()
+            return
+
+        self.selected_brand_names.difference_update(self.filtered_brands)
+        for idx in self.brand_listbox.curselection():
+            brand = self.brand_listbox.get(idx)
+            if brand not in ("No brands found.", "No matching brands."):
+                self.selected_brand_names.add(brand)
+        self._update_brand_summary()
+
+    def _has_catalog_exports(self):
+        input_dir = self.input_dir_var.get().strip()
+        return bool(
+            input_dir
+            and os.path.isdir(input_dir)
+            and any(fn.lower().endswith(".csv") for fn in os.listdir(input_dir))
+        )
+
+    def _autoload_saved_workspace(self):
+        if self._has_catalog_exports():
+            self.append_log("Saved catalog exports were found. Auto-loading the brand library.")
+            if self.load_brands(silent=True):
+                self._set_status(
+                    "Saved workspace restored.",
+                    "Catalog files were detected in the saved input folder and the brand library was loaded automatically.",
+                )
+
+    def show_loading(self, message="Processing...", detail="Working on your request..."):
+        if hasattr(self, "loading_window") and self.loading_window.winfo_exists():
+            self.hide_loading()
+
+        self.loading_window = tk.Toplevel(self.master)
+        self.loading_window.title("Working")
+        self.loading_window.transient(self.master)
+        self.loading_window.configure(bg=self.colors["card"])
+        self.loading_window.resizable(False, False)
+
+        frame = tk.Frame(self.loading_window, bg=self.colors["card"], padx=20, pady=18)
+        frame.pack(fill="both", expand=True)
+
+        tk.Label(
+            frame,
+            text=message,
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            frame,
+            text=detail,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 9),
+            wraplength=320,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 12))
+
+        self.loading_progress = ttk.Progressbar(frame, mode="indeterminate", length=320)
+        self.loading_progress.pack(fill="x")
+        self.loading_progress.start(10)
+
+        self.loading_window.update_idletasks()
+        x = self.master.winfo_rootx() + (self.master.winfo_width() // 2) - 190
+        y = self.master.winfo_rooty() + (self.master.winfo_height() // 2) - 70
+        self.loading_window.geometry(f"380x140+{max(40, x)}+{max(40, y)}")
+        self.loading_window.update()
+
+    def hide_loading(self):
+        if hasattr(self, "loading_progress"):
+            try:
+                self.loading_progress.stop()
+            except Exception:
+                pass
+        if hasattr(self, "loading_window") and self.loading_window.winfo_exists():
+            self.loading_window.destroy()
+
+    def focus_brand_search(self, _event=None):
+        self._select_tab(self.brands_tab)
+        self.brand_search_entry.focus_set()
+        self.brand_search_entry.selection_range(0, tk.END)
+        return "break"
+
+    def _move_focus_to_brand_list(self, _event=None):
+        if self.filtered_brands:
+            self.brand_listbox.focus_set()
+            self._focus_listbox_index(0, flash=True)
+        return "break"
+
+    def _clear_brand_search(self, _event=None):
+        if self.brand_search_var.get():
+            self.brand_search_var.set("")
+        self._clear_quick_jump()
+        return "break"
+
+    def _select_first_visible_brand(self, _event=None):
+        if self.filtered_brands:
+            self.brand_listbox.focus_set()
+            self._focus_listbox_index(0, flash=True)
+        return "break"
+
+    def scroll_to_letter(self, letter):
+        self._select_tab(self.brands_tab)
+        self.brand_listbox.focus_set()
+        self._jump_to_brand_prefix(letter.lower())
+
+    def _jump_to_brand_prefix(self, prefix):
+        if not prefix:
+            return False
+        for idx, brand in enumerate(self.filtered_brands):
+            if brand.lower().startswith(prefix.lower()):
+                self._focus_listbox_index(idx, flash=True)
+                return True
+        return False
+
+    def on_listbox_keypress(self, event):
+        if event.keysym in {"Up", "Down", "Left", "Right", "Home", "End", "Prior", "Next"}:
+            return
+        if event.keysym in {"space", "Return"}:
+            return self.toggle_active_brand_selection()
+        if event.keysym == "Escape":
+            return self._clear_brand_search()
+        if not event.char or not event.char.isalnum():
+            return
+
+        now = time.monotonic()
+        if now - self.quick_jump_last_ts > 1.1:
+            self.quick_jump_buffer = ""
+        self.quick_jump_last_ts = now
+        self.quick_jump_buffer += event.char.lower()
+
+        if self.jump_reset_job is not None:
+            self.master.after_cancel(self.jump_reset_job)
+        self.jump_reset_job = self.master.after(1200, self._clear_quick_jump)
+
+        found = self._jump_to_brand_prefix(self.quick_jump_buffer)
+        if found:
+            self.brand_hint_var.set(f"Quick jump: '{self.quick_jump_buffer}'")
+        else:
+            self.brand_hint_var.set(f"No visible brands start with '{self.quick_jump_buffer}'.")
+        return "break"
+
+    def _clear_quick_jump(self):
+        self.quick_jump_buffer = ""
+        self.quick_jump_last_ts = 0.0
+        if self.jump_reset_job is not None:
+            try:
+                self.master.after_cancel(self.jump_reset_job)
+            except Exception:
+                pass
+        self.jump_reset_job = None
+        self._set_default_brand_hint()
+
+    def _focus_listbox_index(self, index, flash=False):
+        if index < 0 or index >= self.brand_listbox.size():
+            return
+        item = self.brand_listbox.get(index)
+        if item in ("No brands found.", "No matching brands."):
+            return
+
+        current_selection = self.brand_listbox.curselection()
         self.brand_listbox.activate(index)
         self.brand_listbox.see(index)
 
-        # Delay to restore previous selection
+        if not flash:
+            return
+
+        self.brand_listbox.selection_clear(0, tk.END)
+        self.brand_listbox.selection_set(index)
+
         def restore_selection():
             self.brand_listbox.selection_clear(0, tk.END)
             for idx in current_selection:
-                self.brand_listbox.selection_set(idx)
+                if idx < self.brand_listbox.size():
+                    self.brand_listbox.selection_set(idx)
+            self.brand_listbox.activate(index)
+            self.brand_listbox.see(index)
 
-        self.master.after(700, restore_selection)  # 700ms flash
-    
+        self.master.after(650, restore_selection)
+
+    def toggle_active_brand_selection(self, _event=None):
+        if not self.filtered_brands:
+            return "break"
+
+        active_index = self.brand_listbox.index(tk.ACTIVE)
+        if active_index < 0 or active_index >= len(self.filtered_brands):
+            return "break"
+
+        brand = self.brand_listbox.get(active_index)
+        if brand in ("No brands found.", "No matching brands."):
+            return "break"
+
+        if active_index in self.brand_listbox.curselection():
+            self.brand_listbox.selection_clear(active_index)
+            self.selected_brand_names.discard(brand)
+        else:
+            self.brand_listbox.selection_set(active_index)
+            self.selected_brand_names.add(brand)
+
+        self.brand_listbox.activate(active_index)
+        self.brand_listbox.see(active_index)
+        self._update_brand_summary()
+        return "break"
+
+    def _create_metric_tile(self, parent, title, value_var):
+        tile = tk.Frame(
+            parent,
+            bg="#F7FAF8",
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=10,
+            pady=8,
+        )
+        tk.Label(
+            tile,
+            text=title,
+            bg="#F7FAF8",
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            tile,
+            textvariable=value_var,
+            bg="#F7FAF8",
+            fg=self.colors["text"],
+            font=("Segoe UI Semibold", 13),
+        ).pack(anchor="w", pady=(2, 0))
+        return tile
+
+    def _persist_settings(self, add_log=False, update_status=False):
+        save_config(
+            self.input_dir_var.get().strip(),
+            self.output_dir_var.get().strip(),
+            self.fetch_order_reports_var.get(),
+            emails=self.emails_var.get().strip(),
+            include_cost=self.include_cost_var.get(),
+        )
+        self.settings_state_var.set(
+            f"Auto-saved {datetime.now().strftime('%I:%M %p').lstrip('0')}. Use Save Settings if you want a manual checkpoint."
+        )
+        if add_log:
+            self.append_log("Saved workspace settings.")
+        if update_status:
+            self._set_status(
+                "Settings saved.",
+                "Your folders, recipients, and report preferences will be restored next time.",
+            )
+
+    def _schedule_autosave(self):
+        if self.autosave_job is not None:
+            self.master.after_cancel(self.autosave_job)
+        self.settings_state_var.set("Saving your latest changes...")
+        self.autosave_job = self.master.after(900, self._autosave_settings)
+
+    def _autosave_settings(self):
+        self.autosave_job = None
+        try:
+            self._persist_settings(add_log=False, update_status=False)
+        except Exception:
+            self.settings_state_var.set("Could not auto-save settings. You can still use Save Settings manually.")
+
+    def save_settings(self, quiet=False):
+        if self.autosave_job is not None:
+            self.master.after_cancel(self.autosave_job)
+            self.autosave_job = None
+        self._persist_settings(add_log=True, update_status=True)
+        if not quiet:
+            messagebox.showinfo("Saved", "Workspace settings were saved.")
+
+    def on_close(self):
+        try:
+            if self.autosave_job is not None:
+                self.master.after_cancel(self.autosave_job)
+                self.autosave_job = None
+            if self.jump_reset_job is not None:
+                self.master.after_cancel(self.jump_reset_job)
+                self.jump_reset_job = None
+            self._persist_settings(add_log=False, update_status=False)
+        except Exception:
+            pass
+        self.master.destroy()
+
     def browse_input(self):
         folder = filedialog.askdirectory()
         if folder:
             self.input_dir_var.set(folder)
+            self.append_log(f"Selected input folder: {folder}")
+            if self._has_catalog_exports():
+                self.load_brands(silent=True)
 
     def browse_output(self):
         folder = filedialog.askdirectory()
         if folder:
             self.output_dir_var.set(folder)
+            self.append_log(f"Selected output folder: {folder}")
+
+    def select_all_brands(self):
+        if not self.filtered_brands:
+            return
+        self.selected_brand_names.update(self.filtered_brands)
+        self.brand_listbox.selection_set(0, tk.END)
+        self._update_brand_summary()
+
+    def clear_selected_brands(self):
+        self.selected_brand_names.clear()
+        self.brand_listbox.selection_clear(0, tk.END)
+        self._update_brand_summary()
+
+    def _select_tab(self, tab):
+        self.notebook.select(tab)
+        return "break"
+
+    def _shortcut_update_files(self, _event=None):
+        self.get_files()
+        return "break"
+
+    def _shortcut_load_brands(self, _event=None):
+        self.load_brands()
+        return "break"
+
+    def _shortcut_run_process(self, _event=None):
+        self.run_process()
+        return "break"
+
+    def _global_escape(self, _event=None):
+        if self.brand_search_var.get():
+            self.brand_search_var.set("")
+            self._clear_quick_jump()
+            return "break"
+        return None
 
     def get_files(self):
-        """
-        Clears prior source exports and refreshes catalog CSVs, with an
-        optional inventory-order report refresh.
-        Shows a loading screen while running.
-        """
         in_dir = self.input_dir_var.get().strip()
-        out_dir = self.output_dir_var.get().strip()
         fetch_order_reports = self.fetch_order_reports_var.get()
 
         if not in_dir or not os.path.isdir(in_dir):
@@ -761,62 +2098,100 @@ class BrandInventoryGUI:
             messagebox.showwarning("Warning", "No getCatalog.py found in this directory.")
             return
 
-        # ✅ Show loading screen
-        self.show_loading("Updating files...")
+        self.append_log("Starting source refresh.")
+        self._set_status(
+            "Refreshing source files...",
+            "Catalog CSVs are being downloaded and Dutchie order reports will follow if the toggle is enabled.",
+        )
+        self.show_loading(
+            "Updating files...",
+            "Refreshing catalog CSV exports and optionally updating the Dutchie order-report files.",
+        )
 
         try:
             clear_old_input_exports(in_dir, clear_order_reports=fetch_order_reports)
-
-            # Run getCatalog
             subprocess.check_call([sys.executable, "getCatalog.py", in_dir])
+
             order_reports_ok = True
             if fetch_order_reports:
                 order_reports_ok = fetch_inventory_order_reports(in_dir)
+
             self.hide_loading()
-            save_config(in_dir, out_dir, fetch_order_reports)
+            self._persist_settings(add_log=False, update_status=False)
+            self._refresh_source_snapshot()
+            self.load_brands(silent=True)
+
             if not fetch_order_reports:
+                self.append_log("Catalog CSV refresh finished. Order reports were skipped by choice.")
+                self._set_status(
+                    "Catalog refresh complete.",
+                    "Catalog CSVs are current. Existing order-report files were left untouched.",
+                )
                 messagebox.showinfo(
                     "Success",
                     "Catalog CSVs were refreshed. Inventory order report refresh was skipped.",
                 )
             elif order_reports_ok:
+                self.append_log("Catalog CSV and inventory order report refresh finished.")
+                self._set_status(
+                    "Source refresh complete.",
+                    "Catalog CSVs and order-report files are ready, and the brand library has been refreshed.",
+                )
                 messagebox.showinfo(
                     "Success",
                     "Catalog CSVs and inventory order report files were refreshed.",
                 )
             else:
+                self.append_log("Catalog CSV refresh finished, but the order report refresh failed.")
+                self._set_status(
+                    "Partial refresh complete.",
+                    "Catalog CSVs were updated, but the order report refresh did not finish successfully.",
+                )
                 messagebox.showwarning(
                     "Partial Success",
                     "Catalog CSVs were refreshed, but the inventory order report refresh failed.",
                 )
         except subprocess.CalledProcessError as e:
             self.hide_loading()
+            self.append_log(f"Catalog refresh failed: {e}")
+            self._set_status(
+                "Refresh failed.",
+                "The catalog refresh did not complete. Check the error details and try again.",
+            )
             messagebox.showerror("Error", f"getCatalog.py failed:\n{e}")
         except Exception as e:
             self.hide_loading()
+            self.append_log(f"Refresh error: {e}")
+            self._set_status("Refresh failed.", "An unexpected error interrupted the refresh.")
             messagebox.showerror("Error", str(e))
 
-    def load_brands(self):
-        """
-        Scans CSVs in input folder for a 'Brand' column, collects unique brand names,
-        lowercases/strips them, and displays them in the listbox.
-        """
+    def load_brands(self, silent=False):
         in_dir = self.input_dir_var.get().strip()
         if not in_dir or not os.path.isdir(in_dir):
-            messagebox.showerror("Error", "Invalid input folder.")
-            return
-
-        self.brand_listbox.delete(0, tk.END)
-        self.brand_listbox.configure(state="normal")
+            self.all_brands = []
+            self.filtered_brands = []
+            self.selected_brand_names.clear()
+            self._populate_brand_listbox([])
+            self._update_brand_summary()
+            self.brand_load_status_var.set("Brand library not loaded yet.")
+            if not silent:
+                messagebox.showerror("Error", "Invalid input folder.")
+            return False
 
         brand_set = set()
+        csv_count = 0
+        self.append_log(f"Scanning brands from CSV files in {in_dir}.")
+        self._set_status(
+            "Loading brands...",
+            "Reading the current catalog CSV files to build the selectable brand list.",
+        )
         for fn in os.listdir(in_dir):
             if fn.lower().endswith(".csv"):
+                csv_count += 1
                 path = os.path.join(in_dir, fn)
                 try:
                     df = pd.read_csv(path, nrows=50000)
                     if "Brand" in df.columns:
-                        # Convert to lower+strip for consistent matching
                         new_brands = (
                             df["Brand"]
                             .dropna()
@@ -827,24 +2202,49 @@ class BrandInventoryGUI:
                             .tolist()
                         )
                         brand_set.update(new_brands)
-                except:
+                except Exception:
                     pass
 
-        if not brand_set:
-            self.brand_listbox.insert(tk.END, "No brands found.")
-            self.brand_listbox.configure(state="disabled")
-        else:
-            sorted_brands = sorted(list(brand_set))
-            for b in sorted_brands:
-                self.brand_listbox.insert(tk.END, b)
+        self.all_brands = sorted(brand_set)
+        self.selected_brand_names.intersection_update(self.all_brands)
+        self.filter_brand_list()
+
+        loaded_text = datetime.now().strftime("%b %d, %Y %I:%M %p").lstrip("0")
+        if not self.all_brands:
+            self.brand_load_status_var.set(
+                f"No brands were found in {csv_count} catalog CSV file{'s' if csv_count != 1 else ''}."
+            )
+            self.append_log("No brands were found in the current CSV files.")
+            self._set_status(
+                "No brands found.",
+                "Try refreshing files or verify that the input folder contains catalog CSV exports.",
+            )
+            return False
+
+        self.brand_load_status_var.set(
+            f"Loaded {len(self.all_brands)} brands from {csv_count} catalog CSV file{'s' if csv_count != 1 else ''} at {loaded_text}."
+        )
+        self.append_log(f"Loaded {len(self.all_brands)} brands into the library.")
+        self._set_status(
+            "Brand library loaded.",
+            f"{len(self.all_brands)} brands are available for selection.",
+        )
+        return True
 
     def run_process(self):
         in_dir = self.input_dir_var.get().strip()
         out_dir = self.output_dir_var.get().strip()
         emails = self.emails_var.get().strip()
+        invalid_recipients = self._invalid_recipients()
 
         if not (in_dir and out_dir and emails):
             messagebox.showerror("Error", "Need input folder, output folder, and at least one email address.")
+            return
+        if invalid_recipients:
+            messagebox.showerror(
+                "Invalid Email",
+                "Please fix these email addresses before sending:\n\n" + "\n".join(invalid_recipients),
+            )
             return
         if not os.path.isdir(in_dir):
             messagebox.showerror("Error", f"Invalid input folder: {in_dir}")
@@ -853,20 +2253,24 @@ class BrandInventoryGUI:
             messagebox.showerror("Error", f"Invalid output folder: {out_dir}")
             return
 
-        sel_indices = self.brand_listbox.curselection()
-        if sel_indices:
-            selected_brands = [self.brand_listbox.get(i) for i in sel_indices]
-            if "No brands found." in selected_brands:
-                selected_brands = []
-        else:
-            selected_brands = []
+        selected_brands = sorted(self._current_selected_brands())
+        if not selected_brands:
             messagebox.showinfo(
                 "No Selection",
-                "No brands selected. Will process all brand data from the CSVs."
+                "No brands selected. All brand data found in the CSVs will be processed.",
             )
 
-        # 1) For each CSV => generate XLSX (Available + Unavailable)
         all_brand_map = {}
+        self.append_log("Starting report generation workflow.")
+        self._set_status(
+            "Generating reports...",
+            "Building the selected brand workbooks, then uploading them to Drive and sending the delivery email.",
+        )
+        self.show_loading(
+            "Generating reports...",
+            "This can take a moment while workbooks are built, uploaded, and the email is sent.",
+        )
+
         try:
             for fname in os.listdir(in_dir):
                 if fname.lower().endswith(".csv"):
@@ -878,23 +2282,32 @@ class BrandInventoryGUI:
                         include_cost=self.include_cost_var.get(),
                         order_reports_dir=in_dir,
                     )
-                    # Merge
                     for b_name, xlsx_list in brand_map.items():
                         if b_name not in all_brand_map:
                             all_brand_map[b_name] = []
                         all_brand_map[b_name].extend(xlsx_list)
 
             if not all_brand_map:
+                self.hide_loading()
+                self.append_log("No matching workbooks were generated from the current filters.")
+                self._set_status(
+                    "No reports generated.",
+                    "The current brand selection and CSV files did not produce any workbooks.",
+                )
                 messagebox.showinfo("Done", "No XLSX files generated (possibly no matching data).")
                 return
 
-            # 2) Upload to Drive => get brand folder links
             brand_links = upload_brand_reports_to_drive(all_brand_map)
             if not brand_links:
+                self.hide_loading()
+                self.append_log("Drive upload returned no folder links.")
+                self._set_status(
+                    "Upload failed.",
+                    "No Drive folders were created, so the email step was skipped.",
+                )
                 messagebox.showerror("Error", "No folders created on Drive. Aborting email.")
                 return
 
-            # 3) Send an email with each brand link
             lines = []
             for brand_lower, link in brand_links.items():
                 lines.append(f"<h3>{brand_lower}</h3>")
@@ -924,14 +2337,26 @@ class BrandInventoryGUI:
             subject = "Brand Inventory Drive Links"
             send_email_with_gmail_html(subject, body_html, emails)
 
-            # 4) Save the chosen input/output folders to config.txt for next run
-            save_config(in_dir, out_dir, self.fetch_order_reports_var.get())
+            self._persist_settings(add_log=False, update_status=False)
 
-            messagebox.showinfo("Success", "All done! Folders uploaded & email sent.")
+            self.hide_loading()
+            self.append_log(
+                f"Finished report workflow. Uploaded {sum(len(v) for v in all_brand_map.values())} workbook(s) across {len(brand_links)} brand folder(s)."
+            )
+            self._set_status(
+                "Reports delivered.",
+                "Drive folders were uploaded and the recipient email was sent successfully.",
+            )
+            messagebox.showinfo("Success", "All done! Folders uploaded and email sent.")
         except Exception as e:
+            self.hide_loading()
+            self.append_log(f"Report workflow failed: {e}")
+            self._set_status(
+                "Workflow failed.",
+                "An unexpected error interrupted report generation, upload, or email delivery.",
+            )
             traceback.print_exc()
             messagebox.showerror("Error", f"An error occurred:\n{e}")
-
 
 # ----------------- MAIN -----------------
 def main():
