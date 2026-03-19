@@ -704,8 +704,24 @@ def _preserve_existing_columns(export_df, existing_values):
         return export_df
 
     existing_rows = existing_values[1:]
-    padded_rows = [row + [""] * (len(headers) - len(row)) for row in existing_rows]
-    existing_df = pd.DataFrame(padded_rows, columns=headers)
+    normalized_rows = []
+    oversized_row_count = 0
+    for row in existing_rows:
+        row_values = list(row)
+        if len(row_values) > len(headers):
+            row_values = row_values[: len(headers)]
+            oversized_row_count += 1
+        elif len(row_values) < len(headers):
+            row_values.extend([""] * (len(headers) - len(row_values)))
+        normalized_rows.append(row_values)
+
+    if oversized_row_count:
+        print(
+            f"[WARN] Ignoring extra values in {oversized_row_count} existing sheet row(s) "
+            "beyond the last named header column."
+        )
+
+    existing_df = pd.DataFrame(normalized_rows, columns=headers)
     existing_df.columns = [str(col).strip() for col in existing_df.columns]
 
     if existing_df.empty:

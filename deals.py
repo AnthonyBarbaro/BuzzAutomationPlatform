@@ -348,13 +348,13 @@ DEFAULT_BRAND_CRITERIA = {
         'kickback': 0.30,
         'brands': ['Dixie']
     },
-    "710": {
-        'vendors': ['Fluids Manufacturing Inc.'],
-        'days': ['Monday'],
-        'discount': 0.50, #9/31 last day
-        'kickback': 0.30,
-        'brands': ['710']
-    },
+    # "710": {
+    #     'vendors': ['Fluids Manufacturing Inc.'],
+    #     'days': ['Monday'],
+    #     'discount': 0.50, #9/31 last day
+    #     'kickback': 0.30,
+    #     'brands': ['710']
+    # },
     "Blem": {
         'vendors': ['SSAL HORTICULTURE LLC','LB Atlantis LLC'],
         'days': ['Thursday'],
@@ -602,7 +602,7 @@ DEFAULT_BRAND_CRITERIA = {
            'kickback': 0.0,
            'brands': ['Goodgood |']},
     'Lime': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
-           'days': ['Monday','Sunday'],
+           'days': ['Monday','Sunday'], #Started March 2
            'discount': 0.50,
            'kickback': 0.30,
            'brands': ['LIME |']},
