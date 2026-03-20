@@ -33,7 +33,9 @@ from openpyxl.styles import Font, Alignment, PatternFill
 from inventory_order_reports import (
     build_brand_order_sections,
     extract_store_code_from_filename,
+    format_order_sheet,
     summarize_order_report_files,
+    write_order_sections,
 )
 
 # ------------------------------------------------------------------------------
@@ -371,6 +373,9 @@ def format_excel_file(filename: str):
     wb = load_workbook(filename)
 
     for ws in wb.worksheets:
+        if format_order_sheet(ws):
+            continue
+
         # Freeze the first row
         ws.freeze_panes = "A2"
 
@@ -566,8 +571,7 @@ def process_file(file_path, output_directory, selected_brands):
                         brand_unavail = unavailable_data[unavailable_data['Brand'] == brand_name]
                         if not brand_unavail.empty:
                             brand_unavail.to_excel(writer, index=False, sheet_name="Unavailable")
-                    for sheet_name, section_df in order_sections.items():
-                        section_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                    write_order_sections(writer, order_sections)
 
                 format_excel_file(out_xlsx)
                 print(f"[INFO] Created {out_xlsx}")

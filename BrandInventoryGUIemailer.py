@@ -39,7 +39,9 @@ from openpyxl.utils import get_column_letter
 from inventory_order_reports import (
     build_brand_order_sections,
     extract_store_code_from_filename,
+    format_order_sheet,
     summarize_order_report_files,
+    write_order_sections,
 )
 
 # Google API imports
@@ -329,6 +331,9 @@ def advanced_format_excel(xlsx_path):
     """Freeze top row, bold grey headers, auto-fit columns, group by 'Category'."""
     wb = load_workbook(xlsx_path)
     for ws in wb.worksheets:
+        if format_order_sheet(ws):
+            continue
+
         # Freeze row 1
         ws.freeze_panes = "A2"
 
@@ -582,8 +587,7 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
             brand_data.to_excel(writer, index=False, sheet_name="Available")
             if not brand_unavail.empty:
                 brand_unavail.to_excel(writer, index=False, sheet_name="Unavailable")
-            for sheet_name, section_df in order_sections.items():
-                section_df.to_excel(writer, index=False, sheet_name=sheet_name)
+            write_order_sections(writer, order_sections)
 
         advanced_format_excel(out_path)
 
@@ -931,14 +935,17 @@ class BrandInventoryGUI:
         self.overview_tab = tk.Frame(self.notebook, bg=self.colors["bg"])
         self.brands_tab = tk.Frame(self.notebook, bg=self.colors["bg"])
         self.activity_tab = tk.Frame(self.notebook, bg=self.colors["bg"])
+        self.settings_tab = tk.Frame(self.notebook, bg=self.colors["bg"])
 
         self.notebook.add(self.overview_tab, text="Run")
         self.notebook.add(self.brands_tab, text="Brands")
         self.notebook.add(self.activity_tab, text="Activity")
+        self.notebook.add(self.settings_tab, text="Settings")
 
         self._build_overview_tab()
         self._build_brand_tab()
         self._build_activity_tab()
+        self._build_settings_tab()
 
     def _build_overview_tab(self):
         self.overview_tab.grid_columnconfigure(0, weight=1)
@@ -972,21 +979,13 @@ class BrandInventoryGUI:
         self._create_metric_tile(metrics, "Recipients", self.recipient_count_var).grid(row=0, column=2, sticky="ew", padx=2)
         self._create_metric_tile(metrics, "Selected", self.brand_selected_var).grid(row=0, column=3, sticky="ew", padx=(6, 0))
 
-        workspace_card, workspace_body = self._create_card(
-            content,
-            "Workspace",
-            "Choose folders and save the setup you want to reopen next time.",
-        )
-        workspace_card.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 10))
-        self._build_settings_card(workspace_body)
-
         actions_card, actions_body = self._create_card(
             content,
-            "Workflow",
+            "Run Actions",
             "Refresh files, load brands, then generate and email the finished reports.",
         )
-        actions_card.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 10))
-        self._build_actions_card(actions_body)
+        actions_card.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
+        self._build_run_actions_card(actions_body)
 
         delivery_card, delivery_body = self._create_card(
             content,
@@ -1003,6 +1002,38 @@ class BrandInventoryGUI:
         )
         status_card.grid(row=2, column=1, sticky="nsew", padx=(6, 0), pady=(0, 10))
         self._build_snapshot_card(status_body)
+
+    def _build_settings_tab(self):
+        self.settings_tab.grid_columnconfigure(0, weight=1)
+        self.settings_tab.grid_rowconfigure(0, weight=1)
+
+        self.settings_notebook = ttk.Notebook(self.settings_tab, style="App.TNotebook")
+        self.settings_notebook.grid(row=0, column=0, sticky="nsew")
+
+        self.workspace_settings_tab = tk.Frame(self.settings_notebook, bg=self.colors["bg"])
+        self.workflow_settings_tab = tk.Frame(self.settings_notebook, bg=self.colors["bg"])
+
+        self.settings_notebook.add(self.workspace_settings_tab, text="Workspace")
+        self.settings_notebook.add(self.workflow_settings_tab, text="Workflow")
+
+        self.workspace_settings_tab.grid_columnconfigure(0, weight=1)
+        self.workflow_settings_tab.grid_columnconfigure(0, weight=1)
+
+        workspace_card, workspace_body = self._create_card(
+            self.workspace_settings_tab,
+            "Workspace",
+            "Choose folders and save the setup you want to reopen next time.",
+        )
+        workspace_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self._build_settings_card(workspace_body)
+
+        workflow_card, workflow_body = self._create_card(
+            self.workflow_settings_tab,
+            "Workflow Settings",
+            "Choose how source refreshes and generated brand workbooks should behave before each run.",
+        )
+        workflow_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self._build_workflow_settings_card(workflow_body)
 
     def _build_settings_card(self, body):
         body.grid_columnconfigure(1, weight=1)
@@ -1092,52 +1123,92 @@ class BrandInventoryGUI:
             wraplength=420,
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-    def _build_actions_card(self, body):
+    def _build_workflow_settings_card(self, body):
         body.grid_columnconfigure(0, weight=1)
-        body.grid_columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
             body,
             text="Refresh 7d / 14d / 30d Dutchie order reports with Update Files",
             variable=self.fetch_order_reports_var,
             style="Card.TCheckbutton",
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ).grid(row=0, column=0, sticky="w")
         tk.Label(
             body,
             textvariable=self.order_reports_caption_var,
             bg=self.colors["card"],
             fg=self.colors["muted"],
             font=("Segoe UI", 8),
-            wraplength=440,
+            wraplength=520,
             justify="left",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         ttk.Checkbutton(
             body,
             text="Include Cost column in generated brand workbooks",
             variable=self.include_cost_var,
             style="Card.TCheckbutton",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(12, 0))
+
+        tk.Label(
+            body,
+            text="These preferences auto-save as you work, and Save Settings on the Workspace tab stores them immediately.",
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=520,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+    def _build_run_actions_card(self, body):
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
 
         ttk.Button(body, text="Update Files", style="App.TButton", command=self.get_files).grid(
-            row=3,
+            row=0,
             column=0,
             sticky="ew",
-            pady=(14, 0),
+            pady=(4, 0),
         )
         ttk.Button(body, text="Load Brands", style="App.TButton", command=self.load_brands).grid(
-            row=3,
+            row=0,
             column=1,
             sticky="ew",
             padx=(8, 0),
-            pady=(14, 0),
+            pady=(4, 0),
         )
         ttk.Button(
             body,
             text="Generate, Upload & Email",
             style="Primary.TButton",
             command=self.run_process,
-        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        nav_row = tk.Frame(body, bg=self.colors["card"])
+        nav_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        nav_row.grid_columnconfigure(0, weight=1)
+        nav_row.grid_columnconfigure(1, weight=1)
+        ttk.Button(
+            nav_row,
+            text="Open Settings Tab",
+            style="Quiet.TButton",
+            command=lambda: self._select_tab(self.settings_tab),
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            nav_row,
+            text="Open Brands Tab",
+            style="Quiet.TButton",
+            command=lambda: self._select_tab(self.brands_tab),
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        tk.Label(
+            body,
+            text="Folder paths now live in Settings > Workspace. Report behavior toggles live in Settings > Workflow.",
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=520,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         tk.Label(
             body,
@@ -1145,9 +1216,9 @@ class BrandInventoryGUI:
             bg=self.colors["card"],
             fg=self.colors["muted"],
             font=("Segoe UI", 8),
-            wraplength=440,
+            wraplength=520,
             justify="left",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def _build_delivery_card(self, body):
         body.grid_columnconfigure(0, weight=1)
@@ -1509,7 +1580,7 @@ class BrandInventoryGUI:
                 "Ctrl+U  Update files\n"
                 "Ctrl+L  Load brands\n"
                 "Ctrl+Enter  Generate, upload, and email\n"
-                "Alt+1 / Alt+2 / Alt+3  Switch tabs\n"
+                "Alt+1 / Alt+2 / Alt+3 / Alt+4  Switch tabs\n"
                 "Enter on search  Jump to first visible brand\n"
                 "Type in list  Quick prefix jump\n"
                 "Space on list  Toggle active brand"
@@ -1565,6 +1636,7 @@ class BrandInventoryGUI:
         self.master.bind_all("<Alt-1>", lambda event: self._select_tab(self.overview_tab))
         self.master.bind_all("<Alt-2>", lambda event: self._select_tab(self.brands_tab))
         self.master.bind_all("<Alt-3>", lambda event: self._select_tab(self.activity_tab))
+        self.master.bind_all("<Alt-4>", lambda event: self._select_tab(self.settings_tab))
         self.master.bind_all("<Escape>", self._global_escape)
 
     def _set_status(self, headline, detail=None):
