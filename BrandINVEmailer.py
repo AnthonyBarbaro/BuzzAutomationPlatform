@@ -47,7 +47,7 @@ INPUT_DIRECTORY = "files"       # Where CSVs land
 LOCAL_REPORTS_FOLDER = "brand_reports_tmp"  # Local subfolder for generated reports
 INVENTORY_LINKS_DIR = "inventory_links"
 BASE_DIR = "/home/anthony/projects/BuzzPythonGUI"
-BRAND_CONFIG_JSON = "brand_config.json"
+BRAND_CONFIG_JSON = "brand_config2.json"
 ORDER_REPORT_SCRIPT = "getInventoryOrderReport.py"
 
 # Google Drive parent folder name (where we create subfolders by date)

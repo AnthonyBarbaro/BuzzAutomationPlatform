@@ -1,0 +1,252 @@
+{
+  "test_mode": true,
+  "test_email": "donna@buzzcannabis.com",
+  "brands": [
+    {
+      "brand_synonyms": ["Almora Farm", "Heavy Hitters", "Beard Brothers", "Lift Tickets", "Papa & Barkley (P&B)"],
+      "folder_name": "Almora Farm / Heavy Hitters / Beard Brothers / Lift Tickets / P&B",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Autumn Brands", "Camino", "CANN", "CLSICS", "Emerald Sky", "Keef", "KIVA", "Level", "Lost Farms", "Nasha", "Petra", "Terra", "The Tablet", "Uncle Arnie's"],
+      "folder_name": "Autumn Brands / Camino / CANN / CLSICS / Emerald Sky / Keef / KIVA / Level / Lost Farms / Nasha / Petra / Terra / The Tablet / Uncle Arnie's",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Cannabiotix (CBX)", "Heirbloom", "Highatus"],
+      "folder_name": "CBX / Heirbloom / Highatus",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Baba Ku", "ColdFire"],
+      "folder_name": "Baba Ku / ColdFire",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Ball Family Farms"],
+      "folder_name": "Ball Family Farms",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["CAM", "Cake"],
+      "folder_name": "CAM / Cake",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Claybourne Co."],
+      "folder_name": "Claybourne",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Coastal Sun", "Microbar"],
+      "folder_name": "Coastal Sun / Microbar",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Crave", "Yummy Karma"],
+      "folder_name": "Crave / Yummy Karma",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Seed Junky", "Cream Of The Crop (COTC)", "West Coast Trading Company (WCTC)", "Ghost"],
+      "folder_name": "Seed Junky / Cream Of The Crop / WCTC / Ghost",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Dabwoods"],
+      "folder_name": "Dabwoods",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Decibel Gardens"],
+      "folder_name": "Decibel Gardens",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Punch", "Dr. Norms", "Tempo"],
+      "folder_name": "Punch / Dr. Norms / Tempo",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Drops"],
+      "folder_name": "Drops",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Emerald Bay Extracts"],
+      "folder_name": "Emerald Bay Extracts",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["TAGS", "Eureka"],
+      "folder_name": "TAGS / Eureka",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Eyeelle", "WHOA", "Moods", "Wavvy", "Holy Water", "Holy Smokes", "Lavinia", "TopShelf"],
+      "folder_name": "Eyeelle / WHOA / Moods / Wavvy / Holy Water / Holy Smokes / Lavinia / TopShelf",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["WYLD", "Good Tide"],
+      "folder_name": "WYLD / Good Tide",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Pacific Stone", "Time Machine"],
+      "folder_name": "Pacific Stone / Time Machine",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Jetty"],
+      "folder_name": "Jetty",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Jeeter"],
+      "folder_name": "Jeeter",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["710 Labs"],
+      "folder_name": "710 Labs",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["BLEM"],
+      "folder_name": "BLEM",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Boutiq", "Sherbinskis"],
+      "folder_name": "Boutiq / Sherbinskis",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Cizi"],
+      "folder_name": "Cizi",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Ember Valley"],
+      "folder_name": "Ember Valley",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Hashish"],
+      "folder_name": "Hashish",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["High 90's"],
+      "folder_name": "High 90's",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["KANHA"],
+      "folder_name": "KANHA",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["LA Family Farms"],
+      "folder_name": "LA Family Farms",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Maven (MVN)", "LIME", "Humo", "Happy Fruit", "Ursa"],
+      "folder_name": "Maven / LIME / Humo / Happy Fruit / Ursa",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Plug N Play"],
+      "folder_name": "Plug N Play",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Pure Beauty", "Yada Yada"],
+      "folder_name": "Pure Beauty / Yada Yada",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Raw Garden"],
+      "folder_name": "Raw Garden",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Presidential"],
+      "folder_name": "Presidential",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Sluggers", "Tutti"],
+      "folder_name": "Sluggers / Tutti",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Smokiez", "VetCBD"],
+      "folder_name": "Smokiez / VetCBD",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Turn"],
+      "folder_name": "Turn",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Stiiizy"],
+      "folder_name": "Stiiizy",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Treesap"],
+      "folder_name": "Treesap",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Wizard Trees"],
+      "folder_name": "Wizard Trees",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    }
+  ]
+}
