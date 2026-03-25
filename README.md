@@ -29,6 +29,7 @@ This repository is a Python automation stack (not a web backend) that:
 - `getSalesReport.py` - Dutchie sales export automation for all stores/date range
 - `getInventoryOrderReport.py` - Dutchie inventory order report export automation for 7d/14d/30d windows
 - `getCatalog.py` - Dutchie catalog export automation
+- `dutchie_api_reports.py` - direct Dutchie POS API exporter for sales, catalog, inventory, and key verification
 - `getClosingReport.py` - closing report by day/store (GUI)
 - `owner_snapshot.py` - builds owner snapshot PDFs + summary email; can run fresh exports
 
@@ -75,6 +76,21 @@ This project uses local config/token files such as:
 - `credentials.json` (Google OAuth client)
 - `token*.json` (Google OAuth tokens generated after first auth)
 
+For direct Dutchie POS API exports, add your location keys to `.env` using either
+explicit names like `DUTCHIE_API_KEY_MV` or plain store-code keys like `mv`.
+
+Example:
+
+```bash
+DUTCHIE_INTEGRATOR_KEY=
+mv=your_mission_valley_location_key
+lg=your_lemon_grove_location_key
+lm=your_la_mesa_location_key
+wp=your_wildomar_palomar_location_key
+sv=your_sorrento_valley_location_key
+nc=your_national_city_location_key
+```
+
 Recommended operational practice:
 - Keep credential/token files out of git and backed up securely.
 - Rotate secrets if shared accidentally.
@@ -116,9 +132,24 @@ Useful commands:
 .venv/bin/python owner_snapshot.py
 ```
 
+### 2a) Verify Dutchie API keys only
+```bash
+.venv/bin/python dutchie_api_reports.py --verify-only --stores mv lg lm wp sv nc
+```
+
 ### 2b) Inventory order reports (7d / 14d / 30d)
 ```bash
 .venv/bin/python getInventoryOrderReport.py
+```
+
+### 2c) Pull API sales, catalog, and inventory exports
+```bash
+.venv/bin/python dutchie_api_reports.py --stores mv lg --reports sales catalog inventory --from-date 2026-03-01 --to-date 2026-03-24
+```
+
+Optional inventory detail flags:
+```bash
+.venv/bin/python dutchie_api_reports.py --stores mv --reports inventory --include-lab-results --include-room-quantities --include-allocated --include-lineage
 ```
 
 ### 3) Owner snapshot for one specific report day (example: Jan 31, 2026)

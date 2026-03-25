@@ -84,6 +84,7 @@ class BrandMeetingPacketGUI:
         self.email_var = tk.BooleanVar(value=True)
         self.xlsx_var = tk.BooleanVar(value=False)
         self.force_refresh_var = tk.BooleanVar(value=False)
+        self.use_api_var = tk.BooleanVar(value=True)
         self.brand_search_var = tk.StringVar()
         self.custom_brand_var = tk.StringVar()
 
@@ -707,76 +708,88 @@ class BrandMeetingPacketGUI:
 
         ttk.Checkbutton(
             options_body,
+            text="Use Dutchie API for sales and catalog",
+            variable=self.use_api_var,
+            style="Card.TCheckbutton",
+            command=self._update_header_summary,
+        ).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(
+            options_body,
             text="Include store sections",
             variable=self.include_store_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=0, column=0, sticky="w", pady=2)
+        ).grid(row=1, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Include product appendix",
             variable=self.include_appendix_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=1, column=0, sticky="w", pady=2)
+        ).grid(row=2, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Include charts",
             variable=self.include_charts_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=2, column=0, sticky="w", pady=2)
+        ).grid(row=3, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Include prior comparison data",
             variable=self.include_prior_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=3, column=0, sticky="w", pady=2)
+        ).grid(row=4, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Include kickback adjustments",
             variable=self.include_kickback_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=4, column=0, sticky="w", pady=2)
+        ).grid(row=5, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Email supported runs",
             variable=self.email_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=5, column=0, sticky="w", pady=2)
+        ).grid(row=6, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Generate XLSX workbook",
             variable=self.xlsx_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=6, column=0, sticky="w", pady=2)
+        ).grid(row=7, column=0, sticky="w", pady=2)
         ttk.Checkbutton(
             options_body,
             text="Force refresh downloads",
             variable=self.force_refresh_var,
             style="Card.TCheckbutton",
             command=self._update_header_summary,
-        ).grid(row=7, column=0, sticky="w", pady=(8, 8))
+        ).grid(row=8, column=0, sticky="w", pady=(8, 8))
 
+        self._make_help_row(
+            options_body,
+            "Dutchie API mode",
+            "Recommended. Sales and catalog/inventory come straight from the Dutchie POS API using the keys in .env, so the GUI does not need to drive browser exports.",
+        ).grid(row=9, column=0, sticky="ew", pady=(8, 8))
         self._make_help_row(
             options_body,
             "Smart cache reuse",
             "Default mode. Existing sales and catalog files in the run folder are reused first so repeat runs are fast and do not keep downloading the same data.",
-        ).grid(row=8, column=0, sticky="ew", pady=(8, 8))
+        ).grid(row=10, column=0, sticky="ew", pady=(0, 8))
         self._make_help_row(
             options_body,
             "Prior comparison data",
             "When enabled, the app loads the prior comparable window so delta views can compare against it. Turn it off to keep downloads to the selected dates only.",
-        ).grid(row=9, column=0, sticky="ew", pady=(0, 8))
+        ).grid(row=11, column=0, sticky="ew", pady=(0, 8))
         self._make_help_row(
             options_body,
             "Force refresh downloads",
             "Use this only when you know the saved files are stale and want fresh exports. Build-only modes still stay build-only and reuse saved files.",
-        ).grid(row=10, column=0, sticky="ew")
+        ).grid(row=12, column=0, sticky="ew")
 
     def _build_activity_tab(self, parent: tk.Widget) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -1442,7 +1455,9 @@ class BrandMeetingPacketGUI:
             self.store_count_var.set(f"{store_count} store{'s' if store_count != 1 else ''} selected")
         else:
             self.store_count_var.set("No stores selected")
-        self.cache_mode_var.set("Force refresh on" if self.force_refresh_var.get() else "Smart cache reuse on")
+        data_mode = "API" if self.use_api_var.get() else "Browser exports"
+        cache_mode = "Force refresh" if self.force_refresh_var.get() else "Smart cache reuse"
+        self.cache_mode_var.set(f"{data_mode} • {cache_mode}")
         self._update_brand_browser_summary()
 
         try:
@@ -1454,6 +1469,7 @@ class BrandMeetingPacketGUI:
             email_state = "On" if self.email_var.get() else "Off"
             xlsx_state = "On" if self.xlsx_var.get() else "Off"
             prior_state = "On" if self.include_prior_var.get() else "Off"
+            data_state = "API" if self.use_api_var.get() else "Browser exports"
             next_step = ""
             if brand_count == 0:
                 next_step = "  •  Next: open Brands and queue at least one brand."
@@ -1461,7 +1477,7 @@ class BrandMeetingPacketGUI:
                 next_step = "  •  Next: pick at least one store in Data & Output."
             self.setup_summary_var.set(
                 f"Brands: {brand_count}  •  Stores: {store_count}  •  Window: {start_day.isoformat()} to {end_day.isoformat()}  •  "
-                f"Email: {email_state}  •  XLSX: {xlsx_state}  •  Prior: {prior_state}  •  Cache: {'Force refresh' if self.force_refresh_var.get() else 'Smart reuse'}"
+                f"Data: {data_state}  •  Email: {email_state}  •  XLSX: {xlsx_state}  •  Prior: {prior_state}  •  Cache: {'Force refresh' if self.force_refresh_var.get() else 'Smart reuse'}"
                 f"{next_step}"
             )
         except Exception:
@@ -1569,6 +1585,8 @@ class BrandMeetingPacketGUI:
         return bmp.PacketOptions(
             run_export=run_export,
             run_catalog_export=run_catalog_export,
+            use_api=self.use_api_var.get(),
+            api_env_file=bmp.DEFAULT_API_ENV_FILE,
             include_store_sections=self.include_store_var.get(),
             include_product_appendix=self.include_appendix_var.get(),
             include_charts=self.include_charts_var.get(),
@@ -1658,8 +1676,14 @@ class BrandMeetingPacketGUI:
             msg = raw.replace("[SALES] Missing cached exports for ", "")
             msg = msg.replace(". Refreshing sales export.", "")
             return f"Refreshing missing sales data for {msg}", "warn"
+        if raw.startswith("[SALES] Fetching API sales window"):
+            return raw.replace("[SALES] Fetching API sales window ", "Fetching API sales for "), "info"
         if raw.startswith("[SALES] Exporting acquisition window"):
             return raw.replace("[SALES] Exporting acquisition window ", "Downloading sales data for "), "info"
+        if raw.startswith("[API] Sales "):
+            return raw.replace("[API] ", ""), "success"
+        if raw.startswith("[API] Catalog "):
+            return raw.replace("[API] ", ""), "success"
         if raw.startswith("[EXPORT] Running sales export for"):
             return raw.replace("[EXPORT] Running sales export for ", "Sales export window "), "info"
         if raw.startswith("[EXPORT] Sales export completed."):
@@ -1668,6 +1692,8 @@ class BrandMeetingPacketGUI:
             return "Sales files are ready", "success"
         if raw.startswith("[CATALOG] Reusing"):
             return "Using saved inventory files from this run", "info"
+        if raw.startswith("[CATALOG] Using API inventory/catalog fetch"):
+            return "Refreshing inventory data from the Dutchie API", "info"
         if raw.startswith("[CATALOG] Running getCatalog.py export..."):
             return "Refreshing inventory data", "info"
         if raw.startswith("[CATALOG] Catalog export completed."):
@@ -1820,12 +1846,27 @@ class BrandMeetingPacketGUI:
             acquisition_end=acquisition_end,
             allow_export=True,
             force_refresh=self.force_refresh_var.get(),
+            use_api=self.use_api_var.get(),
+            api_env_file=bmp.DEFAULT_API_ENV_FILE,
             logger=self._queue_log,
         )
+        if self.use_api_var.get():
+            bmp.prepare_catalog_exports(
+                paths=paths,
+                selected_store_codes=stores,
+                run_export=True,
+                force_refresh=self.force_refresh_var.get(),
+                use_api=True,
+                api_env_file=bmp.DEFAULT_API_ENV_FILE,
+                logger=self._queue_log,
+            )
         if missing:
             self._queue_log(f"[WARN] Missing sales export for {', '.join(missing)}")
         else:
-            self._queue_log(f"[DONE] Sales exports archived in {paths.raw_sales_dir}")
+            if self.use_api_var.get():
+                self._queue_log(f"[DONE] API sales and catalog data cached in {paths.run_dir}")
+            else:
+                self._queue_log(f"[DONE] Sales exports archived in {paths.raw_sales_dir}")
         if not sales_paths:
             raise ValueError(f"No usable sales exports were found for {brand}.")
 
@@ -1833,10 +1874,12 @@ class BrandMeetingPacketGUI:
         def _task() -> None:
             self._run_across_brands("Preparing sales data", self._download_sales_for_brand)
 
+        start_message = "Preparing cached or fresh API sales and catalog data..." if self.use_api_var.get() else "Preparing cached or fresh sales data..."
+        finish_message = "API sales and catalog data are ready" if self.use_api_var.get() else "Sales data is ready"
         self._run_background(
             _task,
-            start_message="Preparing cached or fresh sales data...",
-            finish_message="Sales data is ready",
+            start_message=start_message,
+            finish_message=finish_message,
         )
 
     def _on_build_pdf(self) -> None:
@@ -1913,9 +1956,14 @@ class BrandMeetingPacketGUI:
 
             self._run_across_brands("Running full packets", _full_run)
 
+        start_message = (
+            "Running cache-aware API fetch, build, and email..."
+            if self.use_api_var.get()
+            else "Running cache-aware download, build, and email..."
+        )
         self._run_background(
             _task,
-            start_message="Running cache-aware download, build, and email...",
+            start_message=start_message,
             finish_message="Full run finished",
         )
 

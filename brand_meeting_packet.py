@@ -12,6 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -43,6 +44,14 @@ from reportlab.platypus import (
 )
 
 import owner_snapshot as osnap
+from dutchie_api_reports import (
+    canonical_env_map as dutchie_canonical_env_map,
+    create_session as dutchie_create_session,
+    local_date_range_to_utc_strings as dutchie_local_date_range_to_utc_strings,
+    request_json as dutchie_request_json,
+    resolve_integrator_key as dutchie_resolve_integrator_key,
+    resolve_store_keys as dutchie_resolve_store_keys,
+)
 from getSalesReport import run_sales_report, store_abbr_map
 
 
@@ -52,6 +61,9 @@ from getSalesReport import run_sales_report, store_abbr_map
 REPORT_TZ = "America/Los_Angeles"
 DEFAULT_DAYS = 60
 DEFAULT_OUTPUT_ROOT = Path("reports/brand_packets").resolve()
+DEFAULT_API_ENV_FILE = ".env"
+SALES_API_MAX_WINDOW_DAYS = 30
+MIN_REPORTABLE_INVENTORY_UNITS = 4.0
 ALL_STORE_SLOW_MOVER_REPORT_NAME = "_all_store_slow_movers"
 THIS_DIR = Path(__file__).resolve().parent
 FILES_DIR = THIS_DIR / "files"
@@ -104,6 +116,8 @@ DEAL_SCENARIOS = [
 class PacketOptions:
     run_export: bool = False
     run_catalog_export: bool = True
+    use_api: bool = False
+    api_env_file: str = DEFAULT_API_ENV_FILE
     include_store_sections: bool = True
     include_product_appendix: bool = True
     include_charts: bool = True
@@ -273,6 +287,19 @@ def int0(x: float) -> str:
         return "0"
 
 
+def inventory_value_with_units(value: float, units: float) -> str:
+    return f"{money0(value)} / {int0(units)} units"
+
+
+def _inventory_reporting_rows(df: Optional[pd.DataFrame], min_units: float = MIN_REPORTABLE_INVENTORY_UNITS) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=(df.columns if df is not None else []))
+
+    out = df.copy()
+    out["Available"] = osnap.to_number(out.get("Available", 0.0)).fillna(0.0).astype(float)
+    return out[out["Available"] >= float(min_units)].copy()
+
+
 def days1(x: Any) -> str:
     try:
         v = float(x)
@@ -345,6 +372,333 @@ def _abbr_from_filename(path: Path) -> Optional[str]:
         if re.search(rf"(^|[^A-Z0-9]){re.escape(abbr)}([^A-Z0-9]|$)", stem):
             return abbr
     return None
+
+
+@lru_cache(maxsize=4)
+def _api_auth_bundle(env_file: str) -> Tuple[Dict[str, str], str]:
+    env_path = str(Path(env_file).expanduser())
+    env_map = dutchie_canonical_env_map(env_path)
+    integrator_key = dutchie_resolve_integrator_key(env_map)
+    return env_map, integrator_key
+
+
+def _api_store_keys(env_file: str, selected_store_codes: Sequence[str]) -> Tuple[Dict[str, str], str]:
+    env_map, integrator_key = _api_auth_bundle(env_file)
+    store_codes = [str(code).upper().strip() for code in selected_store_codes if str(code).strip()]
+    store_keys = dutchie_resolve_store_keys(env_map, store_codes)
+    missing = [code for code in store_codes if code not in store_keys]
+    if missing:
+        raise RuntimeError(
+            "Missing Dutchie API location key(s) for "
+            f"{', '.join(missing)} in {env_file}. "
+            "Expected names like DUTCHIE_API_KEY_MV or mv."
+        )
+    return store_keys, integrator_key
+
+
+def _api_session_for_store(store_code: str, env_file: str, selected_store_codes: Sequence[str]) -> Any:
+    store_keys, integrator_key = _api_store_keys(env_file, selected_store_codes)
+    return dutchie_create_session(store_keys[store_code], integrator_key)
+
+
+def _clean_flat_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=(df.columns if df is not None else []))
+    out = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed", case=False, regex=True)].copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def _to_float(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _first_nonempty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return value.strip()
+            continue
+        return value
+    return ""
+
+
+def _tag_names(tags: Any) -> str:
+    if not isinstance(tags, list):
+        return ""
+    names: List[str] = []
+    for item in tags:
+        if isinstance(item, dict):
+            name = str(item.get("tagName") or item.get("name") or "").strip()
+            if name:
+                names.append(name)
+    return ", ".join(names)
+
+
+def _product_lookup_by_id(products_payload: Any) -> Dict[int, Dict[str, Any]]:
+    lookup: Dict[int, Dict[str, Any]] = {}
+    if not isinstance(products_payload, list):
+        return lookup
+    for row in products_payload:
+        if not isinstance(row, dict):
+            continue
+        product_id = row.get("productId")
+        try:
+            key = int(product_id)
+        except Exception:
+            continue
+        lookup[key] = row
+    return lookup
+
+
+def _normalize_inventory_api_catalog_rows(inventory_payload: Any, store_code: str) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    store_name = _store_name_from_abbr(store_code)
+    for item in inventory_payload or []:
+        if not isinstance(item, dict):
+            continue
+
+        product_name = str(item.get("productName") or item.get("alternateName") or "").strip()
+        category = _first_nonempty(item.get("category"), item.get("masterCategory"), "Unknown")
+        unit_price = _to_float(_first_nonempty(item.get("unitPrice"), item.get("recUnitPrice"), item.get("medUnitPrice")))
+        brand_name = str(item.get("brandName") or osnap.parse_brand_from_product(product_name)).strip()
+
+        rows.append(
+            {
+                "SKU": _first_nonempty(item.get("sku"), ""),
+                "Available": _to_float(item.get("quantityAvailable")),
+                "Product": product_name,
+                "Cost": _to_float(item.get("unitCost")),
+                "Location price": unit_price,
+                "Price": unit_price,
+                "Category": str(category),
+                "Brand": brand_name,
+                "Strain": _first_nonempty(item.get("strain"), ""),
+                "Vendor": _first_nonempty(item.get("vendor"), item.get("producer"), ""),
+                "Tags": _tag_names(item.get("tags")),
+                "Strain Type": _first_nonempty(item.get("strainType"), ""),
+                "Store": store_name,
+                "Store Code": store_code,
+            }
+        )
+
+    return _clean_flat_dataframe(pd.DataFrame(rows))
+
+
+def _normalize_transactions_api_sales_rows(
+    transactions_payload: Any,
+    products_payload: Any,
+    store_code: str,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    product_lookup = _product_lookup_by_id(products_payload)
+
+    for tx in transactions_payload or []:
+        if not isinstance(tx, dict):
+            continue
+
+        tx_id = tx.get("transactionId")
+        tx_time = _first_nonempty(tx.get("transactionDateLocalTime"), tx.get("transactionDate"), tx.get("lastModifiedDateUTC"))
+        budtender = _first_nonempty(tx.get("completedByUser"), tx.get("terminalName"), "")
+        customer_type = _first_nonempty(tx.get("customerTypeName"), tx.get("customerType"), tx.get("customerTypeId"), "")
+        tx_is_return = bool(tx.get("isReturn"))
+
+        for item in tx.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                product_key = int(item.get("productId") or 0)
+            except Exception:
+                product_key = 0
+            product_info = product_lookup.get(product_key, {})
+            product_name = str(
+                _first_nonempty(
+                    product_info.get("productName"),
+                    product_info.get("internalName"),
+                    f"Unknown Product {item.get('productId')}",
+                )
+            )
+            category = str(_first_nonempty(product_info.get("category"), product_info.get("masterCategory"), "Unknown"))
+            quantity = _to_float(item.get("quantity"))
+            unit_weight = _to_float(item.get("unitWeight"))
+            gross_sales = _to_float(item.get("totalPrice"))
+            discount_amount = _to_float(item.get("totalDiscount"))
+            net_sales = gross_sales - discount_amount
+            unit_cost = _to_float(_first_nonempty(item.get("unitCost"), product_info.get("unitCost")))
+            inventory_cost = unit_cost * quantity
+            sale_price = _to_float(_first_nonempty(item.get("unitPrice"), product_info.get("price"), product_info.get("recPrice"), product_info.get("medPrice")))
+
+            is_return = bool(item.get("isReturned")) or tx_is_return
+            sign = -1.0 if is_return else 1.0
+
+            quantity = abs(quantity) * sign
+            gross_sales = abs(gross_sales) * sign
+            discount_amount = abs(discount_amount) * sign
+            net_sales = abs(net_sales) * sign
+            inventory_cost = abs(inventory_cost) * sign
+            total_weight = abs(quantity) * unit_weight * (1.0 if sign >= 0 else -1.0)
+            order_profit = net_sales - inventory_cost
+
+            rows.append(
+                {
+                    "Order ID": tx_id,
+                    "Order Time": tx_time,
+                    "Budtender Name": budtender,
+                    "Customer Type": customer_type,
+                    "Vendor Name": _first_nonempty(item.get("vendor"), product_info.get("vendorName"), product_info.get("producerName"), ""),
+                    "Product Name": product_name,
+                    "Category": category,
+                    "Major Category": category,
+                    "Package ID": _first_nonempty(item.get("packageId"), ""),
+                    "Batch ID": _first_nonempty(item.get("batchName"), ""),
+                    "External Package ID": _first_nonempty(item.get("sourcePackageId"), item.get("packageId"), ""),
+                    "Total Inventory Sold": quantity,
+                    "Unit Weight Sold": unit_weight,
+                    "Total Weight Sold": total_weight,
+                    "Gross Sales": gross_sales,
+                    "Inventory Cost": inventory_cost,
+                    "Discounted Amount": discount_amount,
+                    "Loyalty as Discount": 0.0,
+                    "Net Sales": net_sales,
+                    "Return Date": _first_nonempty(item.get("returnDate"), tx_time if is_return else None),
+                    "Producer": _first_nonempty(product_info.get("producerName"), item.get("vendor"), ""),
+                    "Order Profit": order_profit,
+                    "Unit Price": sale_price,
+                    "Price": sale_price,
+                    "Location price": sale_price,
+                    "Store": _store_name_from_abbr(store_code),
+                    "Store Code": store_code,
+                    "SKU": _first_nonempty(product_info.get("sku"), ""),
+                }
+            )
+
+    out = _clean_flat_dataframe(pd.DataFrame(rows))
+    for date_col in ["Order Time", "Return Date"]:
+        if date_col in out.columns:
+            out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    return out
+
+
+def _read_sales_source_file(path: Path) -> pd.DataFrame:
+    if str(path.suffix).lower() == ".csv":
+        df = pd.read_csv(path)
+        df = _clean_flat_dataframe(df)
+        for date_col in ["Order Time", "Return Date"]:
+            if date_col in df.columns:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        return df
+    return osnap.read_export(path)
+
+
+def _sales_export_candidates(directory: Path, abbr: str) -> List[Path]:
+    candidates: List[Path] = []
+    for pattern in (f"{abbr}*.xlsx", f"{abbr}*.csv"):
+        candidates.extend(directory.glob(pattern))
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _iter_sales_api_chunks(start_day: date, end_day: date, max_days: int = SALES_API_MAX_WINDOW_DAYS) -> List[Tuple[date, date]]:
+    chunks: List[Tuple[date, date]] = []
+    if end_day < start_day:
+        return chunks
+
+    window_days = max(1, int(max_days))
+    chunk_start = start_day
+    while chunk_start <= end_day:
+        chunk_end = min(chunk_start + timedelta(days=window_days - 1), end_day)
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def _fetch_sales_exports_via_api(
+    paths: RunPaths,
+    selected_store_codes: Sequence[str],
+    start_day: date,
+    end_day: date,
+    env_file: str,
+    logger: Optional[Callable[[str], None]],
+) -> Tuple[Dict[str, Path], List[str]]:
+    archived: Dict[str, Path] = {}
+    missing: List[str] = []
+    store_keys, integrator_key = _api_store_keys(env_file, selected_store_codes)
+    chunks = _iter_sales_api_chunks(start_day, end_day)
+
+    for abbr in selected_store_codes:
+        try:
+            session = dutchie_create_session(store_keys[abbr], integrator_key)
+            products_payload = dutchie_request_json(session, "/reporting/products")
+            transactions_payload: List[Dict[str, Any]] = []
+            for idx, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+                from_utc, to_utc = dutchie_local_date_range_to_utc_strings(
+                    chunk_start.isoformat(),
+                    chunk_end.isoformat(),
+                    REPORT_TZ,
+                )
+                sales_params = {
+                    "FromDateUTC": from_utc,
+                    "ToDateUTC": to_utc,
+                    "IncludeDetail": True,
+                    "IncludeTaxes": True,
+                    "IncludeOrderIds": True,
+                    "IncludeFeesAndDonations": True,
+                }
+                _log(
+                    f"[SALES] API chunk {abbr} {idx}/{len(chunks)}: {chunk_start.isoformat()} -> {chunk_end.isoformat()}",
+                    logger,
+                )
+                payload = dutchie_request_json(session, "/reporting/transactions", params=sales_params)
+                if isinstance(payload, list) and payload:
+                    transactions_payload.extend(payload)
+            df = _normalize_transactions_api_sales_rows(transactions_payload, products_payload, abbr)
+            dst_name = safe_filename(
+                f"{abbr} - Sales API Export - {osnap.store_label(_store_name_from_abbr(abbr))} - "
+                f"{start_day.isoformat()}_to_{end_day.isoformat()}.csv"
+            )
+            dst = paths.raw_sales_dir / dst_name
+            df.to_csv(dst, index=False)
+            archived[abbr] = dst
+            _log(f"[API] Sales {abbr}: {len(df)} row(s) -> {dst}", logger)
+        except Exception as exc:
+            missing.append(abbr)
+            _log(f"[WARN] API sales fetch failed for {abbr}: {exc}", logger)
+
+    return archived, missing
+
+
+def _fetch_catalog_exports_via_api(
+    paths: RunPaths,
+    selected_store_codes: Sequence[str],
+    env_file: str,
+    logger: Optional[Callable[[str], None]],
+) -> Tuple[List[Path], List[str]]:
+    copied: List[Path] = []
+    missing: List[str] = []
+    store_keys, integrator_key = _api_store_keys(env_file, selected_store_codes)
+
+    for abbr in selected_store_codes:
+        try:
+            session = dutchie_create_session(store_keys[abbr], integrator_key)
+            inventory_payload = dutchie_request_json(session, "/reporting/inventory")
+            df = _normalize_inventory_api_catalog_rows(inventory_payload, abbr)
+            dst_name = safe_filename(f"catalog_{abbr}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            dst = paths.raw_catalog_dir / dst_name
+            df.to_csv(dst, index=False)
+            copied.append(dst)
+            _log(f"[API] Catalog {abbr}: {len(df)} row(s) -> {dst}", logger)
+        except Exception as exc:
+            missing.append(abbr)
+            _log(f"[WARN] API catalog fetch failed for {abbr}: {exc}", logger)
+
+    return copied, missing
 
 
 def build_brand_aliases_from_catalog(
@@ -506,7 +860,7 @@ def _reuse_or_seed_sales_exports(
     found: Dict[str, Path] = {}
 
     for abbr in selected_store_codes:
-        existing = sorted(paths.raw_sales_dir.glob(f"{abbr}*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+        existing = _sales_export_candidates(paths.raw_sales_dir, abbr)
         if existing:
             found[abbr] = existing[0]
 
@@ -525,7 +879,7 @@ def _reuse_or_seed_sales_exports(
 
         pending = [abbr for abbr in selected_store_codes if abbr not in found]
         for abbr in pending:
-            matches = sorted(src_raw.glob(f"{abbr}*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+            matches = _sales_export_candidates(src_raw, abbr)
             for p in matches:
                 dst = paths.raw_sales_dir / p.name
                 shutil.copy2(p, dst)
@@ -588,6 +942,8 @@ def prepare_sales_exports(
     acquisition_end: date,
     allow_export: bool,
     force_refresh: bool,
+    use_api: bool,
+    api_env_file: str,
     logger: Optional[Callable[[str], None]],
 ) -> Tuple[Dict[str, Path], List[str], bool]:
     sales_paths: Dict[str, Path] = {}
@@ -625,18 +981,32 @@ def prepare_sales_exports(
         return sales_paths, missing, did_export
 
     did_export = True
-    _log(
-        f"[SALES] Exporting acquisition window {acquisition_start.isoformat()} -> {acquisition_end.isoformat()}",
-        logger,
-    )
-    run_sales_export(acquisition_start, acquisition_end, logger)
-    archived, _missing_from_export = archive_sales_exports(
-        paths,
-        acquisition_start,
-        acquisition_end,
-        selected_store_codes,
-        logger,
-    )
+    if use_api:
+        _log(
+            f"[SALES] Fetching API sales window {acquisition_start.isoformat()} -> {acquisition_end.isoformat()}",
+            logger,
+        )
+        archived, _missing_from_export = _fetch_sales_exports_via_api(
+            paths=paths,
+            selected_store_codes=selected_store_codes,
+            start_day=acquisition_start,
+            end_day=acquisition_end,
+            env_file=api_env_file,
+            logger=logger,
+        )
+    else:
+        _log(
+            f"[SALES] Exporting acquisition window {acquisition_start.isoformat()} -> {acquisition_end.isoformat()}",
+            logger,
+        )
+        run_sales_export(acquisition_start, acquisition_end, logger)
+        archived, _missing_from_export = archive_sales_exports(
+            paths,
+            acquisition_start,
+            acquisition_end,
+            selected_store_codes,
+            logger,
+        )
 
     if force_refresh:
         sales_paths = archived
@@ -785,6 +1155,8 @@ def prepare_catalog_exports(
     selected_store_codes: Sequence[str],
     run_export: bool,
     force_refresh: bool,
+    use_api: bool,
+    api_env_file: str,
     logger: Optional[Callable[[str], None]],
 ) -> Tuple[List[Path], List[str], bool]:
     existing = sorted(paths.raw_catalog_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -798,6 +1170,16 @@ def prepare_catalog_exports(
     before_catalog_snapshot: Dict[str, Tuple[int, float]] = {}
     did_export = False
     if run_export:
+        if use_api:
+            _log("[CATALOG] Using API inventory/catalog fetch", logger)
+            copied, missing = _fetch_catalog_exports_via_api(
+                paths=paths,
+                selected_store_codes=selected_store_codes,
+                env_file=api_env_file,
+                logger=logger,
+            )
+            return copied, missing, True
+
         before_catalog_snapshot = run_catalog_export(logger)
         did_export = True
     elif existing:
@@ -1904,7 +2286,7 @@ def build_product_group_supply_maps(
     inv_all = pd.DataFrame(columns=["group_key", "units_available"])
     inv_store = pd.DataFrame(columns=["_store_abbr", "group_key", "units_available"])
     if catalog_brand_df is not None and not catalog_brand_df.empty:
-        inv = _filter_product_group_rows(catalog_brand_df)
+        inv = _inventory_reporting_rows(_filter_product_group_rows(catalog_brand_df))
         if inv.empty:
             inv = pd.DataFrame(columns=catalog_brand_df.columns)
         if "_store_abbr" not in inv.columns:
@@ -1915,11 +2297,9 @@ def build_product_group_supply_maps(
             inv["group_key"] = inv[gcol].fillna("").astype(str)
         else:
             inv["group_key"] = ""
-        if "Available" in inv.columns:
-            inv["Available"] = osnap.to_number(inv["Available"]).fillna(0.0).astype(float)
-        else:
+        if "Available" not in inv.columns:
             inv["Available"] = 0.0
-        inv = inv[(inv["group_key"] != "") & (inv["Available"] > 0)].copy()
+        inv = inv[(inv["group_key"] != "") & (inv["Available"] >= MIN_REPORTABLE_INVENTORY_UNITS)].copy()
         if not inv.empty:
             inv_all = inv.groupby("group_key", as_index=False).agg(units_available=("Available", "sum"))
             inv_store = inv.groupby(["_store_abbr", "group_key"], as_index=False).agg(units_available=("Available", "sum"))
@@ -2198,7 +2578,10 @@ def _load_catalog_exports(paths: RunPaths, selected_store_codes: Sequence[str], 
 
 
 def _load_sales_exports(paths: RunPaths, selected_store_codes: Sequence[str], logger: Optional[Callable[[str], None]]) -> Dict[str, pd.DataFrame]:
-    files = sorted(paths.raw_sales_dir.glob("*.xlsx"))
+    files = sorted(
+        list(paths.raw_sales_dir.glob("*.xlsx")) + list(paths.raw_sales_dir.glob("*.csv")),
+        key=lambda p: p.stat().st_mtime,
+    )
     if not files:
         return {}
 
@@ -2212,7 +2595,7 @@ def _load_sales_exports(paths: RunPaths, selected_store_codes: Sequence[str], lo
         if selected and abbr not in selected:
             continue
         try:
-            df = osnap.read_export(p)
+            df = _read_sales_source_file(p)
         except Exception as exc:
             _log(f"[WARN] Could not read sales export {p.name}: {exc}", logger)
             continue
@@ -2413,6 +2796,7 @@ def build_brand_display_map(catalog_all_df: pd.DataFrame) -> Dict[str, str]:
 
 
 def summarize_inventory_overview(df: pd.DataFrame) -> Dict[str, float]:
+    df = _inventory_reporting_rows(df)
     if df is None or df.empty:
         return {
             "units": 0.0,
@@ -2439,6 +2823,7 @@ def summarize_inventory_overview(df: pd.DataFrame) -> Dict[str, float]:
 
 
 def summarize_inventory_products(df: pd.DataFrame) -> pd.DataFrame:
+    df = _inventory_reporting_rows(df)
     if df is None or df.empty:
         return pd.DataFrame(columns=[
             "merge_key", "display_product", "category_normalized", "units_available", "shelf_price", "cost",
@@ -2501,6 +2886,7 @@ def summarize_inventory_products(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_inventory_by_category(df: pd.DataFrame) -> pd.DataFrame:
+    df = _inventory_reporting_rows(df)
     if df is None or df.empty:
         return pd.DataFrame(columns=["category_normalized", "inventory_value", "potential_profit", "units_available"])
 
@@ -2513,6 +2899,7 @@ def summarize_inventory_by_category(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_inventory_by_store(df: pd.DataFrame) -> pd.DataFrame:
+    df = _inventory_reporting_rows(df)
     if df is None or df.empty or "_store_abbr" not in df.columns:
         return pd.DataFrame(columns=[
             "_store_abbr", "units_available", "inventory_value", "potential_revenue", "potential_profit", "avg_margin",
@@ -2625,7 +3012,7 @@ def add_inventory_supply_metrics(
         if "_store_abbr" in sales14.columns:
             sales14["_store_abbr"] = sales14["_store_abbr"].fillna("").astype(str).str.upper()
 
-    catalog_rows = catalog_brand_df.copy() if catalog_brand_df is not None else pd.DataFrame()
+    catalog_rows = _inventory_reporting_rows(catalog_brand_df.copy() if catalog_brand_df is not None else pd.DataFrame())
     if not catalog_rows.empty:
         if ("supply_merge_key" not in catalog_rows.columns) or ("supply_base_key" not in catalog_rows.columns):
             price_series = osnap.to_number(catalog_rows.get("Price_Used", 0.0)).fillna(0.0).astype(float)
@@ -2668,11 +3055,9 @@ def add_inventory_supply_metrics(
             catalog_rows.loc[missing_base, "supply_base_key"] = catalog_rows.loc[missing_base, "supply_merge_key"].map(_supply_base_from_merge_key)
         if "_store_abbr" in catalog_rows.columns:
             catalog_rows["_store_abbr"] = catalog_rows["_store_abbr"].fillna("").astype(str).str.upper()
-        if "Available" in catalog_rows.columns:
-            catalog_rows["Available"] = osnap.to_number(catalog_rows["Available"]).fillna(0.0).astype(float)
-        else:
+        if "Available" not in catalog_rows.columns:
             catalog_rows["Available"] = 0.0
-        catalog_rows = catalog_rows[catalog_rows["Available"] > 0].copy()
+        catalog_rows = catalog_rows[catalog_rows["Available"] >= MIN_REPORTABLE_INVENTORY_UNITS].copy()
 
     if sales14.empty or catalog_rows.empty or "supply_merge_key" not in sales14.columns or "supply_merge_key" not in catalog_rows.columns:
         total_units_14d = float(sales14["_qty"].sum()) if not sales14.empty else 0.0
@@ -2878,7 +3263,7 @@ def summarize_all_store_inventory_products(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
 
-    tmp = _filter_product_group_rows(df)
+    tmp = _inventory_reporting_rows(_filter_product_group_rows(df))
     if tmp.empty:
         return pd.DataFrame(columns=cols)
 
@@ -3471,7 +3856,7 @@ def summarize_store_inventory_products(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
 
-    tmp = _filter_product_group_rows(df, exclude_accessories=True)
+    tmp = _inventory_reporting_rows(_filter_product_group_rows(df, exclude_accessories=True))
     if tmp.empty:
         return pd.DataFrame(columns=cols)
 
@@ -3924,6 +4309,8 @@ def generate_all_store_slow_mover_report(
         acquisition_end=end_day,
         allow_export=True,
         force_refresh=force_refresh_data,
+        use_api=False,
+        api_env_file=DEFAULT_API_ENV_FILE,
         logger=logger,
     )
     catalog_paths, missing_catalog_stores, _did_export_catalog = prepare_catalog_exports(
@@ -3931,6 +4318,8 @@ def generate_all_store_slow_mover_report(
         selected_store_codes=selected,
         run_export=force_refresh_data,
         force_refresh=force_refresh_data,
+        use_api=False,
+        api_env_file=DEFAULT_API_ENV_FILE,
         logger=logger,
     )
     if not sales_paths:
@@ -4379,6 +4768,102 @@ def chart_inventory_value_by_product_group(inv_products_df: pd.DataFrame, title:
     return buf
 
 
+def _display_part_is_size_token(value: Any) -> bool:
+    part = normalize_text(value)
+    if not part:
+        return False
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?\s*(?:MG|G|ML|OZ)", part))
+
+
+def _rollup_inventory_display_label(value: Any) -> str:
+    label = str(value or "").strip()
+    if not label:
+        return ""
+
+    if "•" in label:
+        parts = [part.strip() for part in label.split("•") if str(part).strip()]
+        kept = [part for part in parts if not _display_part_is_size_token(part)]
+        if kept:
+            return " • ".join(kept)
+    return label
+
+
+def rollup_inventory_units_on_hand(inv_products_df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "display_product",
+        "category_normalized",
+        "units_available",
+        "inventory_value",
+        "trend_units_per_day_30d",
+        "trend_units_per_day_14d",
+        "trend_units_per_day_7d",
+        "days_of_supply",
+    ]
+    if inv_products_df is None or inv_products_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    label_col = "display_product" if "display_product" in inv_products_df.columns else (
+        "product_group_display" if "product_group_display" in inv_products_df.columns else None
+    )
+    if label_col is None:
+        return pd.DataFrame(columns=cols)
+
+    tmp = inv_products_df.copy()
+    tmp[label_col] = tmp[label_col].fillna("").astype(str).str.strip()
+    tmp = tmp[tmp[label_col] != ""].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+
+    tmp["display_product"] = tmp[label_col].map(_rollup_inventory_display_label)
+    tmp["category_normalized"] = tmp.get("category_normalized", "UNKNOWN")
+    tmp["category_normalized"] = tmp["category_normalized"].fillna("UNKNOWN").astype(str)
+    tmp["__rollup_key"] = (
+        tmp["category_normalized"].fillna("UNKNOWN").astype(str)
+        + "|"
+        + tmp["display_product"].map(normalize_text)
+    )
+
+    for col in ["units_available", "inventory_value", "trend_units_per_day_30d", "trend_units_per_day_14d", "trend_units_per_day_7d"]:
+        tmp[col] = pd.to_numeric(tmp.get(col, 0.0), errors="coerce").fillna(0.0).astype(float)
+
+    grouped = tmp.groupby("__rollup_key", as_index=False).agg(
+        display_product=("display_product", lambda s: _first_mode(s, "")),
+        category_normalized=("category_normalized", lambda s: _first_mode(s, "UNKNOWN")),
+        units_available=("units_available", "sum"),
+        inventory_value=("inventory_value", "sum"),
+        trend_units_per_day_30d=("trend_units_per_day_30d", "sum"),
+        trend_units_per_day_14d=("trend_units_per_day_14d", "sum"),
+        trend_units_per_day_7d=("trend_units_per_day_7d", "sum"),
+    )
+    grouped["days_of_supply"] = grouped.apply(
+        lambda r: _safe_dos(
+            float(r.get("units_available", 0.0)),
+            float(r.get("trend_units_per_day_30d", r.get("trend_units_per_day_14d", 0.0))),
+        ),
+        axis=1,
+    )
+    keep_cols = [c for c in cols if c in grouped.columns]
+    return grouped.sort_values(["units_available", "inventory_value", "display_product"], ascending=[False, False, True])[keep_cols].reset_index(drop=True)
+
+
+def chart_inventory_units_by_product_group(inv_products_df: pd.DataFrame, title: str) -> BytesIO:
+    buf = BytesIO()
+    if inv_products_df is None or inv_products_df.empty or "units_available" not in inv_products_df.columns:
+        return buf
+
+    d = rollup_inventory_units_on_hand(inv_products_df)
+    if d.empty or "display_product" not in d.columns:
+        return buf
+
+    d["units_available"] = pd.to_numeric(d["units_available"], errors="coerce").fillna(0.0).astype(float)
+    d = d.sort_values(["units_available", "display_product"], ascending=[False, True]).head(12)
+    if d.empty:
+        return buf
+
+    plot_df = d[["display_product", "units_available"]].copy()
+    return chart_rank_barh(plot_df, "display_product", "units_available", title, value_kind="int")
+
+
 def chart_deal_scenario_margin(
     scenario_df: pd.DataFrame,
     title: str = "Deal Scenario Margin Comparison",
@@ -4558,7 +5043,7 @@ def _metrics_table_rows(metrics: Dict[str, float]) -> List[List[Any]]:
 def _inventory_summary_rows(inv: Dict[str, float]) -> List[List[Any]]:
     return [
         ["Inventory Units", int0(inv.get("units", 0.0))],
-        ["Inventory Value", money0(inv.get("inventory_value", 0.0))],
+        ["Inventory Value", inventory_value_with_units(inv.get("inventory_value", 0.0), inv.get("units", 0.0))],
         ["Potential Revenue", money0(inv.get("potential_revenue", 0.0))],
         ["Potential Profit", money0(inv.get("potential_profit", 0.0))],
         ["Average Margin", pct1(inv.get("avg_margin", 0.0))],
@@ -4962,7 +5447,12 @@ def build_exec_kpi_grid(
             ),
         ),
         osnap.kpi_cell(styles, "Inventory Units", int0(inv_overview.get("units", 0.0)), note),
-        osnap.kpi_cell(styles, "Inventory Value", money0(inv_overview.get("inventory_value", 0.0)), note),
+        osnap.kpi_cell(
+            styles,
+            "Inventory Value",
+            inventory_value_with_units(inv_overview.get("inventory_value", 0.0), inv_overview.get("units", 0.0)),
+            note,
+        ),
         osnap.kpi_cell(styles, "Potential Revenue", money0(inv_overview.get("potential_revenue", 0.0)), note),
         osnap.kpi_cell(styles, "Potential Profit", money0(inv_overview.get("potential_profit", 0.0)), note),
         osnap.kpi_cell(styles, "Avg Inventory Margin", pct1(inv_overview.get("avg_margin", 0.0)), note),
@@ -5493,7 +5983,7 @@ def build_brand_packet_quick_pdf(
             ["Inventory Metric", "Value"],
             [
                 ["Units Available", int0(inv_store_metrics.get("units_available", 0.0))],
-                ["Inventory Value", money0(inv_store_metrics.get("inventory_value", 0.0))],
+                ["Inventory Value", inventory_value_with_units(inv_store_metrics.get("inventory_value", 0.0), inv_store_metrics.get("units_available", 0.0))],
                 ["Potential Profit", money0(inv_store_metrics.get("potential_profit", 0.0))],
                 ["Trend Units / Day (30d)", f"{float(inv_store_metrics.get('trend_units_per_day_30d', inv_store_metrics.get('trend_units_per_day_14d', 0.0))):,.1f}"],
                 ["Trend Units / Day (14d)", f"{float(inv_store_metrics.get('trend_units_per_day_14d', 0.0)):,.1f}"],
@@ -5515,11 +6005,24 @@ def build_brand_packet_quick_pdf(
                 if ch_inv_pg.getbuffer().nbytes > 0:
                     story.append(Image(ch_inv_pg, width=7.3 * inch, height=3.0 * inch))
                     story.append(Spacer(1, 0.04 * inch))
+            story.append(Spacer(1, 0.03 * inch))
 
-            inv_rows = []
-            for r in inv_products_store.sort_values("inventory_value", ascending=False).head(8).itertuples(index=False):
-                inv_rows.append([
+            story.append(Paragraph("Inventory Units On Hand by Product Group", styles["Section"]))
+            inv_products_units_store = rollup_inventory_units_on_hand(inv_products_store)
+            if options.include_charts:
+                ch_inv_units = chart_inventory_units_by_product_group(
+                    inv_products_units_store,
+                    f"{abbr} Inventory Units On Hand by Product Group",
+                )
+                if ch_inv_units.getbuffer().nbytes > 0:
+                    story.append(Image(ch_inv_units, width=7.3 * inch, height=3.0 * inch))
+                    story.append(Spacer(1, 0.04 * inch))
+
+            inv_unit_rows = []
+            for r in inv_products_units_store.sort_values(["units_available", "display_product"], ascending=[False, True]).itertuples(index=False):
+                inv_unit_rows.append([
                     str(getattr(r, "display_product", "")),
+                    int0(float(getattr(r, "units_available", 0.0))),
                     money0(float(getattr(r, "inventory_value", 0.0))),
                     f"{float(getattr(r, 'trend_units_per_day_30d', getattr(r, 'trend_units_per_day_14d', 0.0))):,.1f}",
                     f"{float(getattr(r, 'trend_units_per_day_14d', 0.0)):,.1f}",
@@ -5527,9 +6030,9 @@ def build_brand_packet_quick_pdf(
                     days1(getattr(r, "days_of_supply", np.nan)),
                 ])
             story.append(_build_table_fit(
-                ["Product Group", "Inv Value", "Units/Day 30d", "14d", "7d", "Days Supply"],
-                inv_rows,
-                [3.25 * inch, 1.05 * inch, 0.95 * inch, 0.7 * inch, 0.7 * inch, 0.95 * inch],
+                ["Product Group", "Units", "Inv Value", "Units/Day 30d", "14d", "7d", "Days Supply"],
+                inv_unit_rows,
+                [2.85 * inch, 0.65 * inch, 0.95 * inch, 0.95 * inch, 0.55 * inch, 0.55 * inch, 0.85 * inch],
             ))
             story.append(Spacer(1, 0.05 * inch))
 
@@ -5894,7 +6397,7 @@ def build_brand_packet_pdf(
                     ["Trend Units / Day (30d)", f"{float(inv_store_metrics.get('trend_units_per_day_30d', inv_store_metrics.get('trend_units_per_day_14d', 0.0))):,.1f}"],
                     ["Days of Supply", days1(inv_store_metrics.get("days_of_supply", np.nan))],
                     ["Est. OOS Date", str(inv_store_metrics.get("est_oos_date", "n/a"))],
-                    ["Inventory Value", money0(inv_store_metrics.get("inventory_value", 0.0))],
+                    ["Inventory Value", inventory_value_with_units(inv_store_metrics.get("inventory_value", 0.0), inv_store_metrics.get("units_available", 0.0))],
                     ["Potential Revenue", money0(inv_store_metrics.get("potential_revenue", 0.0))],
                     ["Potential Profit", money0(inv_store_metrics.get("potential_profit", 0.0))],
                     ["Average Margin", pct1(inv_store_metrics.get("avg_margin", 0.0))],
@@ -5902,6 +6405,35 @@ def build_brand_packet_pdf(
                 [3.9 * inch, 3.35 * inch],
             ))
             story.append(Spacer(1, 0.05 * inch))
+
+            inv_products_store = pkt.get("inventory_products", pd.DataFrame())
+            if inv_products_store is not None and not inv_products_store.empty:
+                story.append(Paragraph("Inventory Units On Hand by Product Group", styles["Section"]))
+                inv_products_units_store = rollup_inventory_units_on_hand(inv_products_store)
+                if options.include_charts:
+                    ch_inv_units_store = chart_inventory_units_by_product_group(
+                        inv_products_units_store,
+                        f"{abbr} Inventory Units On Hand by Product Group",
+                    )
+                    if ch_inv_units_store.getbuffer().nbytes > 0:
+                        story.append(Image(ch_inv_units_store, width=7.3 * inch, height=3.0 * inch))
+                        story.append(Spacer(1, 0.04 * inch))
+
+                inv_unit_rows_store = []
+                for r in inv_products_units_store.sort_values(["units_available", "display_product"], ascending=[False, True]).itertuples(index=False):
+                    inv_unit_rows_store.append([
+                        str(getattr(r, "display_product", "")),
+                        int0(float(getattr(r, "units_available", 0.0))),
+                        money0(float(getattr(r, "inventory_value", 0.0))),
+                        f"{float(getattr(r, 'trend_units_per_day_30d', getattr(r, 'trend_units_per_day_14d', 0.0))):,.1f}",
+                        days1(getattr(r, "days_of_supply", np.nan)),
+                    ])
+                story.append(_build_table_fit(
+                    ["Product Group", "Units", "Inv Value", "Units/Day 30d", "Days Supply"],
+                    inv_unit_rows_store,
+                    [3.35 * inch, 0.75 * inch, 1.0 * inch, 1.0 * inch, 1.0 * inch],
+                ))
+                story.append(Spacer(1, 0.05 * inch))
 
             story.append(_build_table_fit(
                 ["Window", "Net", "Tickets", "Basket", "Margin", "Disc Rate"],
@@ -6474,6 +7006,8 @@ def generate_brand_meeting_packet(
         acquisition_end=acquisition_end,
         allow_export=bool(options.run_export),
         force_refresh=bool(options.force_refresh_data),
+        use_api=bool(options.use_api),
+        api_env_file=options.api_env_file,
         logger=logger,
     )
 
@@ -6483,6 +7017,8 @@ def generate_brand_meeting_packet(
         selected_store_codes,
         run_export=bool(options.run_catalog_export),
         force_refresh=bool(options.force_refresh_data),
+        use_api=bool(options.use_api),
+        api_env_file=options.api_env_file,
         logger=logger,
     )
 
@@ -6505,7 +7041,7 @@ def generate_brand_meeting_packet(
     sales_source_coverage: Dict[str, Tuple[date, date]] = {}
     for abbr, path in sales_paths.items():
         try:
-            raw = osnap.read_export(path)
+            raw = _read_sales_source_file(path)
         except Exception as exc:
             _log(f"[WARN] Could not read sales export for {abbr} ({path.name}): {exc}", logger)
             continue
@@ -6594,12 +7130,8 @@ def generate_brand_meeting_packet(
 
     inv_units_by_store: Dict[str, float] = {}
     if catalog_brand is not None and not catalog_brand.empty and "_store_abbr" in catalog_brand.columns:
-        inv_tmp = catalog_brand.copy()
+        inv_tmp = _inventory_reporting_rows(catalog_brand)
         inv_tmp["_store_abbr"] = inv_tmp["_store_abbr"].fillna("").astype(str).str.upper()
-        if "Available" in inv_tmp.columns:
-            inv_tmp["Available"] = osnap.to_number(inv_tmp["Available"]).fillna(0.0).astype(float)
-        else:
-            inv_tmp["Available"] = 0.0
         inv_store_units_df = inv_tmp.groupby("_store_abbr", as_index=False).agg(units=("Available", "sum"))
         inv_units_by_store = {
             str(r["_store_abbr"]).upper(): float(r["units"])
@@ -6619,15 +7151,14 @@ def generate_brand_meeting_packet(
             sales_cov.loc[missing_base, "supply_base_key"] = sales_cov.loc[missing_base, "supply_merge_key"].map(_supply_base_from_merge_key)
         sales_cov = sales_cov[sales_cov["supply_merge_key"] != ""].copy()
 
-    catalog_cov = catalog_brand.copy() if catalog_brand is not None else pd.DataFrame()
+    catalog_cov = _inventory_reporting_rows(catalog_brand.copy() if catalog_brand is not None else pd.DataFrame())
     if not catalog_cov.empty:
         catalog_cov["supply_merge_key"] = catalog_cov.get("supply_merge_key", "").fillna("").astype(str)
         catalog_cov["supply_base_key"] = catalog_cov.get("supply_base_key", "").fillna("").astype(str)
         missing_base = catalog_cov["supply_base_key"].eq("")
         if missing_base.any():
             catalog_cov.loc[missing_base, "supply_base_key"] = catalog_cov.loc[missing_base, "supply_merge_key"].map(_supply_base_from_merge_key)
-        catalog_cov["Available"] = osnap.to_number(catalog_cov.get("Available", 0.0)).fillna(0.0).astype(float)
-        catalog_cov = catalog_cov[(catalog_cov["supply_merge_key"] != "") & (catalog_cov["Available"] > 0)].copy()
+        catalog_cov = catalog_cov[(catalog_cov["supply_merge_key"] != "") & (catalog_cov["Available"] >= MIN_REPORTABLE_INVENTORY_UNITS)].copy()
 
     sales_unique_merge = int(sales_cov["supply_merge_key"].nunique()) if not sales_cov.empty else 0
     catalog_unique_merge = int(catalog_cov["supply_merge_key"].nunique()) if not catalog_cov.empty else 0
@@ -6876,9 +7407,7 @@ def generate_brand_meeting_packet(
             )
 
         if catalog_brand is not None and not catalog_brand.empty:
-            inv_q = catalog_brand.copy()
-            inv_q["Available"] = osnap.to_number(inv_q.get("Available", 0.0)).fillna(0.0).astype(float)
-            inv_q = inv_q[inv_q["Available"] > 0].copy()
+            inv_q = _inventory_reporting_rows(catalog_brand)
             inv_q["supply_merge_key"] = inv_q.get("supply_merge_key", "")
             inv_q["supply_base_key"] = inv_q.get("supply_base_key", inv_q["supply_merge_key"].map(_supply_base_from_merge_key))
             inv_q_grp = inv_q.groupby(["_store_abbr", "supply_base_key", "supply_merge_key"], as_index=False).agg(
@@ -7007,6 +7536,8 @@ def parse_cli_args() -> argparse.Namespace:
     p.add_argument("--end-date", type=parse_iso_date, help="Override end date (YYYY-MM-DD).")
     p.add_argument("--stores", type=str, default="", help="Comma-separated store codes, e.g. MV,LM,SV")
 
+    p.add_argument("--use-api", action="store_true", help="Fetch sales and catalog/inventory data from the Dutchie POS API instead of browser exports.")
+    p.add_argument("--env-file", type=str, default=DEFAULT_API_ENV_FILE, help=f"Env file containing Dutchie API keys when --use-api is enabled. Default: {DEFAULT_API_ENV_FILE}")
     p.add_argument("--run-export", action="store_true", help="Run Dutchie sales export before building packet.")
     p.add_argument("--no-export", action="store_true", help="Reuse latest archived exports instead of running exporter.")
     p.add_argument("--no-catalog-export", action="store_true", help="Skip running getCatalog.py (debug/fast runs).")
@@ -7054,8 +7585,10 @@ def main() -> None:
     stores = parse_store_codes_arg(args.stores)
 
     options = PacketOptions(
-        run_export=bool(args.run_export and not args.no_export),
-        run_catalog_export=not args.no_catalog_export,
+        run_export=bool((args.use_api or args.run_export) and not args.no_export),
+        run_catalog_export=bool((not args.no_catalog_export) and ((not args.use_api) or not args.no_export)),
+        use_api=bool(args.use_api),
+        api_env_file=str(args.env_file or DEFAULT_API_ENV_FILE),
         include_store_sections=not args.no_store_sections,
         include_product_appendix=not args.no_product_appendix,
         include_charts=not args.no_charts,
