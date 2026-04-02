@@ -1842,6 +1842,46 @@ def _prepare_sales_df_for_brand(
     return work
 
 
+def _empty_prepared_brand_sales_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=[
+        "_date",
+        "_product_raw",
+        "_store_abbr",
+        "_store_name",
+        "_net",
+        "_gross",
+        "_qty",
+        "_disc_main",
+        "_disc_loyal",
+        "_disc_total",
+        "_tx_key",
+        "_kickback_amt",
+        "_cogs_real",
+        "_cogs_kb",
+        "_profit_real",
+        "_profit_kb",
+        "_weight",
+        "_is_return",
+        "norm_product_name",
+        "size_normalized",
+        "variant_type",
+        "category_normalized",
+        "core_name_normalized",
+        "merge_price_basis",
+        "merge_cost_basis",
+        "merge_key",
+        "product_group_key",
+        "product_group_display",
+        "supply_family_name",
+        "supply_base_key",
+        "supply_merge_key",
+        "display_product",
+        "_catalog_basis_matched",
+        "_deal_rule",
+        "_deal_brand",
+    ])
+
+
 def _prepare_sales_df_all_brands(
     df: pd.DataFrame,
     store_code: str,
@@ -3070,7 +3110,7 @@ def add_inventory_supply_metrics(
         if not out_store.empty and "_store_abbr" in out_store.columns:
             out_store["_store_abbr"] = out_store["_store_abbr"].fillna("").astype(str).str.upper()
             by_store_units = pd.DataFrame(columns=["_store_abbr", "trend_units_14d"])
-            if "_store_abbr" in sales14.columns:
+            if not sales14.empty and "_store_abbr" in sales14.columns and "_qty" in sales14.columns:
                 by_store_units = sales14.groupby("_store_abbr", as_index=False).agg(trend_units_14d=("_qty", "sum"))
             st_map = {str(r["_store_abbr"]).upper(): float(r["trend_units_14d"]) for _, r in by_store_units.iterrows()}
             out_store["trend_units_14d"] = out_store["_store_abbr"].map(st_map).fillna(0.0).astype(float)
@@ -7066,7 +7106,7 @@ def generate_brand_meeting_packet(
             continue
         brand_frames.append(dfb)
 
-    sales_brand = pd.concat(brand_frames, ignore_index=True) if brand_frames else pd.DataFrame()
+    sales_brand = pd.concat(brand_frames, ignore_index=True) if brand_frames else _empty_prepared_brand_sales_df()
     if sales_brand.empty:
         _log("[WARN] No matching brand sales rows found in selected window/stores.", logger)
 

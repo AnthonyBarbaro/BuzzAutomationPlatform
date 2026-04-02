@@ -9,8 +9,14 @@
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },
     {
-      "brand_synonyms": ["Autumn Brands", "Camino", "CANN", "CLSICS", "Emerald Sky", "Keef", "KIVA", "Level", "Lost Farms", "Nasha", "Petra", "Terra", "The Tablet", "Uncle Arnie's"],
-      "folder_name": "Autumn Brands / Camino / CANN / CLSICS / Emerald Sky / Keef / KIVA / Level / Lost Farms / Nasha / Petra / Terra / The Tablet / Uncle Arnie's",
+      "brand_synonyms": ["Camino", "CANN", "CLSICS", "Emerald Sky", "Keef", "KIVA", "Level", "Lost Farms", "Nasha", "Petra", "Terra", "The Tablet", "Uncle Arnie's"],
+      "folder_name": "Camino / CANN / CLSICS / Emerald Sky / Keef / KIVA / Level / Lost Farms / Nasha / Petra / Terra / The Tablet / Uncle Arnie's",
+      "emails": ["donna@buzzcannabis.com"],
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "brand_synonyms": ["Autumn Brands"],
+      "folder_name": "Autumn Brands",
       "emails": ["donna@buzzcannabis.com"],
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },

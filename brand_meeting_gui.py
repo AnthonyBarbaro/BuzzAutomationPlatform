@@ -38,8 +38,8 @@ class BrandMeetingPacketGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Brand Meeting Packet Studio")
-        self.root.geometry("1380x920")
-        self.root.minsize(1180, 760)
+        self.root.geometry("1360x900")
+        self.root.minsize(940, 640)
 
         self.colors = {
             "bg": "#F3EEE4",
@@ -70,6 +70,10 @@ class BrandMeetingPacketGUI:
         self.filtered_brand_options: List[BrandOption] = []
         self.brand_jump_buffer = ""
         self.brand_jump_timestamp = 0.0
+        self._responsive_wrap_bases: Dict[tk.Widget, int] = {}
+        self._layout_mode = ""
+        self._store_toggle_columns = 0
+        self._last_window_size = (0, 0)
 
         self.date_preset_var = tk.StringVar(value="Last 60 days")
         self.custom_start_var = tk.StringVar()
@@ -89,11 +93,11 @@ class BrandMeetingPacketGUI:
         self.custom_brand_var = tk.StringVar()
 
         self.status_var = tk.StringVar(value="Ready")
-        self.activity_var = tk.StringVar(value="Choose brands and run a packet.")
+        self.activity_var = tk.StringVar(value="Choose brands, review settings, and run a packet.")
         self.brand_count_var = tk.StringVar(value="0 brands selected")
         self.store_count_var = tk.StringVar(value="0 stores selected")
         self.window_summary_var = tk.StringVar(value="Last 60 days")
-        self.cache_mode_var = tk.StringVar(value="Smart cache reuse on")
+        self.cache_mode_var = tk.StringVar(value="Use saved data first")
         self.window_preview_var = tk.StringVar(value="")
         self.brand_selection_var = tk.StringVar(value="No brands selected")
         self.brand_details_var = tk.StringVar(value="Pick a brand to see details.")
@@ -108,12 +112,14 @@ class BrandMeetingPacketGUI:
 
         self._configure_theme()
         self._build_ui()
+        self._collect_wraplength_widgets(self.root)
         self._bind_events()
         self._set_custom_date_state()
         self._refresh_brand_list()
         self._update_store_summary()
         self._update_brand_details()
         self._update_header_summary()
+        self.root.after(0, lambda: self._apply_responsive_layout(force=True))
         self.root.after(120, self._drain_log_queue)
 
     def _configure_theme(self) -> None:
@@ -124,6 +130,13 @@ class BrandMeetingPacketGUI:
         label_font = tkfont.Font(family="Helvetica", size=11)
         small_font = tkfont.Font(family="Helvetica", size=10)
         chip_font = tkfont.Font(family="Helvetica", size=10, weight="bold")
+        self.font_sizes = {
+            "title": 22,
+            "section": 13,
+            "label": 11,
+            "small": 10,
+            "chip": 10,
+        }
 
         self.fonts = {
             "title": title_font,
@@ -134,6 +147,7 @@ class BrandMeetingPacketGUI:
         }
 
         style = ttk.Style(self.root)
+        self.style = style
         try:
             style.theme_use("clam")
         except tk.TclError:
@@ -177,19 +191,49 @@ class BrandMeetingPacketGUI:
             borderwidth=0,
         )
         style.map("Ghost.TButton", background=[("active", self.colors["ghost_dark"])])
+        style.configure(
+            "Store.TCheckbutton",
+            background=self.colors["card_alt"],
+            foreground=self.colors["text"],
+            padding=(10, 8),
+            font=("Helvetica", 10, "bold"),
+        )
+        style.map(
+            "Store.TCheckbutton",
+            background=[("active", self.colors["ghost"]), ("selected", self.colors["ghost"])],
+        )
         style.configure("Studio.TNotebook", background=self.colors["bg"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.layout("Studio.TNotebook.Tab", [])
+        style.configure(
+            "HeaderNav.TButton",
+            padding=(16, 10),
+            font=("Helvetica", 10, "bold"),
+            background=self.colors["hero_chip"],
+            foreground="#F7F2E9",
+            borderwidth=0,
+        )
+        style.map(
+            "HeaderNav.TButton",
+            background=[("active", self.colors["accent"]), ("disabled", self.colors["hero_chip"])],
+            foreground=[("disabled", "#F7F2E9")],
+        )
+        style.configure(
+            "HeaderNavActive.TButton",
+            padding=(16, 10),
+            font=("Helvetica", 10, "bold"),
+            background=self.colors["hero_border"],
+            foreground=self.colors["hero"],
+            borderwidth=0,
+        )
+        style.map(
+            "HeaderNavActive.TButton",
+            background=[("active", self.colors["hero_border"])],
+            foreground=[("active", self.colors["hero"])],
+        )
         style.configure(
             "Studio.TNotebook.Tab",
             padding=(18, 10),
             font=("Helvetica", 10, "bold"),
-            background=self.colors["ghost"],
-            foreground=self.colors["text"],
-            borderwidth=0,
-        )
-        style.map(
-            "Studio.TNotebook.Tab",
-            background=[("selected", self.colors["card"]), ("active", self.colors["ghost_dark"])],
-            foreground=[("selected", self.colors["accent_dark"])],
         )
         style.configure(
             "TEntry",
@@ -263,7 +307,7 @@ class BrandMeetingPacketGUI:
         ).grid(row=0, column=0, sticky="w")
         tk.Label(
             hero,
-            text="A guided workspace for first-time users: choose brands, confirm dates and stores, then run. Saved data is reused automatically unless you force a refresh.",
+            text="Choose brands, review settings, then run. The app uses saved data first and only pulls fresh data when needed or when you force a refresh.",
             bg=self.colors["hero"],
             fg="#D8E1DE",
             font=self.fonts["label"],
@@ -273,12 +317,16 @@ class BrandMeetingPacketGUI:
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         summary = tk.Frame(hero, bg=self.colors["hero"])
-        summary.grid(row=0, column=1, rowspan=2, sticky="e")
+        summary.grid(row=0, column=1, rowspan=3, sticky="ne")
         self._make_hero_chip(summary, self.status_var, 0, 0)
         self._make_hero_chip(summary, self.brand_count_var, 0, 1)
         self._make_hero_chip(summary, self.store_count_var, 1, 0)
         self._make_hero_chip(summary, self.cache_mode_var, 1, 1)
         self._make_hero_chip(summary, self.window_summary_var, 2, 0, columnspan=2)
+
+        self.header_nav = tk.Frame(hero, bg=self.colors["hero"])
+        self.header_nav.grid(row=2, column=0, sticky="w", pady=(16, 0))
+        self.nav_buttons: Dict[str, ttk.Button] = {}
 
         content = tk.Frame(outer, bg=self.colors["bg"])
         content.pack(fill="both", expand=True, pady=(18, 0))
@@ -286,206 +334,41 @@ class BrandMeetingPacketGUI:
         self.notebook = ttk.Notebook(content, style="Studio.TNotebook")
         self.notebook.pack(fill="both", expand=True)
 
-        self.overview_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
         self.brands_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
-        self.data_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
+        self.settings_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
         self.activity_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
 
-        self.notebook.add(self.overview_tab, text="Overview")
         self.notebook.add(self.brands_tab, text="Brands")
-        self.notebook.add(self.data_tab, text="Data & Output")
+        self.notebook.add(self.settings_tab, text="Settings")
         self.notebook.add(self.activity_tab, text="Activity")
 
-        self._build_overview_tab(self.overview_tab)
         self._build_brands_tab(self.brands_tab)
-        self._build_data_tab(self.data_tab)
+        self._build_settings_tab(self.settings_tab)
         self._build_activity_tab(self.activity_tab)
+        self._build_header_nav()
+        self.notebook.select(self.brands_tab)
 
-    def _build_overview_tab(self, parent: tk.Widget) -> None:
+    def _build_home_tab(self, parent: tk.Widget) -> None:
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_columnconfigure(1, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
-
-        guide_card, _, guide_body = self._make_card(
+        card, _, body = self._make_card(
             parent,
-            "Quick Start",
-            "If you are new to the tool, move left to right: choose brands, confirm settings, then run from here.",
+            "Home",
+            "The main flow now starts on Brands so selection and running stay on one page.",
         )
-        guide_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12), pady=(0, 12))
-        self._make_step_row(
-            guide_body,
-            1,
-            "Choose one or more brands",
-            "Open the Brands tab to search, jump with the keyboard, and queue multiple brands for one batch run.",
-            button_text="Open Brands",
-            command=lambda: self.notebook.select(self.brands_tab),
-        ).pack(fill="x", pady=(0, 10))
-        self._make_step_row(
-            guide_body,
-            2,
-            "Check dates, stores, and output",
-            "Use the Data & Output tab to set the date window, confirm stores, and decide whether you want charts, appendix pages, XLSX, or force refresh.",
-            button_text="Open Data",
-            command=lambda: self.notebook.select(self.data_tab),
-        ).pack(fill="x", pady=(0, 10))
-        self._make_step_row(
-            guide_body,
-            3,
-            "Run the packet",
-            "Most of the time, Download + Build + Email is all you need. It only refreshes missing inputs unless force refresh is enabled.",
-        ).pack(fill="x")
-
-        snapshot_card, _, snapshot_body = self._make_card(
-            parent,
-            "Current Setup",
-            "This is the exact configuration that will be used when you click run.",
-        )
-        snapshot_card.grid(row=0, column=1, sticky="nsew", pady=(0, 12))
-        snapshot_body.grid_columnconfigure(0, weight=1)
-        snapshot_body.grid_columnconfigure(1, weight=1)
-
-        self._make_summary_tile(snapshot_body, "Brands Queued", self.brand_count_var).grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
-        self._make_summary_tile(snapshot_body, "Stores Selected", self.store_count_var).grid(row=0, column=1, sticky="ew", pady=(0, 8))
-        self._make_summary_tile(snapshot_body, "Window", self.window_summary_var).grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
-        self._make_summary_tile(snapshot_body, "Cache Mode", self.cache_mode_var).grid(row=1, column=1, sticky="ew", pady=(0, 8))
-
-        tk.Label(
-            snapshot_body,
-            text="Run summary",
-            bg=self.colors["card"],
-            fg=self.colors["text"],
-            font=self.fonts["small"],
-            anchor="w",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 4))
-        tk.Label(
-            snapshot_body,
-            textvariable=self.setup_summary_var,
-            bg=self.colors["card_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["small"],
-            justify="left",
-            wraplength=520,
-            anchor="w",
-            padx=12,
-            pady=10,
-            highlightbackground=self.colors["border"],
-            highlightthickness=1,
-        ).grid(row=3, column=0, columnspan=2, sticky="ew")
-
-        actions_card, _, actions_body = self._make_card(
-            parent,
-            "Run Actions",
-            "The main buttons live here so the home tab stays simple for a new user.",
-        )
-        actions_card.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
-        actions_body.grid_columnconfigure(0, weight=1)
-        actions_body.grid_columnconfigure(1, weight=1)
-
-        self.btn_all = ttk.Button(
-            actions_body,
-            text="Download + Build + Email",
-            style="Accent.TButton",
-            command=self._on_full_run,
-        )
-        self.btn_all.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-
-        self.btn_download = ttk.Button(
-            actions_body,
-            text="Download Data",
-            style="Secondary.TButton",
-            command=self._on_download_sales,
-        )
-        self.btn_download.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
-
-        self.btn_build = ttk.Button(
-            actions_body,
-            text="Build Packet",
-            style="Secondary.TButton",
-            command=self._on_build_pdf,
-        )
-        self.btn_build.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
-
-        self.btn_build_email = ttk.Button(
-            actions_body,
-            text="Build + Email",
-            style="Secondary.TButton",
-            command=self._on_build_email_no_download,
-        )
-        self.btn_build_email.grid(row=2, column=0, columnspan=2, sticky="ew")
-
-        self.btn_all_store_slow = ttk.Button(
-            actions_body,
-            text="Store SKU Cuts",
-            style="Secondary.TButton",
-            command=self._on_all_store_slow_movers,
-        )
-        self.btn_all_store_slow.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-
-        self.progress = ttk.Progressbar(actions_body, mode="indeterminate")
-        self.progress.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 8))
-
-        tk.Label(
-            actions_body,
-            textvariable=self.status_var,
-            bg=self.colors["card"],
-            fg=self.colors["text"],
-            font=self.fonts["chip"],
-            anchor="w",
-        ).grid(row=5, column=0, columnspan=2, sticky="w")
-        tk.Label(
-            actions_body,
-            textvariable=self.activity_var,
-            bg=self.colors["card"],
-            fg=self.colors["muted"],
-            font=self.fonts["small"],
-            justify="left",
-            wraplength=520,
-            anchor="w",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        help_card, _, help_body = self._make_card(
-            parent,
-            "What Each Button Does",
-            "Short explanations so you do not have to remember the workflow.",
-        )
-        help_card.grid(row=1, column=1, sticky="nsew")
-        self._make_help_row(
-            help_body,
-            "Download Data",
-            "Creates or fills missing sales inputs for the selected brands and stores. Good when you want to prep files first.",
-        ).pack(fill="x", pady=(0, 10))
-        self._make_help_row(
-            help_body,
-            "Build Packet",
-            "Uses the saved files already in the selected run folder. Best when the data is already there and you only want a new PDF/XLSX.",
-        ).pack(fill="x", pady=(0, 10))
-        self._make_help_row(
-            help_body,
-            "Build + Email",
-            "Builds from saved files only, then emails the result. No new download unless you run the full button instead.",
-        ).pack(fill="x", pady=(0, 10))
-        self._make_help_row(
-            help_body,
-            "Download + Build + Email",
-            "Smart full run. Reuses the current run cache first and only downloads missing data unless Force Refresh is enabled in the Data tab.",
-        ).pack(fill="x")
-        self._make_help_row(
-            help_body,
-            "Store SKU Cuts",
-            "Builds a store-by-store PDF plus XLSX that keeps every location separate and highlights which brand SKUs to cut or review inside each store. If email is enabled, it sends both files when the run finishes.",
-        ).pack(fill="x", pady=(10, 0))
+        card.grid(row=0, column=0, sticky="nsew")
+        ttk.Button(body, text="Open Brands", style="Secondary.TButton", command=lambda: self._select_tab(self.brands_tab)).pack(anchor="w")
 
     def _build_brands_tab(self, parent: tk.Widget) -> None:
         parent.grid_columnconfigure(0, weight=3)
         parent.grid_columnconfigure(1, weight=2)
         parent.grid_rowconfigure(0, weight=1)
 
-        brand_card, _, brand_body = self._make_card(
+        self.brands_main_card, _, brand_body = self._make_card(
             parent,
             "Brand Browser",
             "Search, multi-select, or use the keyboard to jump directly to a brand. This tab is your queue builder.",
         )
-        brand_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        self.brands_main_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         brand_body.grid_rowconfigure(3, weight=1)
         brand_body.grid_columnconfigure(0, weight=1)
 
@@ -548,17 +431,82 @@ class BrandMeetingPacketGUI:
         brand_scroll.grid(row=0, column=1, sticky="ns")
         self.brand_list.configure(yscrollcommand=brand_scroll.set)
 
-        side = tk.Frame(parent, bg=self.colors["bg"])
-        side.grid(row=0, column=1, sticky="nsew")
-        side.grid_columnconfigure(0, weight=1)
-        side.grid_rowconfigure(0, weight=1)
+        self.brands_side = tk.Frame(parent, bg=self.colors["bg"])
+        self.brands_side.grid(row=0, column=1, sticky="nsew")
+        self.brands_side.grid_columnconfigure(0, weight=1)
+        self.brands_side.grid_rowconfigure(1, weight=1)
 
-        queue_card, _, queue_body = self._make_card(
-            side,
+        self.run_actions_card, _, actions_body = self._make_card(
+            self.brands_side,
+            "Run Actions",
+            "Select brands, then run from this page without jumping somewhere else.",
+        )
+        self.run_actions_card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        actions_body.grid_columnconfigure(0, weight=1)
+
+        self.run_action_grid = tk.Frame(actions_body, bg=self.colors["card"])
+        self.run_action_grid.grid(row=0, column=0, sticky="ew")
+
+        self.btn_all = ttk.Button(
+            self.run_action_grid,
+            text="Download + Build + Email",
+            style="Accent.TButton",
+            command=self._on_full_run,
+        )
+        self.btn_download = ttk.Button(
+            self.run_action_grid,
+            text="Download Data",
+            style="Secondary.TButton",
+            command=self._on_download_sales,
+        )
+        self.btn_build = ttk.Button(
+            self.run_action_grid,
+            text="Build Packet",
+            style="Secondary.TButton",
+            command=self._on_build_pdf,
+        )
+        self.btn_build_email = ttk.Button(
+            self.run_action_grid,
+            text="Build + Email",
+            style="Secondary.TButton",
+            command=self._on_build_email_no_download,
+        )
+        self.btn_all_store_slow = ttk.Button(
+            self.run_action_grid,
+            text="Store SKU Cuts",
+            style="Secondary.TButton",
+            command=self._on_all_store_slow_movers,
+        )
+
+        self.progress = ttk.Progressbar(actions_body, mode="indeterminate")
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(14, 8))
+
+        tk.Label(
+            actions_body,
+            textvariable=self.status_var,
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=self.fonts["chip"],
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w")
+        tk.Label(
+            actions_body,
+            textvariable=self.activity_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=self.fonts["small"],
+            justify="left",
+            wraplength=360,
+            anchor="w",
+        ).grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self._layout_run_actions(stacked=False)
+
+        self.brand_queue_card, _, queue_body = self._make_card(
+            self.brands_side,
             "Queued Brands",
             "Everything listed here will run in order with the same date window, stores, and options.",
         )
-        queue_card.grid(row=0, column=0, sticky="nsew", pady=(0, 12))
+        self.brand_queue_card.grid(row=1, column=0, sticky="nsew", pady=(0, 12))
         tk.Label(
             queue_body,
             textvariable=self.selected_queue_var,
@@ -574,12 +522,12 @@ class BrandMeetingPacketGUI:
             highlightthickness=1,
         ).pack(fill="both", expand=True)
 
-        detail_card, _, detail_body = self._make_card(
-            side,
+        self.brand_detail_card, _, detail_body = self._make_card(
+            self.brands_side,
             "Brand Details & Shortcuts",
             "Helpful if you only have one brand selected or you are still learning the keyboard controls.",
         )
-        detail_card.grid(row=1, column=0, sticky="ew")
+        self.brand_detail_card.grid(row=2, column=0, sticky="ew")
         tk.Label(
             detail_body,
             textvariable=self.brand_details_var,
@@ -598,17 +546,17 @@ class BrandMeetingPacketGUI:
         self._make_help_row(detail_body, "Type on the list", "Jump to a brand name quickly without reaching for the search box.").pack(fill="x", pady=(0, 8))
         self._make_help_row(detail_body, "Space or Enter", "Toggle the highlighted brand on or off in the queue.").pack(fill="x")
 
-    def _build_data_tab(self, parent: tk.Widget) -> None:
+    def _build_settings_tab(self, parent: tk.Widget) -> None:
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_columnconfigure(1, weight=1)
         parent.grid_rowconfigure(1, weight=1)
 
-        run_card, _, run_body = self._make_card(
+        self.settings_run_card, _, run_body = self._make_card(
             parent,
-            "Date Window & Output Folder",
+            "Settings",
             "These settings apply to every brand in the queue.",
         )
-        run_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        self.settings_run_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         run_body.grid_columnconfigure(1, weight=1)
         run_body.grid_columnconfigure(3, weight=1)
 
@@ -642,68 +590,64 @@ class BrandMeetingPacketGUI:
             anchor="w",
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
-        store_card, _, store_body = self._make_card(
+        self.settings_store_card, _, store_body = self._make_card(
             parent,
             "Stores",
-            "Pick the stores to include. Clearing everything now really means no stores selected.",
+            "Pick the stores to include for every brand in the run.",
         )
-        store_card.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
-        store_body.grid_rowconfigure(2, weight=1)
+        self.settings_store_card.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         store_body.grid_columnconfigure(0, weight=1)
 
+        store_top = tk.Frame(store_body, bg=self.colors["card"])
+        store_top.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        store_top.grid_columnconfigure(0, weight=1)
+
         tk.Label(
-            store_body,
+            store_top,
             textvariable=self.store_summary_var,
             bg=self.colors["card"],
             fg=self.colors["muted"],
             font=self.fonts["small"],
             anchor="w",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ).grid(row=0, column=0, sticky="w")
 
-        store_list_wrap = tk.Frame(store_body, bg=self.colors["card"])
-        store_list_wrap.grid(row=1, column=0, sticky="nsew")
-        store_list_wrap.grid_rowconfigure(0, weight=1)
-        store_list_wrap.grid_columnconfigure(0, weight=1)
-
-        self.store_list = tk.Listbox(
-            store_list_wrap,
-            selectmode=tk.MULTIPLE,
-            exportselection=False,
-            activestyle="none",
-            height=10,
-            bg=self.colors["input_bg"],
-            fg=self.colors["text"],
-            font=self.fonts["label"],
-            selectbackground=self.colors["accent"],
-            selectforeground="#FFFFFF",
-            highlightthickness=1,
-            highlightbackground=self.colors["border"],
-            relief="flat",
-        )
-        self.store_list.grid(row=0, column=0, sticky="nsew")
-        store_scroll = ttk.Scrollbar(store_list_wrap, orient="vertical", command=self.store_list.yview)
-        store_scroll.grid(row=0, column=1, sticky="ns")
-        self.store_list.configure(yscrollcommand=store_scroll.set)
-
-        self.store_rows = []
-        for store_name, abbr in bmp.store_abbr_map.items():
-            label = f"{abbr}  {store_name}"
-            self.store_rows.append(label)
-            self.store_list.insert(tk.END, label)
-        for index in range(len(self.store_rows)):
-            self.store_list.selection_set(index)
-
-        store_buttons = tk.Frame(store_body, bg=self.colors["card"])
-        store_buttons.grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Button(store_buttons, text="All Stores", style="Ghost.TButton", command=self._select_all_stores).pack(side="left", padx=(0, 8))
+        store_buttons = tk.Frame(store_top, bg=self.colors["card"])
+        store_buttons.grid(row=0, column=1, sticky="e")
+        ttk.Button(store_buttons, text="All", style="Ghost.TButton", command=self._select_all_stores).pack(side="left", padx=(0, 8))
         ttk.Button(store_buttons, text="Clear", style="Ghost.TButton", command=self._clear_store_selection).pack(side="left")
 
-        options_card, _, options_body = self._make_card(
+        self.store_toggle_grid = tk.Frame(
+            store_body,
+            bg=self.colors["card_alt"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=12,
+            pady=12,
+        )
+        self.store_toggle_grid.grid(row=1, column=0, sticky="nsew")
+        self.store_vars: Dict[str, tk.BooleanVar] = {}
+        self.store_toggle_buttons: List[ttk.Checkbutton] = []
+        self.store_display_labels: Dict[str, str] = {}
+        for store_name, abbr in bmp.store_abbr_map.items():
+            self.store_vars[abbr] = tk.BooleanVar(value=True)
+            short_name = self._compact_store_name(store_name)
+            self.store_display_labels[abbr] = short_name
+            button = ttk.Checkbutton(
+                self.store_toggle_grid,
+                text=f"{abbr}  {short_name}",
+                variable=self.store_vars[abbr],
+                style="Store.TCheckbutton",
+                command=self._update_store_summary,
+            )
+            self.store_toggle_buttons.append(button)
+        self._layout_store_toggles(3)
+
+        self.settings_options_card, _, options_body = self._make_card(
             parent,
             "Packet Options",
             "These control the output format and whether the tool should reuse saved files or force a refresh.",
         )
-        options_card.grid(row=1, column=1, sticky="nsew")
+        self.settings_options_card.grid(row=1, column=1, sticky="nsew")
         options_body.grid_columnconfigure(0, weight=1)
 
         ttk.Checkbutton(
@@ -777,8 +721,8 @@ class BrandMeetingPacketGUI:
         ).grid(row=9, column=0, sticky="ew", pady=(8, 8))
         self._make_help_row(
             options_body,
-            "Smart cache reuse",
-            "Default mode. Existing sales and catalog files in the run folder are reused first so repeat runs are fast and do not keep downloading the same data.",
+            "Reuse saved data",
+            "Default mode. Saved sales and catalog files in the run folder are used first, so the app only pulls fresh data when something is missing or when Force refresh is turned on.",
         ).grid(row=10, column=0, sticky="ew", pady=(0, 8))
         self._make_help_row(
             options_body,
@@ -796,12 +740,12 @@ class BrandMeetingPacketGUI:
         parent.grid_columnconfigure(1, weight=1)
         parent.grid_rowconfigure(1, weight=1)
 
-        status_card, _, status_body = self._make_card(
+        self.activity_status_card, _, status_body = self._make_card(
             parent,
             "Live Status",
             "A clean snapshot of what the app is doing right now.",
         )
-        status_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        self.activity_status_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         status_body.grid_columnconfigure(0, weight=1)
         status_body.grid_columnconfigure(1, weight=1)
 
@@ -822,12 +766,12 @@ class BrandMeetingPacketGUI:
             highlightthickness=1,
         ).grid(row=1, column=0, columnspan=2, sticky="ew")
 
-        log_card, log_header, log_body = self._make_card(
+        self.activity_log_card, log_header, log_body = self._make_card(
             parent,
             "Activity Feed",
             "Short status only. File-level archive noise and QA cache writes are hidden so this stays readable.",
         )
-        log_card.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        self.activity_log_card.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         log_body.grid_rowconfigure(0, weight=1)
         log_body.grid_columnconfigure(0, weight=1)
         ttk.Button(log_header, text="Clear Feed", style="Ghost.TButton", command=self._clear_logs).pack(side="right")
@@ -849,16 +793,16 @@ class BrandMeetingPacketGUI:
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_list.configure(yscrollcommand=log_scroll.set)
 
-        notes_card, _, notes_body = self._make_card(
+        self.activity_notes_card, _, notes_body = self._make_card(
             parent,
             "Reading The Feed",
             "Use this tab when a run is in progress or if something does not look right.",
         )
-        notes_card.grid(row=1, column=1, sticky="nsew")
+        self.activity_notes_card.grid(row=1, column=1, sticky="nsew")
         self._make_help_row(notes_body, "Green entries", "A step finished successfully, like a PDF build or a completed email.").pack(fill="x", pady=(0, 10))
         self._make_help_row(notes_body, "Amber entries", "Something needs attention, such as missing stores or an incomplete comparison window.").pack(fill="x", pady=(0, 10))
         self._make_help_row(notes_body, "Red entries", "The run stopped because of an error. The app will also show a popup with the same message.").pack(fill="x", pady=(0, 10))
-        self._make_help_row(notes_body, "Best workflow", "Stay on Overview while choosing settings, then jump here automatically once a run starts if you want to watch progress.").pack(fill="x")
+        self._make_help_row(notes_body, "Best workflow", "Stay on Brands while choosing settings, then jump here automatically once a run starts if you want to watch progress.").pack(fill="x")
 
     def _make_hero_chip(
         self,
@@ -1000,7 +944,187 @@ class BrandMeetingPacketGUI:
         ).pack(anchor="w", pady=(4, 0))
         return row
 
+    def _build_header_nav(self) -> None:
+        pages = [
+            ("Brands", self.brands_tab),
+            ("Settings", self.settings_tab),
+            ("Activity", self.activity_tab),
+        ]
+        for label, tab in pages:
+            button = ttk.Button(
+                self.header_nav,
+                text=label,
+                style="HeaderNav.TButton",
+                command=lambda target=tab: self._select_tab(target),
+            )
+            button.pack(side="left", padx=(0, 8))
+            self.nav_buttons[str(tab)] = button
+        self._sync_header_nav()
+
+    def _select_tab(self, tab: tk.Widget) -> None:
+        self.notebook.select(tab)
+        self._sync_header_nav()
+
+    def _sync_header_nav(self) -> None:
+        current = self.notebook.select()
+        for tab_id, button in self.nav_buttons.items():
+            style = "HeaderNavActive.TButton" if tab_id == current else "HeaderNav.TButton"
+            button.configure(style=style)
+
+    def _on_notebook_tab_changed(self, _event: tk.Event) -> None:
+        self._sync_header_nav()
+
+    def _collect_wraplength_widgets(self, widget: tk.Widget) -> None:
+        for child in widget.winfo_children():
+            try:
+                wrap = int(float(child.cget("wraplength")))
+            except Exception:
+                wrap = 0
+            if wrap > 0 and child not in self._responsive_wrap_bases:
+                self._responsive_wrap_bases[child] = wrap
+            self._collect_wraplength_widgets(child)
+
+    def _compact_store_name(self, store_name: str) -> str:
+        text = str(store_name).replace("Buzz Cannabis", "")
+        text = text.replace("-", " ").replace("(", " ").replace(")", " ")
+        cleaned = " ".join(text.split()).strip()
+        return cleaned.title() if cleaned else store_name
+
+    def _layout_run_actions(self, stacked: bool) -> None:
+        for column in range(2):
+            self.run_action_grid.grid_columnconfigure(column, weight=0)
+        self.run_action_grid.grid_columnconfigure(0, weight=1)
+        if not stacked:
+            self.run_action_grid.grid_columnconfigure(1, weight=1)
+
+        for button in (self.btn_all, self.btn_download, self.btn_build, self.btn_build_email, self.btn_all_store_slow):
+            button.grid_forget()
+
+        if stacked:
+            self.btn_all.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            self.btn_download.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+            self.btn_build.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+            self.btn_build_email.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+            self.btn_all_store_slow.grid(row=4, column=0, sticky="ew")
+            return
+
+        self.btn_all.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        self.btn_download.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+        self.btn_build.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
+        self.btn_build_email.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.btn_all_store_slow.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    def _layout_store_toggles(self, columns: int) -> None:
+        columns = max(1, columns)
+        if self._store_toggle_columns == columns:
+            return
+
+        for column in range(4):
+            self.store_toggle_grid.grid_columnconfigure(column, weight=0)
+        for column in range(columns):
+            self.store_toggle_grid.grid_columnconfigure(column, weight=1)
+
+        for idx, button in enumerate(self.store_toggle_buttons):
+            button.grid_forget()
+            row = idx // columns
+            column = idx % columns
+            padx = (0, 8) if column < columns - 1 else (0, 0)
+            button.grid(row=row, column=column, sticky="ew", padx=padx, pady=(0, 8))
+
+        self._store_toggle_columns = columns
+
+    def _apply_layout_mode(self, mode: str) -> None:
+        if mode == "wide":
+            self.brands_tab.grid_columnconfigure(0, weight=3)
+            self.brands_tab.grid_columnconfigure(1, weight=2)
+            self.brands_main_card.grid_configure(row=0, column=0, padx=(0, 12), pady=0)
+            self.brands_side.grid_configure(row=0, column=1, padx=0, pady=0, sticky="nsew")
+
+            self.settings_tab.grid_columnconfigure(0, weight=1)
+            self.settings_tab.grid_columnconfigure(1, weight=1)
+            self.settings_run_card.grid_configure(columnspan=2)
+            self.settings_store_card.grid_configure(row=1, column=0, padx=(0, 12), pady=0, sticky="nsew")
+            self.settings_options_card.grid_configure(row=1, column=1, padx=0, pady=0, sticky="nsew")
+
+            self.activity_tab.grid_columnconfigure(0, weight=1)
+            self.activity_tab.grid_columnconfigure(1, weight=1)
+            self.activity_status_card.grid_configure(columnspan=2)
+            self.activity_log_card.grid_configure(row=1, column=0, padx=(0, 12), pady=0, sticky="nsew")
+            self.activity_notes_card.grid_configure(row=1, column=1, padx=0, pady=0, sticky="nsew")
+            return
+
+        self.brands_tab.grid_columnconfigure(0, weight=1)
+        self.brands_tab.grid_columnconfigure(1, weight=0)
+        self.brands_main_card.grid_configure(row=0, column=0, padx=0, pady=0)
+        self.brands_side.grid_configure(row=1, column=0, padx=0, pady=(12, 0), sticky="nsew")
+
+        self.settings_tab.grid_columnconfigure(0, weight=1)
+        self.settings_tab.grid_columnconfigure(1, weight=0)
+        self.settings_run_card.grid_configure(columnspan=1)
+        self.settings_store_card.grid_configure(row=1, column=0, padx=0, pady=0, sticky="nsew")
+        self.settings_options_card.grid_configure(row=2, column=0, padx=0, pady=(12, 0), sticky="nsew")
+
+        self.activity_tab.grid_columnconfigure(0, weight=1)
+        self.activity_tab.grid_columnconfigure(1, weight=0)
+        self.activity_status_card.grid_configure(columnspan=1)
+        self.activity_log_card.grid_configure(row=1, column=0, padx=0, pady=0, sticky="nsew")
+        self.activity_notes_card.grid_configure(row=2, column=0, padx=0, pady=(12, 0), sticky="nsew")
+
+    def _apply_responsive_layout(self, force: bool = False) -> None:
+        width = max(self.root.winfo_width(), self.root.winfo_reqwidth())
+        height = max(self.root.winfo_height(), self.root.winfo_reqheight())
+        if width <= 1 or height <= 1:
+            return
+
+        if width < 1040 or height < 700:
+            mode = "narrow"
+        elif width < 1260 or height < 800:
+            mode = "compact"
+        else:
+            mode = "wide"
+
+        scale = max(0.82, min(1.0, min(width / 1360, height / 900)))
+        self.fonts["title"].configure(size=max(18, round(self.font_sizes["title"] * scale)))
+        self.fonts["section"].configure(size=max(11, round(self.font_sizes["section"] * scale)))
+        self.fonts["label"].configure(size=max(10, round(self.font_sizes["label"] * scale)))
+        self.fonts["small"].configure(size=max(9, round(self.font_sizes["small"] * scale)))
+        self.fonts["chip"].configure(size=max(9, round(self.font_sizes["chip"] * scale)))
+
+        button_font_size = max(10, round(11 * scale))
+        secondary_font_size = max(9, round(10 * scale))
+        tab_font_size = max(9, round(10 * scale))
+        self.style.configure("Accent.TButton", padding=(max(10, round(14 * scale)), max(8, round(10 * scale))), font=("Helvetica", button_font_size, "bold"))
+        self.style.configure("Secondary.TButton", padding=(max(10, round(12 * scale)), max(7, round(9 * scale))), font=("Helvetica", secondary_font_size, "bold"))
+        self.style.configure("Ghost.TButton", padding=(max(8, round(10 * scale)), max(6, round(7 * scale))), font=("Helvetica", secondary_font_size))
+        self.style.configure("Store.TCheckbutton", padding=(max(8, round(10 * scale)), max(6, round(8 * scale))), font=("Helvetica", secondary_font_size, "bold"))
+        self.style.configure("HeaderNav.TButton", padding=(max(12, round(16 * scale)), max(8, round(10 * scale))), font=("Helvetica", secondary_font_size, "bold"))
+        self.style.configure("HeaderNavActive.TButton", padding=(max(12, round(16 * scale)), max(8, round(10 * scale))), font=("Helvetica", secondary_font_size, "bold"))
+        self.style.configure("Studio.TNotebook.Tab", padding=(max(12, round(18 * scale)), max(8, round(10 * scale))), font=("Helvetica", tab_font_size, "bold"))
+
+        wrap_scale = 1.0 if mode == "wide" else 0.82 if mode == "compact" else 0.68
+        for widget, base in list(self._responsive_wrap_bases.items()):
+            try:
+                widget.configure(wraplength=max(180, int(base * wrap_scale)))
+            except tk.TclError:
+                self._responsive_wrap_bases.pop(widget, None)
+
+        self._layout_run_actions(stacked=(mode == "narrow"))
+        self._layout_store_toggles(3 if mode == "wide" else 2 if mode == "compact" else 1)
+        if force or mode != self._layout_mode:
+            self._apply_layout_mode(mode)
+            self._layout_mode = mode
+
+    def _on_root_configure(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        size = (event.width, event.height)
+        if size == self._last_window_size:
+            return
+        self._last_window_size = size
+        self._apply_responsive_layout()
+
     def _bind_events(self) -> None:
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
         self.date_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_window_changed())
         self.brand_search_var.trace_add("write", lambda *_args: self._refresh_brand_list())
         self.custom_start_var.trace_add("write", lambda *_args: self._update_header_summary())
@@ -1016,8 +1140,7 @@ class BrandMeetingPacketGUI:
         self.brand_search_entry.bind("<Escape>", self._clear_search_and_focus_list)
         self.custom_brand_entry.bind("<Return>", self._add_custom_brand_event)
         self.root.bind("<Control-f>", self._focus_brand_search)
-
-        self.store_list.bind("<<ListboxSelect>>", lambda _event: self._update_store_summary())
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
 
     def _load_brand_options(self) -> List[BrandOption]:
         brand_map: Dict[str, BrandOption] = {}
@@ -1326,8 +1449,12 @@ class BrandMeetingPacketGUI:
         self.selected_brand_names.clear()
         if hasattr(self, "brand_list"):
             self.brand_list.selection_clear(0, tk.END)
-        self._update_brand_details()
-        self._update_header_summary()
+        self.brand_jump_buffer = ""
+        if self.brand_search_var.get():
+            self.brand_search_var.set("")
+        else:
+            self._refresh_brand_list()
+        self.brand_search_entry.focus_set()
 
     def _restore_brand_selection(self) -> None:
         if not hasattr(self, "brand_list"):
@@ -1361,21 +1488,17 @@ class BrandMeetingPacketGUI:
         return sorted(self.selected_brand_names, key=str.casefold)
 
     def _selected_store_codes(self) -> List[str]:
-        idxs = self.store_list.curselection()
-        out: List[str] = []
-        for idx in idxs:
-            label = self.store_rows[idx]
-            abbr = label.split(" ", 1)[0].strip().upper()
-            if abbr:
-                out.append(abbr)
-        return bmp.order_store_codes(out)
+        selected = [abbr for abbr, var in self.store_vars.items() if var.get()]
+        return bmp.order_store_codes(selected)
 
     def _select_all_stores(self) -> None:
-        self.store_list.selection_set(0, tk.END)
+        for var in self.store_vars.values():
+            var.set(True)
         self._update_store_summary()
 
     def _clear_store_selection(self) -> None:
-        self.store_list.selection_clear(0, tk.END)
+        for var in self.store_vars.values():
+            var.set(False)
         self._update_store_summary()
 
     def _update_store_summary(self) -> None:
@@ -1456,7 +1579,7 @@ class BrandMeetingPacketGUI:
         else:
             self.store_count_var.set("No stores selected")
         data_mode = "API" if self.use_api_var.get() else "Browser exports"
-        cache_mode = "Force refresh" if self.force_refresh_var.get() else "Smart cache reuse"
+        cache_mode = "Pull fresh data" if self.force_refresh_var.get() else "Use saved data first"
         self.cache_mode_var.set(f"{data_mode} • {cache_mode}")
         self._update_brand_browser_summary()
 
@@ -1474,10 +1597,10 @@ class BrandMeetingPacketGUI:
             if brand_count == 0:
                 next_step = "  •  Next: open Brands and queue at least one brand."
             elif store_count == 0:
-                next_step = "  •  Next: pick at least one store in Data & Output."
+                next_step = "  •  Next: pick at least one store in Settings."
             self.setup_summary_var.set(
                 f"Brands: {brand_count}  •  Stores: {store_count}  •  Window: {start_day.isoformat()} to {end_day.isoformat()}  •  "
-                f"Data: {data_state}  •  Email: {email_state}  •  XLSX: {xlsx_state}  •  Prior: {prior_state}  •  Cache: {'Force refresh' if self.force_refresh_var.get() else 'Smart reuse'}"
+                f"Data: {data_state}  •  Email: {email_state}  •  XLSX: {xlsx_state}  •  Prior: {prior_state}  •  Downloads: {'Fresh pull' if self.force_refresh_var.get() else 'Saved data first'}"
                 f"{next_step}"
             )
         except Exception:
@@ -1786,7 +1909,7 @@ class BrandMeetingPacketGUI:
         self.status_var.set("Running")
         self.activity_var.set(start_message)
         if hasattr(self, "notebook") and hasattr(self, "activity_tab"):
-            self.notebook.select(self.activity_tab)
+            self._select_tab(self.activity_tab)
 
         def _worker() -> None:
             success = False

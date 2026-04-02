@@ -205,7 +205,7 @@ DEFAULT_BRAND_CRITERIA = {
          'brands': ['Time Machine']
      },
      'Pacific Stone': {
-         'vendors': ['Vino & Cigarro, LLC','KIVA / LCISM CORP', 'Garden Of Weeden Inc.','Pacific Stone','Garden Of Weeden'],
+         'vendors': ['Vino & Cigarro, LLC','KIVA / LCISM CORP', 'Garden Of Weeden Inc.','Pacific Stone','Garden Of Weeden','NC INVESTMENT GROUP, LLC'],
          'days': ['Monday','Thursday'],
          'discount': 0.50,
          'kickback': 0.25,
@@ -305,7 +305,7 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ['Eureka |']
     }, 
     'Ember Valley': { 
-        'vendors': ['LB Atlantis LLC', 'Garden Of Weeden Inc.', 'Courtney Lang', 'Hilife Group MV , LLC', 'Ember Valley', 'Helios | Hypeereon Corporation'],
+        'vendors': ['LB Atlantis LLC', 'Garden Of Weeden Inc.', 'Courtney Lang','NC INVESTMENT GROUP, LLC','Hilife Group MV , LLC', 'Ember Valley', 'Helios | Hypeereon Corporation'],
         'days': ['Thursday','Tuesday'],
         'discount': 0.50,
         'kickback': 0.30,
@@ -360,7 +360,7 @@ DEFAULT_BRAND_CRITERIA = {
         'days': ['Thursday'],
         'discount': 0.50,
         'kickback': 0.30,
-        'brands': ['BLEM']
+        'brands': ['BLEM'] #Make this pre-rolls and eigths only
     },
        "P&B": {
         'vendors': ['Fluids Manufacturing Inc.'],
@@ -529,7 +529,7 @@ DEFAULT_BRAND_CRITERIA = {
             'discount': 0.5,
             'kickback': 0.3,
             'brands': ['CLSICS']},
-    'Nasha': {'vendors': ['KIVA / LCISM CORP', 'Vino & Cigarro, LLC'],
+    'Nasha': {'vendors': ['KIVA / LCISM CORP', 'Vino & Cigarro, LLC','Hilife LM'],
            'days': ['Tuesday'],
            'discount': 0.5,
            'kickback': 0.3,
@@ -580,7 +580,7 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Ghost |']},
-    'Maven': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+    'Maven': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden','NC INVESTMENT GROUP, LLC'],
            'days': ['Monday','Wednesday'],
            'discount': 0.5,
            'kickback': 0.3,
@@ -596,8 +596,8 @@ DEFAULT_BRAND_CRITERIA = {
            'kickback': 0.30,
            'brands': ['Lyfe Sauce |']},
     'Good Good': {'vendors': ['KMMK Distribution Inc.'],
-           #'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-           'days': ['Thursday','Friday','Saturday','Sunday'],
+           'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+           #'days': ['Thursday','Friday','Saturday','Sunday'],
            'discount': 0.5,
            'kickback': 0.0,
            'brands': ['Goodgood |']},

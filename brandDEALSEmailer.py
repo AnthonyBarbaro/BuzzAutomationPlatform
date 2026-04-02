@@ -4,6 +4,17 @@ import os
 import re
 import openpyxl
 
+
+def alpha_key(value):
+    return str(value).casefold()
+
+
+def link_line_key(line):
+    if ":" in line:
+        filename, _ = line.split(":", 1)
+        return alpha_key(filename.strip())
+    return alpha_key(line)
+
 # ---------------------------------------------
 # 1) GMAIL API SEND LOGIC 
 # ---------------------------------------------
@@ -203,7 +214,7 @@ def make_html_link_list(lines):
     if not lines:
         return "<p>No links for this brand.</p>"
     html = "<ul>"
-    for ln in lines:
+    for ln in sorted(lines, key=link_line_key):
         if ":" in ln:
             filename, link = ln.split(":", 1)
             filename = filename.strip()
@@ -231,7 +242,7 @@ def send_brand_emails():
     all_brands_info = []
 
     # 2) Iterate brand_reports, parse brand, build email
-    for filename in os.listdir(reports_dir):
+    for filename in sorted(os.listdir(reports_dir), key=alpha_key):
         if not filename.endswith(".xlsx"):
             continue
 
@@ -337,7 +348,7 @@ def send_brand_emails():
 
         # --- 2) Brand blocks (NO store totals under each brand) ---
         brand_htmls = []
-        for bi in all_brands_info:
+        for bi in sorted(all_brands_info, key=lambda item: alpha_key(item["brand"])):
             brand = bi["brand"]
             link_html = make_html_link_list(bi["links"])
             row_html = build_kickback_table(bi["rows"])

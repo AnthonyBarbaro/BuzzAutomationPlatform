@@ -3,12 +3,15 @@
 import os
 import re
 import subprocess
+import sys
 import time
 import traceback
 import datetime
 import calendar
 from datetime import date, timedelta, datetime as dt
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
 
 ##############################################################################
 # 1) LOGIC FOR LAST MONDAY TO SUNDAY
@@ -40,8 +43,9 @@ def run_get_catalog():
     Make sure getCatalog.py is in the same directory or specify the full path.
     """
     print("\n===== Running getCatalog.py to download Catalog files... =====\n")
+    script_path = BASE_DIR / "getCatalog.py"
     try:
-        subprocess.check_call(["python", "getCatalog.py"])
+        subprocess.check_call([sys.executable, str(script_path)], cwd=BASE_DIR)
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] getCatalog.py failed: {e}")
     except FileNotFoundError:
@@ -478,7 +482,7 @@ def main():
     run_sales_report(last_monday, last_sunday)
 
     # 3) Deals
-    subprocess.run(["python", "deals.py"])
+    subprocess.run([sys.executable, str(BASE_DIR / "deals.py")], cwd=BASE_DIR)
     time.sleep(2)
 
     # 5) Drive Upload (both brand_reports + done/Hashish)
@@ -504,7 +508,7 @@ def main():
             else:
                 non_hashish_links.append(line)
 
-    subprocess.run(["python", "brandDEALSEmailer.py"])
+    subprocess.run([sys.executable, str(BASE_DIR / "brandDEALSEmailer.py")], cwd=BASE_DIR)
 
 
     print("\n===== autoJob.py completed successfully. =====")
