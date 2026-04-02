@@ -30,6 +30,8 @@ This repository is a Python automation stack (not a web backend) that:
 - `getInventoryOrderReport.py` - Dutchie inventory order report export automation for 7d/14d/30d windows
 - `getCatalog.py` - Dutchie catalog export automation
 - `dutchie_api_reports.py` - direct Dutchie POS API exporter for sales, catalog, inventory, and key verification
+- `dutchie_today_dashboard.py` - live same-day Dutchie API HTML dashboard with store pace, hourly flow, top products, and low-stock flags
+- `dutchie_live_dashboard_gui.py` - native Tkinter live dashboard with same-day KPIs, store focus, sales mix tables, and inventory alerts
 - `getClosingReport.py` - closing report by day/store (GUI)
 - `owner_snapshot.py` - builds owner snapshot PDFs + summary email; can run fresh exports
 
@@ -150,6 +152,33 @@ Useful commands:
 Optional inventory detail flags:
 ```bash
 .venv/bin/python dutchie_api_reports.py --stores mv --reports inventory --include-lab-results --include-room-quantities --include-allocated --include-lineage
+```
+
+### 2d) Live same-day Dutchie dashboard
+One-shot HTML snapshot:
+```bash
+.venv/bin/python dutchie_today_dashboard.py --stores mv lg lm wp sv nc --open
+```
+
+Keep refreshing a live dashboard in the browser:
+```bash
+.venv/bin/python dutchie_today_dashboard.py --stores mv lg lm wp sv nc --watch --refresh-seconds 90 --open
+```
+
+Skip inventory if you only want sales-side pace metrics:
+```bash
+.venv/bin/python dutchie_today_dashboard.py --stores mv lg --no-inventory
+```
+
+### 2e) Native live dashboard GUI
+Launch the desktop dashboard:
+```bash
+.venv/bin/python dutchie_live_dashboard_gui.py
+```
+
+Start with inventory calls disabled:
+```bash
+.venv/bin/python dutchie_live_dashboard_gui.py --no-inventory
 ```
 
 ### 3) Owner snapshot for one specific report day (example: Jan 31, 2026)
