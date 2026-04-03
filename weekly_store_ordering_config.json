@@ -1,0 +1,72 @@
+{
+  "timezone": "America/Los_Angeles",
+  "stores": [
+    "MV",
+    "LG",
+    "LM",
+    "WP",
+    "SV",
+    "NC"
+  ],
+  "spreadsheet_url_env": "WEEKLY_STORE_ORDERING_SHEET_URL",
+  "spreadsheet_url_file": "weekly_store_ordering_sheet_url.txt",
+  "output_root": "reports/store_weekly_ordering",
+  "sheet_names": {
+    "auto_suffix": "Auto",
+    "review_suffix": "Review"
+  },
+  "sales": {
+    "window_days": 30,
+    "excluded_statuses": [
+      "cancelled",
+      "canceled",
+      "void",
+      "voided",
+      "deleted"
+    ]
+  },
+  "inventory_api_params": {
+    "includeLabResults": false,
+    "includeRoomQuantities": false,
+    "includeAllocated": false,
+    "includeLineage": false
+  },
+  "eligibility": {
+    "mode": "brand_or_vendor",
+    "include_sales_only_rows": true
+  },
+  "exclusions": {
+    "pattern": "\\b(sample|samples|promo|promos|promotional|display|tester)\\b",
+    "fields": [
+      "product",
+      "category",
+      "tags",
+      "brand",
+      "vendor"
+    ],
+    "extra_keywords": [
+      "west coast hookah & glass"
+    ],
+    "low_cost_threshold": 1.01,
+    "exclude_low_cost_rows": false
+  },
+  "reorder": {
+    "velocity_window_days": 30,
+    "target_cover_days": 14,
+    "needs_order_min_qty": 1,
+    "days_of_supply_urgent": 3.0,
+    "days_of_supply_low": 7.0,
+    "high_sell_through_30d": 0.6
+  },
+  "review_manual_columns": [
+    "Shelf Count Checked",
+    "Proposed Order Qty",
+    "Final Approved Qty",
+    "Ordered?",
+    "Buyer Initials",
+    "Reviewer Initials",
+    "Cross-Check Status",
+    "Notes",
+    "PO / Vendor Ref"
+  ]
+}

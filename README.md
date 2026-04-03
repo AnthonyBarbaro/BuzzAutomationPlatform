@@ -30,6 +30,8 @@ This repository is a Python automation stack (not a web backend) that:
 - `getInventoryOrderReport.py` - Dutchie inventory order report export automation for 7d/14d/30d windows
 - `getCatalog.py` - Dutchie catalog export automation
 - `dutchie_api_reports.py` - direct Dutchie POS API exporter for sales, catalog, inventory, and key verification
+- `weekly_store_ordering_sheet.py` - store-first weekly reorder workbook builder for one Google Spreadsheet with `AUTO` + `REVIEW` tabs per store/week
+- `weekly_store_ordering_sheets.py` - Google Sheets helper/upsert layer for weekly ordering tabs
 - `dutchie_today_dashboard.py` - live same-day Dutchie API HTML dashboard with store pace, hourly flow, top products, and low-stock flags
 - `dutchie_live_dashboard_gui.py` - native Tkinter live dashboard with same-day KPIs, store focus, sales mix tables, and inventory alerts
 - `getClosingReport.py` - closing report by day/store (GUI)
@@ -180,6 +182,20 @@ Start with inventory calls disabled:
 ```bash
 .venv/bin/python dutchie_live_dashboard_gui.py --no-inventory
 ```
+
+### 2f) Weekly store ordering sheets
+Dry-run with the bundled fixture:
+```bash
+.venv/bin/python weekly_store_ordering_sheet.py --store MV --week 2026-03-30 --as-of-date 2026-04-03 --fixture-root tests/fixtures/weekly_store_ordering --dry-run
+```
+
+Live all-store write:
+```bash
+.venv/bin/python weekly_store_ordering_sheet.py --all-stores
+```
+
+Setup and cron details:
+- [`docs/weekly_store_ordering_setup.md`](/home/anthony/projects/BuzzPythonGUI/docs/weekly_store_ordering_setup.md)
 
 ### 3) Owner snapshot for one specific report day (example: Jan 31, 2026)
 ```bash

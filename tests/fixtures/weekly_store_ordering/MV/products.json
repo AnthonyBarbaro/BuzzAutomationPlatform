@@ -1,0 +1,68 @@
+[
+  {
+    "productId": 101,
+    "productName": "Brand A | Gummies 100mg | Mixed Berry",
+    "category": "Edibles",
+    "masterCategory": "Edibles",
+    "vendorName": "Vendor Alpha",
+    "producerName": "Vendor Alpha",
+    "sku": "SKU-GUMMY",
+    "unitCost": 8.0,
+    "price": 20.0
+  },
+  {
+    "productId": 102,
+    "productName": "Brand A | Flower 3.5g | Blue Dream",
+    "category": "Flower",
+    "masterCategory": "Flower",
+    "vendorName": "Vendor Alpha",
+    "producerName": "Vendor Alpha",
+    "sku": "SKU-FLOWER",
+    "unitCost": 12.0,
+    "price": 35.0
+  },
+  {
+    "productId": 103,
+    "productName": "Brand A Sample Pre-Roll 1g",
+    "category": "Pre-Rolls",
+    "masterCategory": "Pre-Rolls",
+    "vendorName": "Vendor Alpha",
+    "producerName": "Vendor Alpha",
+    "sku": "SKU-SAMPLE",
+    "unitCost": 0.5,
+    "price": 0.0
+  },
+  {
+    "productId": 104,
+    "productName": "Brand B | Beverage 10mg | Lemon",
+    "category": "Beverages",
+    "masterCategory": "Beverages",
+    "vendorName": "Vendor Beta",
+    "producerName": "Vendor Beta",
+    "sku": "SKU-DRINK",
+    "unitCost": 4.0,
+    "price": 12.0
+  },
+  {
+    "productId": 105,
+    "productName": "Brand A | Flower 7g | Reserve",
+    "category": "Flower",
+    "masterCategory": "Flower",
+    "vendorName": "Vendor Alpha",
+    "producerName": "Vendor Alpha",
+    "sku": "SKU-NOSALES",
+    "unitCost": 20.0,
+    "price": 45.0
+  },
+  {
+    "productId": 106,
+    "productName": "Brand A | Gummies 10pk | Tropical",
+    "category": "Edibles",
+    "masterCategory": "Edibles",
+    "vendorName": "Vendor Alpha",
+    "producerName": "Vendor Alpha",
+    "sku": "SKU-ZEROINV",
+    "unitCost": 7.0,
+    "price": 18.0
+  }
+]

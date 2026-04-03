@@ -1,0 +1,200 @@
+[
+  {
+    "transactionId": 1,
+    "transactionDateLocalTime": "2026-04-02T10:00:00",
+    "completedByUser": "Budtender 1",
+    "customerTypeName": "Adult Use",
+    "isReturn": false,
+    "status": "Completed",
+    "items": [
+      {
+        "productId": 101,
+        "quantity": 3,
+        "totalPrice": 60.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 20.0,
+        "unitCost": 8.0,
+        "vendor": "Vendor Alpha"
+      },
+      {
+        "productId": 102,
+        "quantity": 1,
+        "totalPrice": 35.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 35.0,
+        "unitCost": 12.0,
+        "vendor": "Vendor Alpha"
+      },
+      {
+        "productId": 103,
+        "quantity": 5,
+        "totalPrice": 0.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 0.0,
+        "unitCost": 0.5,
+        "vendor": "Vendor Alpha"
+      }
+    ]
+  },
+  {
+    "transactionId": 2,
+    "transactionDateLocalTime": "2026-03-30T14:00:00",
+    "completedByUser": "Budtender 2",
+    "customerTypeName": "Adult Use",
+    "isReturn": false,
+    "status": "Completed",
+    "items": [
+      {
+        "productId": 101,
+        "quantity": 2,
+        "totalPrice": 40.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 20.0,
+        "unitCost": 8.0,
+        "vendor": "Vendor Alpha"
+      }
+    ]
+  },
+  {
+    "transactionId": 3,
+    "transactionDateLocalTime": "2026-03-27T15:00:00",
+    "completedByUser": "Budtender 3",
+    "customerTypeName": "Adult Use",
+    "isReturn": false,
+    "status": "Completed",
+    "items": [
+      {
+        "productId": 101,
+        "quantity": 3,
+        "totalPrice": 60.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 20.0,
+        "unitCost": 8.0,
+        "vendor": "Vendor Alpha"
+      },
+      {
+        "productId": 102,
+        "quantity": 2,
+        "totalPrice": 70.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 35.0,
+        "unitCost": 12.0,
+        "vendor": "Vendor Alpha"
+      }
+    ]
+  },
+  {
+    "transactionId": 4,
+    "transactionDateLocalTime": "2026-03-10T11:30:00",
+    "completedByUser": "Budtender 4",
+    "customerTypeName": "Adult Use",
+    "isReturn": false,
+    "status": "Completed",
+    "items": [
+      {
+        "productId": 101,
+        "quantity": 4,
+        "totalPrice": 80.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 20.0,
+        "unitCost": 8.0,
+        "vendor": "Vendor Alpha"
+      },
+      {
+        "productId": 102,
+        "quantity": 4,
+        "totalPrice": 140.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 35.0,
+        "unitCost": 12.0,
+        "vendor": "Vendor Alpha"
+      }
+    ]
+  },
+  {
+    "transactionId": 5,
+    "transactionDateLocalTime": "2026-04-01T13:00:00",
+    "completedByUser": "Budtender 5",
+    "customerTypeName": "Adult Use",
+    "isReturn": false,
+    "status": "Completed",
+    "items": [
+      {
+        "productId": 106,
+        "quantity": 2,
+        "totalPrice": 36.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 18.0,
+        "unitCost": 7.0,
+        "vendor": "Vendor Alpha"
+      },
+      {
+        "productId": 102,
+        "quantity": 1,
+        "totalPrice": 35.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 35.0,
+        "unitCost": 12.0,
+        "vendor": "Vendor Alpha"
+      }
+    ]
+  },
+  {
+    "transactionId": 6,
+    "transactionDateLocalTime": "2026-03-20T09:15:00",
+    "completedByUser": "Budtender 6",
+    "customerTypeName": "Adult Use",
+    "isReturn": false,
+    "status": "Completed",
+    "items": [
+      {
+        "productId": 106,
+        "quantity": 1,
+        "totalPrice": 18.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 18.0,
+        "unitCost": 7.0,
+        "vendor": "Vendor Alpha"
+      }
+    ]
+  },
+  {
+    "transactionId": 7,
+    "transactionDateLocalTime": "2026-04-02T16:00:00",
+    "completedByUser": "Budtender 7",
+    "customerTypeName": "Adult Use",
+    "isReturn": true,
+    "status": "Completed",
+    "items": [
+      {
+        "productId": 102,
+        "quantity": 1,
+        "totalPrice": 35.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 35.0,
+        "unitCost": 12.0,
+        "vendor": "Vendor Alpha",
+        "isReturned": true
+      }
+    ]
+  },
+  {
+    "transactionId": 8,
+    "transactionDateLocalTime": "2026-04-02T17:00:00",
+    "completedByUser": "Budtender 8",
+    "customerTypeName": "Adult Use",
+    "isReturn": false,
+    "status": "Cancelled",
+    "items": [
+      {
+        "productId": 101,
+        "quantity": 9,
+        "totalPrice": 180.0,
+        "totalDiscount": 0.0,
+        "unitPrice": 20.0,
+        "unitCost": 8.0,
+        "vendor": "Vendor Alpha"
+      }
+    ]
+  }
+]
