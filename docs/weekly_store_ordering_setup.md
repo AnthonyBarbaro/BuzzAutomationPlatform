@@ -14,6 +14,11 @@ The flow is idempotent by store/week. A rerun updates the same:
 
 It does not create duplicate weekly tabs for the same store/week.
 
+The workflow supports two reorder modes:
+
+- `exact_sku`: reorder against the exact item row
+- `family_par`: reorder against a configurable replacement family / par bucket, with family summary rows followed by detail rows for strain choice and cross-check
+
 ## Required Inputs
 
 1. Dutchie API keys in `.env`
@@ -43,6 +48,13 @@ Important settings:
 - `reorder.days_of_supply_urgent`: default `3`
 - `reorder.days_of_supply_low`: default `7`
 - `reorder.high_sell_through_30d`: default `0.6`
+- `family_reorder.default_mode`: default `exact_sku`
+- `family_reorder.mode_rules`: switch matched products into `family_par`
+- `family_reorder.par_targets`: configurable family-level par rules by brand/product type/size/pack/strain type
+- `family_reorder.fallback_target_mode`: fallback behavior when a family has no explicit par rule
+- `family_reorder.include_cost_in_family_key`: when true, family buckets are split by same-cost item within the brand
+- `family_reorder.cost_field`: default `cost`
+- `family_reorder.cost_precision`: default `2`
 
 ## Commands
 
@@ -80,6 +92,8 @@ Each run writes proof artifacts under:
 - `reports/store_weekly_ordering/<week_of>/<STORE>/normalized_inventory.csv`
 - `reports/store_weekly_ordering/<week_of>/<STORE>/normalized_sales.csv`
 - `reports/store_weekly_ordering/<week_of>/<STORE>/sku_metrics.csv`
+- `reports/store_weekly_ordering/<week_of>/<STORE>/family_metrics.csv`
+- `reports/store_weekly_ordering/<week_of>/<STORE>/ordering_rows.csv`
 - `reports/store_weekly_ordering/<week_of>/<STORE>/auto_preview.csv`
 - `reports/store_weekly_ordering/<week_of>/<STORE>/review_preview.csv`
 - `reports/store_weekly_ordering/<week_of>/<STORE>/sheet_payload.json`
@@ -92,6 +106,11 @@ The `REVIEW` tab preserves manual columns on rerun by `Row Key`.
 
 Current preserved columns:
 
+- `Chosen Replacement Strain`
+- `Units To Order`
+- `Reviewer Cross-Check`
+- `Approved By`
+- `Order Notes`
 - `Shelf Count Checked`
 - `Proposed Order Qty`
 - `Final Approved Qty`
@@ -107,6 +126,12 @@ Default row key strategy:
 - `store_code + SKU` when SKU exists
 - fallback to `store_code + brand_product_key`
 - fallback to normalized product identity
+- family summary rows use `family|<reorder_family_key>`
+- family detail rows use `detail|<exact_row_key>`
+
+For `family_par` rows, the current default family bucket is:
+
+- `store + vendor + brand + product type + size / pack + I/H/S bucket + same-cost item`
 
 ## Logging
 
@@ -114,7 +139,8 @@ Typical log lines:
 
 ```text
 [MV] Building weekly ordering bundle for week 2026-03-30 as of 2026-04-03
-[MV] rows=4 needs_order=3 tabs=MV 2026-03-30 Auto / MV 2026-03-30 Review
+[MV] rows=14 needs_order=7 tabs=MV 2026-03-30 Auto / MV 2026-03-30 Review
+[MV] row_types={'Family Detail': 6, 'Exact SKU': 4, 'Family Summary': 4} reorder_modes={'family_par': 6, 'exact_sku': 4} parser_conflicts={'inventory_strain_type_conflicts': 0, 'sales_strain_type_conflicts': 0}
 [MV] excluded inventory={'pattern:product': 1} sales={'pattern:product': 1} tx={'status:cancelled': 1}
 Run summary saved to .../reports/store_weekly_ordering/2026-03-30/run_summary.json
 ```
