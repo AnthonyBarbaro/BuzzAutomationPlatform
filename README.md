@@ -52,7 +52,7 @@ This repository is a Python automation stack (not a web backend) that:
 - `googleDrive.py`, `uploadDrive.py` - Drive upload helpers
 
 ### Orchestration and utilities
-- `autoJob.py` - weekly orchestration (sales export -> deals -> upload -> email)
+- `autoJob.py` - weekly orchestration (Dutchie API sales export -> deals -> upload -> email)
 - `listBrands.py` - lists unique brands from CSV files
 
 ## Prerequisites
@@ -129,6 +129,17 @@ Useful commands:
 ### 1) Sales exports (all stores)
 ```bash
 .venv/bin/python getSalesReport.py
+```
+
+### 1a) Weekly automation job
+Uses Dutchie API sales pulls by default:
+```bash
+.venv/bin/python autoJob.py
+```
+
+Force the legacy browser export path if needed:
+```bash
+.venv/bin/python autoJob.py --sales-source browser
 ```
 
 ### 2) Owner snapshot (default window)

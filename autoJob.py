@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import os
 import re
 import subprocess
@@ -10,8 +11,339 @@ import datetime
 import calendar
 from datetime import date, timedelta, datetime as dt
 from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from dutchie_api_reports import (
+    DutchieAPIError,
+    canonical_env_map,
+    create_session,
+    local_date_range_to_utc_strings,
+    request_json,
+    resolve_integrator_key,
+    resolve_store_keys,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_API_ENV_FILE = BASE_DIR / ".env"
+SALES_API_MAX_WINDOW_DAYS = 30
+AUTOJOB_STORES = [
+    ("MV", "Buzz Cannabis - Mission Valley"),
+    ("LM", "Buzz Cannabis-La Mesa"),
+    ("SV", "Buzz Cannabis - SORRENTO VALLEY"),
+    ("LG", "Buzz Cannabis - Lemon Grove"),
+    ("NC", "Buzz Cannabis (National City)"),
+    ("WP", "Buzz Cannabis Wildomar Palomar"),
+]
+DEALS_EXPORT_COLUMNS = [
+    "Order ID",
+    "Order Time",
+    "Budtender Name",
+    "Customer Name",
+    "Customer Type",
+    "Vendor Name",
+    "Product Name",
+    "Category",
+    "Package ID",
+    "Batch ID",
+    "External Package ID",
+    "Total Inventory Sold",
+    "Unit Weight Sold",
+    "Total Weight Sold",
+    "Gross Sales",
+    "Inventory Cost",
+    "Discounted Amount",
+    "Loyalty as Discount",
+    "Net Sales",
+    "Return Date",
+    "UPC GTIN (Canada)",
+    "Provincial SKU (Canada)",
+    "Producer",
+    "Order Profit",
+]
+DEALS_EXPORT_NUMERIC_COLUMNS = [
+    "Total Inventory Sold",
+    "Unit Weight Sold",
+    "Total Weight Sold",
+    "Gross Sales",
+    "Inventory Cost",
+    "Discounted Amount",
+    "Loyalty as Discount",
+    "Net Sales",
+    "Order Profit",
+]
+
+
+def _first_nonempty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return value.strip()
+            continue
+        return value
+    return ""
+
+
+def _to_float(value: Any) -> float:
+    try:
+        if value in (None, ""):
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _coerce_report_day(value: date | dt | str) -> date:
+    if isinstance(value, dt):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return dt.fromisoformat(value).date()
+    raise TypeError(f"Unsupported date value: {value!r}")
+
+
+def _product_lookup_by_id(products_payload: Any) -> dict[int, dict[str, Any]]:
+    lookup: dict[int, dict[str, Any]] = {}
+    if not isinstance(products_payload, list):
+        return lookup
+
+    for row in products_payload:
+        if not isinstance(row, dict):
+            continue
+        try:
+            product_id = int(row.get("productId"))
+        except Exception:
+            continue
+        lookup[product_id] = row
+    return lookup
+
+
+def _iter_sales_api_chunks(start_day: date, end_day: date, max_days: int = SALES_API_MAX_WINDOW_DAYS) -> list[tuple[date, date]]:
+    chunks: list[tuple[date, date]] = []
+    if end_day < start_day:
+        return chunks
+
+    window_days = max(1, int(max_days))
+    chunk_start = start_day
+    while chunk_start <= end_day:
+        chunk_end = min(chunk_start + timedelta(days=window_days - 1), end_day)
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end + timedelta(days=1)
+
+    return chunks
+
+
+def _normalize_sales_api_export_rows(transactions_payload: Any, products_payload: Any) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    product_lookup = _product_lookup_by_id(products_payload)
+
+    for tx in transactions_payload or []:
+        if not isinstance(tx, dict):
+            continue
+
+        tx_id = str(_first_nonempty(tx.get("transactionId"), tx.get("globalId"), tx.get("referenceId"), ""))
+        tx_time = pd.to_datetime(
+            _first_nonempty(
+                tx.get("transactionDateLocalTime"),
+                tx.get("transactionDate"),
+                tx.get("lastModifiedDateUTC"),
+            ),
+            errors="coerce",
+        )
+        budtender = str(_first_nonempty(tx.get("completedByUser"), tx.get("terminalName"), ""))
+        customer_name = str(
+            _first_nonempty(
+                tx.get("customerName"),
+                tx.get("customerFullName"),
+                tx.get("customer"),
+                "",
+            )
+        )
+        customer_type = str(
+            _first_nonempty(
+                tx.get("customerTypeName"),
+                tx.get("customerType"),
+                tx.get("customerTypeId"),
+                "",
+            )
+        )
+        tx_is_return = bool(tx.get("isReturn"))
+
+        for item in tx.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                product_key = int(item.get("productId") or 0)
+            except Exception:
+                product_key = 0
+            product_info = product_lookup.get(product_key, {})
+
+            product_name = str(
+                _first_nonempty(
+                    product_info.get("productName"),
+                    product_info.get("internalName"),
+                    product_info.get("alternateName"),
+                    f"Unknown Product {item.get('productId')}",
+                )
+            )
+            category = str(_first_nonempty(product_info.get("category"), product_info.get("masterCategory"), "Unknown"))
+            quantity = _to_float(item.get("quantity"))
+            unit_weight = _to_float(item.get("unitWeight"))
+            gross_sales = _to_float(item.get("totalPrice"))
+            discount_amount = _to_float(item.get("totalDiscount"))
+            loyalty_discount = _to_float(item.get("loyaltyAsDiscount"))
+            net_sales = gross_sales - discount_amount
+            unit_cost = _to_float(_first_nonempty(item.get("unitCost"), product_info.get("unitCost")))
+            inventory_cost = unit_cost * quantity
+
+            is_return = bool(item.get("isReturned")) or tx_is_return
+            sign = -1.0 if is_return else 1.0
+
+            quantity = abs(quantity) * sign
+            gross_sales = abs(gross_sales) * sign
+            discount_amount = abs(discount_amount) * sign
+            loyalty_discount = abs(loyalty_discount) * sign
+            net_sales = abs(net_sales) * sign
+            inventory_cost = abs(inventory_cost) * sign
+            total_weight = abs(quantity) * unit_weight * (1.0 if sign >= 0 else -1.0)
+            order_profit = net_sales - inventory_cost
+            sku = str(_first_nonempty(product_info.get("sku"), ""))
+            upc = str(
+                _first_nonempty(
+                    product_info.get("upc"),
+                    product_info.get("gtin"),
+                    product_info.get("barcode"),
+                    "",
+                )
+            )
+
+            rows.append(
+                {
+                    "Order ID": tx_id,
+                    "Order Time": tx_time,
+                    "Budtender Name": budtender,
+                    "Customer Name": customer_name,
+                    "Customer Type": customer_type,
+                    "Vendor Name": str(
+                        _first_nonempty(
+                            item.get("vendor"),
+                            product_info.get("vendorName"),
+                            product_info.get("producerName"),
+                            "",
+                        )
+                    ),
+                    "Product Name": product_name,
+                    "Category": category,
+                    "Package ID": str(_first_nonempty(item.get("packageId"), "")),
+                    "Batch ID": str(_first_nonempty(item.get("batchName"), item.get("batchId"), "")),
+                    "External Package ID": str(
+                        _first_nonempty(item.get("sourcePackageId"), item.get("externalPackageId"), item.get("packageId"), "")
+                    ),
+                    "Total Inventory Sold": quantity,
+                    "Unit Weight Sold": unit_weight,
+                    "Total Weight Sold": total_weight,
+                    "Gross Sales": gross_sales,
+                    "Inventory Cost": inventory_cost,
+                    "Discounted Amount": discount_amount,
+                    "Loyalty as Discount": loyalty_discount,
+                    "Net Sales": net_sales,
+                    "Return Date": _first_nonempty(item.get("returnDate"), tx_time if is_return else None),
+                    "UPC GTIN (Canada)": upc,
+                    "Provincial SKU (Canada)": sku,
+                    "Producer": str(_first_nonempty(product_info.get("producerName"), item.get("vendor"), "")),
+                    "Order Profit": order_profit,
+                }
+            )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=DEALS_EXPORT_COLUMNS)
+
+    for column in ("Order Time", "Return Date"):
+        frame[column] = pd.to_datetime(frame[column], errors="coerce")
+    for column in DEALS_EXPORT_NUMERIC_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+
+    frame = frame.reindex(columns=DEALS_EXPORT_COLUMNS)
+    return frame.sort_values(by=["Order Time", "Order ID", "Product Name"], na_position="last").reset_index(drop=True)
+
+
+def _write_deals_compatible_sales_export(frame: pd.DataFrame, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    export_frame = frame.reindex(columns=DEALS_EXPORT_COLUMNS)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        export_frame.to_excel(writer, index=False, startrow=4)
+
+
+def run_sales_report_api(start_date: date | dt | str, end_date: date | dt | str, env_file: str | os.PathLike[str] = DEFAULT_API_ENV_FILE) -> None:
+    start_day = _coerce_report_day(start_date)
+    end_day = _coerce_report_day(end_date)
+    if end_day < start_day:
+        raise ValueError("end_date cannot be earlier than start_date")
+
+    env_map = canonical_env_map(str(env_file))
+    store_codes = [code for code, _store_name in AUTOJOB_STORES]
+    store_keys = resolve_store_keys(env_map, store_codes)
+    integrator_key = resolve_integrator_key(env_map)
+    missing_store_codes = [code for code in store_codes if code not in store_keys]
+    if missing_store_codes:
+        missing = ", ".join(missing_store_codes)
+        raise RuntimeError(
+            "Missing Dutchie API location key(s) for: "
+            f"{missing}. Add them to {env_file} using names like DUTCHIE_API_KEY_MV or mv."
+        )
+
+    files_dir = BASE_DIR / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    chunks = _iter_sales_api_chunks(start_day, end_day)
+    failed_stores: list[str] = []
+
+    for store_code, store_name in AUTOJOB_STORES:
+        try:
+            print(f"[API] Pulling sales for {store_name} ({store_code})")
+            session = create_session(store_keys[store_code], integrator_key)
+            products_payload = request_json(session, "/reporting/products")
+            transactions_payload: list[dict[str, Any]] = []
+
+            for idx, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+                from_utc, to_utc = local_date_range_to_utc_strings(
+                    chunk_start.isoformat(),
+                    chunk_end.isoformat(),
+                )
+                sales_params = {
+                    "FromDateUTC": from_utc,
+                    "ToDateUTC": to_utc,
+                    "IncludeDetail": True,
+                    "IncludeTaxes": True,
+                    "IncludeOrderIds": True,
+                    "IncludeFeesAndDonations": True,
+                }
+                print(f"[API] {store_code} chunk {idx}/{len(chunks)}: {chunk_start.isoformat()} -> {chunk_end.isoformat()}")
+                payload = request_json(session, "/reporting/transactions", params=sales_params)
+                if isinstance(payload, list) and payload:
+                    transactions_payload.extend(item for item in payload if isinstance(item, dict))
+
+            export_frame = _normalize_sales_api_export_rows(transactions_payload, products_payload)
+            output_path = files_dir / f"sales{store_code}.xlsx"
+            _write_deals_compatible_sales_export(export_frame, output_path)
+            print(f"[API] Saved {store_code}: {len(export_frame)} row(s) -> {output_path}")
+        except (DutchieAPIError, ValueError, OSError) as exc:
+            print(f"[WARN] API sales export failed for {store_name} ({store_code}): {exc}")
+            failed_stores.append(store_code)
+
+    if failed_stores:
+        raise RuntimeError(f"API export failed for store(s): {', '.join(failed_stores)}")
+
+
+def run_sales_report_browser(start_date: date | dt | str, end_date: date | dt | str) -> None:
+    from getSalesReport import run_sales_report as browser_run_sales_report
+
+    browser_run_sales_report(start_date, end_date)
 
 ##############################################################################
 # 1) LOGIC FOR LAST MONDAY TO SUNDAY
@@ -457,11 +789,27 @@ def send_email_with_gmail_html(subject, html_body, recipients, attachments=None)
     except Exception as e:
         print("[ERROR] Could not send HTML email:", e)
 
-from getSalesReport import run_sales_report
 ##############################################################################
 # MAIN: ORCHESTRATE ALL STEPS
 ##############################################################################
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the weekly Buzz automation job.")
+    parser.add_argument(
+        "--sales-source",
+        choices=("api", "browser"),
+        default="api",
+        help="Where autoJob should pull sales data from. Default: api",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=str(DEFAULT_API_ENV_FILE),
+        help=f"Path to the Dutchie API .env file when using --sales-source api. Default: {DEFAULT_API_ENV_FILE}",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None):
+    args = build_parser().parse_args(argv)
     print("===== Starting autoJob.py =====")
 
     last_monday, last_sunday = get_last_monday_sunday()
@@ -479,7 +827,12 @@ def main():
             except Exception as e:
                 print(f"[ERROR] Could not delete {file}: {e}")
     # 2) Sales
-    run_sales_report(last_monday, last_sunday)
+    if args.sales_source == "api":
+        print(f"[AUTOJOB] Pulling weekly sales from the Dutchie API using {args.env_file}")
+        run_sales_report_api(last_monday, last_sunday, env_file=args.env_file)
+    else:
+        print("[AUTOJOB] Pulling weekly sales from the browser export flow.")
+        run_sales_report_browser(last_monday, last_sunday)
 
     # 3) Deals
     subprocess.run([sys.executable, str(BASE_DIR / "deals.py")], cwd=BASE_DIR)

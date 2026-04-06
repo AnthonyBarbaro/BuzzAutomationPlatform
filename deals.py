@@ -11,7 +11,7 @@ from pathlib import Path
 import locale
 import shutil
 import warnings
-from deals_brand_config_sync import load_brand_criteria, sync_brand_config_artifacts
+from deals_brand_config_sync import sync_brand_config_artifacts
 # Global dictionary to map real names -> pseudonyms
 NAME_MAP = {}
 GLOBAL_COUNTER = 1
@@ -183,7 +183,7 @@ DEFAULT_BRAND_CRITERIA = {
     },  
     'Kiva': {
         'vendors': ['KIVA / LCISM CORP', 'Vino & Cigarro, LLC','Garden Of Weeden Inc.','PuffCo'],
-        'days': ['Monday','Wednesday'],
+        'days': ['Monday','Wednesday','Friday'],
         'discount': 0.50,
         'kickback': 0.25,
         'brands': ['Terra', 'Petra', 'KIVA', 'Lost Farms', 'Camino']
@@ -264,29 +264,17 @@ DEFAULT_BRAND_CRITERIA = {
     },
       'Made': {
         'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+        'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+        'discount': 0.50,
+        'kickback': 0.0,
         'categories': ['Pre-Rolls','Flower','Eighths'],
         'brands': ['Made |'],
-        'rules': [
-            {
-                'rule_name': 'Made - Friday Saturday (50/30)',
-                'days': ['Friday','Saturday'],
-                'discount': 0.50,
-                'kickback': 0.30,
-            },
-            {
-                'rule_name': 'Made - Sun Thu SV WP (50/30)',
-                'days': ['Sunday','Monday','Tuesday','Wednesday','Thursday'],
-                'stores': ['SV','WP'],
-                'discount': 0.50,
-                'kickback': 0.30,
-            },
-        ],
     },
       'Made-Eddys': { 
         'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
-        'days': ['Friday','Saturday'],
+        'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
         'discount': 0.50,
-        'kickback': 0.30,
+        'kickback': 0.0,
         'categories': ['Edibles'], 
         'brands': ['Made |']
     }, 
@@ -311,6 +299,13 @@ DEFAULT_BRAND_CRITERIA = {
         'kickback': 0.30,
         'brands': ['Ember Valley |','EV |']
     }, 
+    'Emerald Sky': {
+        'vendors': ['KIVA / LCISM CORP','Garden Of Weeden Inc.','Vino & Cigarro, LLC'],
+        'days': ['Tuesday','Thursday'],
+        'discount': 0.50,
+        'kickback': 0.30,
+        'brands': ['Emerald Sky']
+    },
     'Cake': { 
         'vendors': ['ThirtyOne Labs, LLC'],
         'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
@@ -328,7 +323,7 @@ DEFAULT_BRAND_CRITERIA = {
     }, 
     'LA FARMS': { 
         'vendors': ["LA Family Farms LLC",'Los Angeles Family Farms LLC'],
-        'days': ['Friday','Sunday'],
+        'days': ['Monday','Friday','Sunday'],
         'discount': 0.50,
         'kickback': 0.30,
         #'categories': [''], 
@@ -360,7 +355,15 @@ DEFAULT_BRAND_CRITERIA = {
         'days': ['Thursday'],
         'discount': 0.50,
         'kickback': 0.30,
-        'brands': ['BLEM'] #Make this pre-rolls and eigths only
+        'categories': ['Pre-Rolls','Eighths'],
+        'brands': ['BLEM']
+    },
+    'Baba Ku': {
+        'vendors': ["Higher Ground Holdings, LLC"],
+        'days': ['Monday','Friday'],
+        'discount': 0.50,
+        'kickback': 0.30,
+        'brands': ['Baba Ku']
     },
        "P&B": {
         'vendors': ['Fluids Manufacturing Inc.'],
@@ -383,14 +386,13 @@ DEFAULT_BRAND_CRITERIA = {
         'kickback': 0.35,
         'brands': ['Keef']
     },
-    # "PlugnPlay": {
-    #     'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','IE Licensing, LLC'],
-    #     # 'days': ['Saturday','Monday','Sunday'],
-    #     'days': ['Monday'],
-    #     'discount': 0.50,
-    #     'kickback': 0.30,
-    #     'brands': ['Plug n Play |','Plug N Play |']
-    # },
+    'PlugNPlay': {
+        'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','IE Licensing, LLC'],
+        'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+        'discount': 0.50,
+        'kickback': 0.0, 
+        'brands': ['Plug n Play |','Plug N Play |']
+    },
     "Sluggers": {
         'vendors': ['Garden Of Weeden','Garden Of Weeden Inc.'],
         'brands': ['Sluggers'],
@@ -512,14 +514,14 @@ DEFAULT_BRAND_CRITERIA = {
 
         'rules': [
             {
-                'rule_name': 'Cam - Saturday (50/12)',
-                'days': ['Saturday'],
+                'rule_name': 'Cam - Friday Saturday (50/12)',
+                'days': ['Friday','Saturday'],
                 'discount': 0.50,
                 'kickback': 0.12,
             },
             {
-                'rule_name': 'Cam - Sun-Fri (40/0)',
-                'days': ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday'],
+                'rule_name': 'Cam - Sun-Thu (40/0)',
+                'days': ['Sunday','Monday','Tuesday','Wednesday','Thursday'],
                 # inherits base 0.40 / 0.00
             },
         ],
@@ -539,6 +541,11 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Ball Family Farms']},
+    'Pusha': {'vendors': ['Ash Capital, Inc.'],
+           'days': ['Friday','Saturday'],
+           'discount': 0.5,
+           'kickback': 0.3,
+           'brands': ['Pusha']},
     'Sol Flora': {'vendors': ['Twisted Roots, Inc.','Garden Of Weeden Inc.','Garden Of Weeden'],
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
            'discount': 0.3,
@@ -598,9 +605,14 @@ DEFAULT_BRAND_CRITERIA = {
     'Good Good': {'vendors': ['KMMK Distribution Inc.'],
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
            #'days': ['Thursday','Friday','Saturday','Sunday'],
-           'discount': 0.5,
+           'discount': 0.3,
            'kickback': 0.0,
            'brands': ['Goodgood |']},
+    'Wavvy': {'vendors': ['Happy Travels, LLC'],
+           'days': ['Wednesday','Thursday'],
+           'discount': 0.5,
+           'kickback': 0.3,
+           'brands': ['Wavvy']},
     'Lime': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
            'days': ['Monday','Sunday'], #Started March 2
            'discount': 0.50,
@@ -615,18 +627,10 @@ brand_config_source = "built-in deals.py"
 def refresh_brand_criteria(sync_reference=False, sync_sheet=False, log_source=True, log_errors=True):
     global brand_criteria, brand_config_source
 
-    brand_criteria, brand_config_source = load_brand_criteria(
-        DEFAULT_BRAND_CRITERIA,
-        log_source=log_source,
-        log_errors=log_errors,
-    )
-
-    if len(brand_criteria) < len(DEFAULT_BRAND_CRITERIA):
-        print(
-            f"[WARN] Shared deals config currently has {len(brand_criteria)} brands; "
-            f"built-in deals.py has {len(DEFAULT_BRAND_CRITERIA)}. "
-            "Run `python3 deals.py --seed-brand-config-sheet` to push the full built-in config to the sheet."
-        )
+    brand_criteria = DEFAULT_BRAND_CRITERIA
+    brand_config_source = "built-in deals.py"
+    if log_source:
+        print("[INFO] Using built-in deals brand config from DEFAULT_BRAND_CRITERIA in deals.py.")
 
     if sync_reference:
         try:
