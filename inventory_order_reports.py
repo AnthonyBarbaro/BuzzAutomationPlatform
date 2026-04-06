@@ -8,8 +8,6 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from getSalesReport import store_abbr_map
-
 ORDER_REPORT_WINDOWS = (7, 14, 30)
 ORDER_REPORT_PATTERN = re.compile(
     r"^inventory_order_(?P<days>7d|14d|30d)_(?P<store>[A-Za-z0-9]+)\.(?P<ext>xlsx|xls|csv)$",
@@ -96,7 +94,14 @@ KNOWN_PACK_LABELS = {
     28.0: "28g",
 }
 
-STORE_NAME_TO_ABBR = dict(store_abbr_map)
+STORE_NAME_TO_ABBR = {
+    "Buzz Cannabis - Mission Valley": "MV",
+    "Buzz Cannabis-La Mesa": "LM",
+    "Buzz Cannabis - SORRENTO VALLEY": "SV",
+    "Buzz Cannabis - Lemon Grove": "LG",
+    "Buzz Cannabis (National City)": "NC",
+    "Buzz Cannabis Wildomar Palomar": "WP",
+}
 STORE_ABBR_TO_NAME = {abbr.upper(): name for name, abbr in STORE_NAME_TO_ABBR.items()}
 
 

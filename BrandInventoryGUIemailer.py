@@ -32,10 +32,12 @@ from datetime import datetime
 import subprocess
 import sys
 import time
+from pathlib import Path
 # For Excel formatting
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
+from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
     build_brand_order_sections,
     extract_store_code_from_filename,
@@ -69,7 +71,11 @@ DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 # Gmail API Scopes
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-ORDER_REPORT_SCRIPT = "getInventoryOrderReport.py"
+ORDER_REPORT_API_SCRIPT = "getInventoryOrderReport_api.py"
+ORDER_REPORT_BROWSER_SCRIPT = "getInventoryOrderReport.py"
+CATALOG_API_SCRIPT = "getCatalog.py"
+CATALOG_BROWSER_SCRIPT = "getCatalog_browser.py"
+DEFAULT_API_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # Required CSV columns + optional
 REQUIRED_COLUMNS = ["Available", "Product", "Brand"]
@@ -84,6 +90,7 @@ DEFAULT_GUI_CONFIG = {
     "fetch_order_reports": True,
     "emails": "",
     "include_cost": True,
+    "prefer_catalog_api": True,
 }
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -91,6 +98,30 @@ ORDER_REPORT_FILE_PATTERN = re.compile(
     r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
     re.IGNORECASE,
 )
+
+
+def is_order_report_filename(filename):
+    return bool(ORDER_REPORT_FILE_PATTERN.match(str(filename or "")))
+
+
+def list_catalog_csv_files(directory):
+    if not directory or not os.path.isdir(directory):
+        return []
+    return sorted(
+        filename
+        for filename in os.listdir(directory)
+        if filename.lower().endswith(".csv") and not is_order_report_filename(filename)
+    )
+
+
+def list_order_report_files(directory):
+    if not directory or not os.path.isdir(directory):
+        return []
+    return sorted(
+        filename
+        for filename in os.listdir(directory)
+        if is_order_report_filename(filename)
+    )
 
 # ----------------------------------------------------------------------
 #                  CONFIG.TXT load/save
@@ -148,6 +179,8 @@ def load_config():
                     cfg["emails"] = value
                 elif key == "include_cost":
                     cfg["include_cost"] = parse_bool_value(value, True)
+                elif key == "prefer_catalog_api":
+                    cfg["prefer_catalog_api"] = parse_bool_value(value, True)
         except:
             pass
     return cfg
@@ -157,16 +190,13 @@ def clear_old_input_exports(directory, clear_order_reports=True):
     if not directory or not os.path.isdir(directory):
         return
 
-    order_pattern = re.compile(
-        r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
-        re.IGNORECASE,
-    )
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
         if not os.path.isfile(file_path):
             continue
-        should_delete = filename.lower().endswith(".csv")
-        if clear_order_reports and order_pattern.match(filename):
+        is_order_file = is_order_report_filename(filename)
+        should_delete = filename.lower().endswith(".csv") and not is_order_file
+        if clear_order_reports and is_order_file:
             should_delete = True
         if should_delete:
             os.remove(file_path)
@@ -174,21 +204,42 @@ def clear_old_input_exports(directory, clear_order_reports=True):
 
 
 def fetch_inventory_order_reports(output_directory):
-    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ORDER_REPORT_SCRIPT)
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ORDER_REPORT_BROWSER_SCRIPT)
     if not os.path.exists(script_path):
-        print(f"[WARN] {ORDER_REPORT_SCRIPT} not found, skipping order-report fetch.")
+        print(f"[WARN] {ORDER_REPORT_BROWSER_SCRIPT} not found, skipping order-report fetch.")
         return False
 
     try:
-        print("[INFO] Running getInventoryOrderReport.py for 7d/14d/30d source files ...")
+        print("[INFO] Running browser order-report exporter for 7d/14d/30d source files ...")
         subprocess.check_call([sys.executable, script_path, output_directory])
         print("[INFO] Inventory order report fetch complete.")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] {ORDER_REPORT_SCRIPT} failed: {e}")
+        print(f"[ERROR] {ORDER_REPORT_BROWSER_SCRIPT} failed: {e}")
     except Exception as e:
         print(f"[ERROR] Unexpected order-report fetch failure: {e}")
     return False
+
+
+def dutchie_api_readiness(env_file=DEFAULT_API_ENV_FILE):
+    """
+    Returns whether Dutchie API refresh is ready for all configured Buzz stores.
+    """
+    expected_codes = list(STORE_CODES.keys())
+
+    try:
+        env_map = canonical_env_map(env_file)
+        resolved = resolve_store_keys(env_map, expected_codes)
+    except Exception as exc:
+        return False, [], expected_codes, str(exc)
+
+    available_codes = [code for code in expected_codes if code in resolved]
+    missing_codes = [code for code in expected_codes if code not in resolved]
+    return not missing_codes, available_codes, missing_codes, ""
+
+
+def catalog_api_readiness(env_file=DEFAULT_API_ENV_FILE):
+    return dutchie_api_readiness(env_file)
 
 def save_config(
     input_dir,
@@ -196,6 +247,7 @@ def save_config(
     fetch_order_reports=True,
     emails="",
     include_cost=True,
+    prefer_catalog_api=True,
 ):
     """
     Writes GUI settings to config.txt while keeping the first two lines as
@@ -208,6 +260,7 @@ def save_config(
             f.write(f"fetch_order_reports={'1' if fetch_order_reports else '0'}\n")
             f.write(f"emails={emails.strip()}\n")
             f.write(f"include_cost={'1' if include_cost else '0'}\n")
+            f.write(f"prefer_catalog_api={'1' if prefer_catalog_api else '0'}\n")
     except Exception as e:
         print(f"[ERROR] Could not write config.txt: {e}")
 
@@ -484,12 +537,15 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
         print(f"[ERROR] reading {csv_path}: {e}")
         return {}
 
-    # Keep relevant columns only
-    keep_cols = [c for c in REQUIRED_COLUMNS + OPTIONAL_COLUMNS if c in df.columns]
-    if not any(c in df.columns for c in REQUIRED_COLUMNS):
-        print(f"[WARN] '{csv_path}' is missing required columns {REQUIRED_COLUMNS}. Skipping.")
+    if not all(c in df.columns for c in REQUIRED_COLUMNS):
+        print(
+            f"[WARN] '{csv_path}' is missing required columns {REQUIRED_COLUMNS}. "
+            f"Columns found: {list(df.columns)}. Skipping."
+        )
         return {}
 
+    # Keep relevant columns only
+    keep_cols = [c for c in REQUIRED_COLUMNS + OPTIONAL_COLUMNS if c in df.columns]
     df = df[keep_cols]
 
     # Remove "sample"/"promo" lines
@@ -676,6 +732,7 @@ class BrandInventoryGUI:
         self.emails_var = tk.StringVar(value=cfg.get("emails", ""))
         self.fetch_order_reports_var = tk.BooleanVar(value=cfg.get("fetch_order_reports", True))
         self.include_cost_var = tk.BooleanVar(value=cfg.get("include_cost", True))
+        self.prefer_catalog_api_var = tk.BooleanVar(value=cfg.get("prefer_catalog_api", True))
         self.brand_search_var = tk.StringVar()
 
         self.status_var = tk.StringVar(value="Ready to refresh exports and build reports.")
@@ -687,6 +744,7 @@ class BrandInventoryGUI:
         self.brand_summary_var = tk.StringVar(value="No brands loaded yet.")
         self.email_summary_var = tk.StringVar(value="No recipients saved yet.")
         self.order_reports_caption_var = tk.StringVar()
+        self.catalog_refresh_caption_var = tk.StringVar()
         self.settings_state_var = tk.StringVar(
             value="Auto-save is on. Folder choices, recipients, and toggles are stored as you work."
         )
@@ -710,6 +768,7 @@ class BrandInventoryGUI:
         self._refresh_path_summaries()
         self._refresh_source_snapshot()
         self._update_email_display()
+        self._update_catalog_refresh_caption()
         self._update_order_report_caption()
         self._update_brand_summary()
         self.append_log("Workspace ready.")
@@ -1128,13 +1187,13 @@ class BrandInventoryGUI:
 
         ttk.Checkbutton(
             body,
-            text="Refresh 7d / 14d / 30d Dutchie order reports with Update Files",
-            variable=self.fetch_order_reports_var,
+            text="Prefer Dutchie API for source refresh when available",
+            variable=self.prefer_catalog_api_var,
             style="Card.TCheckbutton",
         ).grid(row=0, column=0, sticky="w")
         tk.Label(
             body,
-            textvariable=self.order_reports_caption_var,
+            textvariable=self.catalog_refresh_caption_var,
             bg=self.colors["card"],
             fg=self.colors["muted"],
             font=("Segoe UI", 8),
@@ -1144,10 +1203,26 @@ class BrandInventoryGUI:
 
         ttk.Checkbutton(
             body,
+            text="Refresh 7d / 14d / 30d Dutchie order reports with Update Files",
+            variable=self.fetch_order_reports_var,
+            style="Card.TCheckbutton",
+        ).grid(row=2, column=0, sticky="w", pady=(12, 0))
+        tk.Label(
+            body,
+            textvariable=self.order_reports_caption_var,
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+            wraplength=520,
+            justify="left",
+        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+
+        ttk.Checkbutton(
+            body,
             text="Include Cost column in generated brand workbooks",
             variable=self.include_cost_var,
             style="Card.TCheckbutton",
-        ).grid(row=2, column=0, sticky="w", pady=(12, 0))
+        ).grid(row=4, column=0, sticky="w", pady=(12, 0))
 
         tk.Label(
             body,
@@ -1157,7 +1232,7 @@ class BrandInventoryGUI:
             font=("Segoe UI", 8),
             wraplength=520,
             justify="left",
-        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(10, 0))
 
     def _build_run_actions_card(self, body):
         body.grid_columnconfigure(0, weight=1)
@@ -1614,12 +1689,14 @@ class BrandInventoryGUI:
         self.output_dir_var.trace_add("write", lambda *_: self._refresh_path_summaries())
         self.emails_var.trace_add("write", lambda *_: self._update_email_display())
         self.brand_search_var.trace_add("write", lambda *_: self.filter_brand_list())
+        self.prefer_catalog_api_var.trace_add("write", lambda *_: self._update_catalog_refresh_caption())
         self.fetch_order_reports_var.trace_add("write", lambda *_: self._update_order_report_caption())
 
         for var in (
             self.input_dir_var,
             self.output_dir_var,
             self.emails_var,
+            self.prefer_catalog_api_var,
             self.fetch_order_reports_var,
             self.include_cost_var,
         ):
@@ -1650,6 +1727,7 @@ class BrandInventoryGUI:
         self.log_text.insert("end", f"[{timestamp}] {message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        self.master.update_idletasks()
 
     def _refresh_path_summaries(self):
         input_dir = self.input_dir_var.get().strip()
@@ -1680,8 +1758,10 @@ class BrandInventoryGUI:
             self.order_window_summary_var.set("Dutchie order windows: unavailable.")
             return
 
-        csv_files = sorted(fn for fn in filenames if fn.lower().endswith(".csv"))
-        order_files = sorted(fn for fn in filenames if ORDER_REPORT_FILE_PATTERN.match(fn))
+        csv_files = sorted(
+            fn for fn in filenames if fn.lower().endswith(".csv") and not is_order_report_filename(fn)
+        )
+        order_files = sorted(fn for fn in filenames if is_order_report_filename(fn))
         self.catalog_count_var.set(str(len(csv_files)))
         self.order_file_count_var.set(str(len(order_files)))
 
@@ -1759,10 +1839,36 @@ class BrandInventoryGUI:
                 f"{len(recipients)} recipient{'s' if len(recipients) != 1 else ''} ready for the outgoing Drive-link email."
             )
 
+    def _update_catalog_refresh_caption(self):
+        api_ready, available_codes, missing_codes, error_text = dutchie_api_readiness(DEFAULT_API_ENV_FILE)
+
+        if self.prefer_catalog_api_var.get():
+            if api_ready:
+                store_list = ", ".join(available_codes)
+                self.catalog_refresh_caption_var.set(
+                    "Update Files will try the Dutchie API first for catalog CSVs and inventory order reports "
+                    f"for {store_list}, then fall back to the browser exporters if an API refresh fails."
+                )
+            elif error_text:
+                self.catalog_refresh_caption_var.set(
+                    "Dutchie API preference is on, but the API configuration could not be read. "
+                    "Update Files will fall back to the browser catalog and order-report scripts."
+                )
+            else:
+                missing_list = ", ".join(missing_codes)
+                self.catalog_refresh_caption_var.set(
+                    "Dutchie API preference is on, but some store keys are missing "
+                    f"({missing_list}). Update Files will fall back to the browser catalog and order-report scripts."
+                )
+        else:
+            self.catalog_refresh_caption_var.set(
+                "Update Files will use the browser catalog and order-report exporters even if Dutchie API credentials are available."
+            )
+
     def _update_order_report_caption(self):
         if self.fetch_order_reports_var.get():
             self.order_reports_caption_var.set(
-                "Update Files will refresh catalog CSVs and also download the Dutchie 7d, 14d, and 30d order-report exports."
+                "Update Files will also refresh the Dutchie 7d, 14d, and 30d order-report source files, using the API first when enabled and available."
             )
         else:
             self.order_reports_caption_var.set(
@@ -1844,7 +1950,7 @@ class BrandInventoryGUI:
         return bool(
             input_dir
             and os.path.isdir(input_dir)
-            and any(fn.lower().endswith(".csv") for fn in os.listdir(input_dir))
+            and bool(list_catalog_csv_files(input_dir))
         )
 
     def _autoload_saved_workspace(self):
@@ -2064,6 +2170,7 @@ class BrandInventoryGUI:
             self.fetch_order_reports_var.get(),
             emails=self.emails_var.get().strip(),
             include_cost=self.include_cost_var.get(),
+            prefer_catalog_api=self.prefer_catalog_api_var.get(),
         )
         self.settings_state_var.set(
             f"Auto-saved {datetime.now().strftime('%I:%M %p').lstrip('0')}. Use Save Settings if you want a manual checkpoint."
@@ -2159,69 +2266,211 @@ class BrandInventoryGUI:
             return "break"
         return None
 
+    def _resolve_script_path(self, script_name):
+        return Path(__file__).resolve().with_name(script_name)
+
+    def _run_script(self, script_name, *args):
+        script_path = self._resolve_script_path(script_name)
+        if not script_path.exists():
+            raise FileNotFoundError(f"{script_name} was not found at {script_path}.")
+
+        cmd = [sys.executable, str(script_path), *[str(arg) for arg in args]]
+        self.append_log(f"Running: {' '.join(str(part) for part in cmd)}")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_lines = []
+        if process.stdout is not None:
+            for raw_line in process.stdout:
+                line = raw_line.rstrip()
+                output_lines.append(raw_line)
+                if line:
+                    print(line, flush=True)
+                    self.append_log(line)
+
+        return_code = process.wait()
+        combined_output = "".join(output_lines)
+
+        if return_code != 0:
+            raise subprocess.CalledProcessError(
+                return_code,
+                cmd,
+                output=combined_output,
+                stderr=combined_output,
+            )
+
+        return subprocess.CompletedProcess(
+            cmd,
+            return_code,
+            stdout=combined_output,
+            stderr="",
+        )
+
+    def _refresh_catalog_exports(self, input_dir):
+        prefer_api = self.prefer_catalog_api_var.get()
+        api_ready, available_codes, missing_codes, error_text = dutchie_api_readiness(DEFAULT_API_ENV_FILE)
+
+        if prefer_api and api_ready:
+            self.append_log(
+                "Dutchie API catalog refresh is configured for all stores. Trying the API exporter first."
+            )
+            try:
+                self._run_script(CATALOG_API_SCRIPT, input_dir)
+                return "api"
+            except subprocess.CalledProcessError:
+                self.append_log(
+                    "Dutchie API catalog refresh failed. Falling back to the browser catalog export script."
+                )
+
+        elif prefer_api:
+            if error_text:
+                self.append_log(
+                    "Dutchie API readiness could not be confirmed. Falling back to the browser catalog export script."
+                )
+            else:
+                missing_text = ", ".join(missing_codes)
+                self.append_log(
+                    f"Dutchie API is missing store credentials for: {missing_text}. "
+                    "Falling back to the browser catalog export script."
+                )
+        else:
+            self.append_log("Catalog refresh is set to browser mode. Skipping the Dutchie API path.")
+
+        self._run_script(CATALOG_BROWSER_SCRIPT, input_dir)
+        return "browser"
+
+    def _refresh_order_report_exports(self, input_dir):
+        prefer_api = self.prefer_catalog_api_var.get()
+        api_ready, available_codes, missing_codes, error_text = dutchie_api_readiness(DEFAULT_API_ENV_FILE)
+
+        if prefer_api and api_ready:
+            self.append_log(
+                "Dutchie API order-report refresh is configured for all stores. Trying the API exporter first."
+            )
+            try:
+                self._run_script(ORDER_REPORT_API_SCRIPT, input_dir)
+                return "api"
+            except subprocess.CalledProcessError:
+                self.append_log(
+                    "Dutchie API order-report refresh failed. Falling back to the browser order-report export script."
+                )
+        elif prefer_api:
+            if error_text:
+                self.append_log(
+                    "Dutchie API readiness could not be confirmed for order reports. Falling back to the browser order-report export script."
+                )
+            else:
+                missing_text = ", ".join(missing_codes)
+                self.append_log(
+                    f"Dutchie API is missing store credentials for: {missing_text}. "
+                    "Falling back to the browser order-report export script."
+                )
+        else:
+            self.append_log("Order-report refresh is set to browser mode. Skipping the Dutchie API path.")
+
+        self._run_script(ORDER_REPORT_BROWSER_SCRIPT, input_dir)
+        return "browser"
+
     def get_files(self):
         in_dir = self.input_dir_var.get().strip()
         fetch_order_reports = self.fetch_order_reports_var.get()
+        prefer_api = self.prefer_catalog_api_var.get()
 
         if not in_dir or not os.path.isdir(in_dir):
             messagebox.showerror("Error", "Please choose a valid input folder first.")
-            return
-        if not os.path.exists("getCatalog.py"):
-            messagebox.showwarning("Warning", "No getCatalog.py found in this directory.")
             return
 
         self.append_log("Starting source refresh.")
         self._set_status(
             "Refreshing source files...",
-            "Catalog CSVs are being downloaded and Dutchie order reports will follow if the toggle is enabled.",
+            "Catalog CSVs are being refreshed, and Dutchie order reports will follow if the toggle is enabled.",
         )
         self.show_loading(
             "Updating files...",
-            "Refreshing catalog CSV exports and optionally updating the Dutchie order-report files.",
+            (
+                "Refreshing catalog CSV exports and Dutchie order-report source files with API preference and browser fallback."
+                if prefer_api
+                else "Refreshing catalog CSV exports and Dutchie order-report source files with the browser scripts."
+            ),
         )
 
         try:
             clear_old_input_exports(in_dir, clear_order_reports=fetch_order_reports)
-            subprocess.check_call([sys.executable, "getCatalog.py", in_dir])
+            catalog_mode_used = self._refresh_catalog_exports(in_dir)
 
             order_reports_ok = True
+            order_report_mode_used = None
+            order_report_error = None
             if fetch_order_reports:
-                order_reports_ok = fetch_inventory_order_reports(in_dir)
+                try:
+                    order_report_mode_used = self._refresh_order_report_exports(in_dir)
+                except subprocess.CalledProcessError as exc:
+                    order_reports_ok = False
+                    order_report_error = exc
+                    self.append_log(f"Order-report refresh failed: {exc}")
+                    if getattr(exc, "stderr", None):
+                        self.append_log(str(exc.stderr).strip())
+                except Exception as exc:
+                    order_reports_ok = False
+                    order_report_error = exc
+                    self.append_log(f"Order-report refresh failed: {exc}")
 
             self.hide_loading()
             self._persist_settings(add_log=False, update_status=False)
             self._refresh_source_snapshot()
             self.load_brands(silent=True)
 
+            catalog_mode_text = "Dutchie API" if catalog_mode_used == "api" else "browser export"
+            order_mode_text = "Dutchie API" if order_report_mode_used == "api" else "browser export"
+
             if not fetch_order_reports:
-                self.append_log("Catalog CSV refresh finished. Order reports were skipped by choice.")
+                self.append_log(
+                    f"Catalog CSV refresh finished via {catalog_mode_text}. Order reports were skipped by choice."
+                )
                 self._set_status(
                     "Catalog refresh complete.",
-                    "Catalog CSVs are current. Existing order-report files were left untouched.",
+                    f"Catalog CSVs are current via {catalog_mode_text}. Existing order-report files were left untouched.",
                 )
                 messagebox.showinfo(
                     "Success",
-                    "Catalog CSVs were refreshed. Inventory order report refresh was skipped.",
+                    f"Catalog CSVs were refreshed via {catalog_mode_text}. Inventory order report refresh was skipped.",
                 )
             elif order_reports_ok:
-                self.append_log("Catalog CSV and inventory order report refresh finished.")
+                self.append_log(
+                    f"Catalog CSV refresh via {catalog_mode_text} and inventory order report refresh via {order_mode_text} finished."
+                )
                 self._set_status(
                     "Source refresh complete.",
-                    "Catalog CSVs and order-report files are ready, and the brand library has been refreshed.",
+                    f"Catalog CSVs ({catalog_mode_text}) and order-report files ({order_mode_text}) are ready, and the brand library has been refreshed.",
                 )
                 messagebox.showinfo(
                     "Success",
-                    "Catalog CSVs and inventory order report files were refreshed.",
+                    f"Catalog CSVs were refreshed via {catalog_mode_text}, and the inventory order report files were refreshed via {order_mode_text}.",
                 )
             else:
-                self.append_log("Catalog CSV refresh finished, but the order report refresh failed.")
+                self.append_log(
+                    f"Catalog CSV refresh via {catalog_mode_text} finished, but the order report refresh failed."
+                )
                 self._set_status(
                     "Partial refresh complete.",
-                    "Catalog CSVs were updated, but the order report refresh did not finish successfully.",
+                    f"Catalog CSVs were updated via {catalog_mode_text}, but the order report refresh did not finish successfully.",
                 )
                 messagebox.showwarning(
                     "Partial Success",
-                    "Catalog CSVs were refreshed, but the inventory order report refresh failed.",
+                    (
+                        f"Catalog CSVs were refreshed via {catalog_mode_text}, but the inventory order report refresh failed."
+                        if order_report_error is None
+                        else (
+                            f"Catalog CSVs were refreshed via {catalog_mode_text}, but the inventory order report refresh failed:\n\n"
+                            f"{order_report_error}"
+                        )
+                    ),
                 )
         except subprocess.CalledProcessError as e:
             self.hide_loading()
@@ -2230,7 +2479,10 @@ class BrandInventoryGUI:
                 "Refresh failed.",
                 "The catalog refresh did not complete. Check the error details and try again.",
             )
-            messagebox.showerror("Error", f"getCatalog.py failed:\n{e}")
+            detail = str(e)
+            if getattr(e, "stderr", None):
+                detail = f"{detail}\n\n{str(e.stderr).strip()}"
+            messagebox.showerror("Error", detail)
         except Exception as e:
             self.hide_loading()
             self.append_log(f"Refresh error: {e}")
@@ -2257,25 +2509,24 @@ class BrandInventoryGUI:
             "Loading brands...",
             "Reading the current catalog CSV files to build the selectable brand list.",
         )
-        for fn in os.listdir(in_dir):
-            if fn.lower().endswith(".csv"):
-                csv_count += 1
-                path = os.path.join(in_dir, fn)
-                try:
-                    df = pd.read_csv(path, nrows=50000)
-                    if "Brand" in df.columns:
-                        new_brands = (
-                            df["Brand"]
-                            .dropna()
-                            .astype(str)
-                            .str.strip()
-                            .str.lower()
-                            .unique()
-                            .tolist()
-                        )
-                        brand_set.update(new_brands)
-                except Exception:
-                    pass
+        for fn in list_catalog_csv_files(in_dir):
+            csv_count += 1
+            path = os.path.join(in_dir, fn)
+            try:
+                df = pd.read_csv(path, nrows=50000)
+                if "Brand" in df.columns:
+                    new_brands = (
+                        df["Brand"]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .str.lower()
+                        .unique()
+                        .tolist()
+                    )
+                    brand_set.update(new_brands)
+            except Exception:
+                pass
 
         self.all_brands = sorted(brand_set)
         self.selected_brand_names.intersection_update(self.all_brands)
@@ -2344,20 +2595,19 @@ class BrandInventoryGUI:
         )
 
         try:
-            for fname in os.listdir(in_dir):
-                if fname.lower().endswith(".csv"):
-                    path = os.path.join(in_dir, fname)
-                    brand_map = generate_brand_reports(
-                        path,
-                        out_dir,
-                        selected_brands,
-                        include_cost=self.include_cost_var.get(),
-                        order_reports_dir=in_dir,
-                    )
-                    for b_name, xlsx_list in brand_map.items():
-                        if b_name not in all_brand_map:
-                            all_brand_map[b_name] = []
-                        all_brand_map[b_name].extend(xlsx_list)
+            for fname in list_catalog_csv_files(in_dir):
+                path = os.path.join(in_dir, fname)
+                brand_map = generate_brand_reports(
+                    path,
+                    out_dir,
+                    selected_brands,
+                    include_cost=self.include_cost_var.get(),
+                    order_reports_dir=in_dir,
+                )
+                for b_name, xlsx_list in brand_map.items():
+                    if b_name not in all_brand_map:
+                        all_brand_map[b_name] = []
+                    all_brand_map[b_name].extend(xlsx_list)
 
             if not all_brand_map:
                 self.hide_loading()
