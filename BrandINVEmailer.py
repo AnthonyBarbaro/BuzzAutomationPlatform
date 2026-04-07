@@ -852,12 +852,7 @@ def main():
     if not generated_files:
         print("[INFO] No XLSX files were generated. Possibly no data matched.")
         return
-    print("[TEST] Skipping Google Drive and Gmail steps.")
-    print(f"[TEST] Generated {len(generated_files)} local file(s):")
-    for path in generated_files:
-        print(f"  - {path}")
-    return
-
+    
     # 7) Upload to Google Drive
     drive_service = drive_authenticate()
     parent_folder_id = find_or_create_folder(drive_service, DRIVE_PARENT_FOLDER_NAME, parent_id=None)
