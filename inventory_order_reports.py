@@ -284,7 +284,7 @@ def _sort_order_rows(df):
 def _to_numeric_series(df, candidates):
     col = find_matching_column(df, candidates)
     if not col:
-        return pd.Series([pd.NA] * len(df), index=df.index, dtype="object"), None
+        return pd.Series(float("nan"), index=df.index, dtype="float64"), None
     return pd.to_numeric(df[col], errors="coerce"), col
 
 

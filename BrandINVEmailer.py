@@ -30,6 +30,7 @@ import time
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
+from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
     build_brand_order_sections,
     extract_store_code_from_filename,
@@ -48,7 +49,15 @@ LOCAL_REPORTS_FOLDER = "brand_reports_tmp"  # Local subfolder for generated repo
 INVENTORY_LINKS_DIR = "inventory_links"
 BASE_DIR = "/home/anthony/projects/BuzzPythonGUI"
 BRAND_CONFIG_JSON = "brand_config2.json"
-ORDER_REPORT_SCRIPT = "getInventoryOrderReport.py"
+CATALOG_API_SCRIPT = "getCatalog.py"
+CATALOG_BROWSER_SCRIPT = "getCatalog_browser.py"
+ORDER_REPORT_API_SCRIPT = "getInventoryOrderReport_api.py"
+ORDER_REPORT_BROWSER_SCRIPT = "getInventoryOrderReport.py"
+DEFAULT_API_ENV_FILE = os.path.join(BASE_DIR, ".env")
+ORDER_REPORT_FILE_PATTERN = re.compile(
+    r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
+    re.IGNORECASE,
+)
 
 # Google Drive parent folder name (where we create subfolders by date)
 DRIVE_PARENT_FOLDER_NAME = "INVENTORY"
@@ -253,6 +262,108 @@ def safe_makedirs(path):
         os.makedirs(path)
 
 
+def is_order_report_filename(filename):
+    return bool(ORDER_REPORT_FILE_PATTERN.match(str(filename or "")))
+
+
+def list_catalog_csv_files(directory):
+    if not os.path.isdir(directory):
+        return []
+    return sorted(
+        filename
+        for filename in os.listdir(directory)
+        if filename.lower().endswith(".csv") and not is_order_report_filename(filename)
+    )
+
+
+def dutchie_api_readiness(env_file=DEFAULT_API_ENV_FILE):
+    expected_codes = list(STORE_CODES.keys())
+
+    try:
+        env_map = canonical_env_map(env_file)
+        resolved = resolve_store_keys(env_map, expected_codes)
+    except Exception as exc:
+        return False, [], expected_codes, str(exc)
+
+    available_codes = [code for code in expected_codes if code in resolved]
+    missing_codes = [code for code in expected_codes if code not in resolved]
+    return not missing_codes, available_codes, missing_codes, ""
+
+
+def run_refresh_script(script_name, *args):
+    script_path = os.path.join(BASE_DIR, script_name)
+    if not os.path.exists(script_path):
+        raise FileNotFoundError(f"{script_name} not found at {script_path}")
+
+    cmd = [sys.executable, script_path, *[str(arg) for arg in args]]
+    print(f"[INFO] Running {' '.join(cmd)}")
+    subprocess.check_call(cmd)
+
+
+def refresh_catalog_exports(output_directory):
+    api_ready, available_codes, missing_codes, error_text = dutchie_api_readiness(DEFAULT_API_ENV_FILE)
+
+    if api_ready:
+        print(
+            "[INFO] Dutchie API catalog refresh is configured for all stores "
+            f"({', '.join(available_codes)}). Trying the API exporter first."
+        )
+        try:
+            run_refresh_script(CATALOG_API_SCRIPT, output_directory)
+            print("[INFO] Catalog CSV refresh complete via Dutchie API.")
+            return "api"
+        except subprocess.CalledProcessError as exc:
+            print(f"[WARN] Dutchie API catalog refresh failed: {exc}")
+            print("[INFO] Falling back to the browser catalog export script.")
+    else:
+        if error_text:
+            print(
+                "[WARN] Dutchie API readiness could not be confirmed for catalog refresh. "
+                "Falling back to the browser catalog export script."
+            )
+        else:
+            print(
+                "[WARN] Dutchie API is missing store credentials for: "
+                f"{', '.join(missing_codes)}. Falling back to the browser catalog export script."
+            )
+
+    run_refresh_script(CATALOG_BROWSER_SCRIPT, output_directory)
+    print("[INFO] Catalog CSV refresh complete via browser export.")
+    return "browser"
+
+
+def refresh_inventory_order_reports(output_directory):
+    api_ready, available_codes, missing_codes, error_text = dutchie_api_readiness(DEFAULT_API_ENV_FILE)
+
+    if api_ready:
+        print(
+            "[INFO] Dutchie API order-report refresh is configured for all stores "
+            f"({', '.join(available_codes)}). Trying the API exporter first."
+        )
+        try:
+            run_refresh_script(ORDER_REPORT_API_SCRIPT, output_directory)
+            print("[INFO] Inventory order report refresh complete via Dutchie API.")
+            return "api"
+        except subprocess.CalledProcessError as exc:
+            print(f"[WARN] Dutchie API inventory order report refresh failed: {exc}")
+            print("[INFO] Falling back to the browser inventory order report script.")
+    else:
+        if error_text:
+            print(
+                "[WARN] Dutchie API readiness could not be confirmed for inventory order reports. "
+                "Falling back to the browser inventory order report script."
+            )
+        else:
+            print(
+                "[WARN] Dutchie API is missing store credentials for: "
+                f"{', '.join(missing_codes)}. Falling back to the browser inventory order report script."
+            )
+
+    run_refresh_script(ORDER_REPORT_BROWSER_SCRIPT, output_directory)
+    print("[INFO] Inventory order report refresh complete via browser export.")
+    return "browser"
+
+
 def clear_old_input_exports(directory):
     """
     Remove prior catalog CSVs and prior inventory-order exports so a fresh run
@@ -261,38 +372,16 @@ def clear_old_input_exports(directory):
     if not os.path.exists(directory):
         return
 
-    order_pattern = re.compile(
-        r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
-        re.IGNORECASE,
-    )
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
         if not os.path.isfile(file_path):
             continue
-        if filename.lower().endswith(".csv") or order_pattern.match(filename):
+        if (filename.lower().endswith(".csv") and not is_order_report_filename(filename)) or is_order_report_filename(filename):
             try:
                 os.remove(file_path)
                 print(f"[INFO] Deleted old source export: {file_path}")
             except Exception as e:
                 print(f"[ERROR] Could not delete {file_path}: {e}")
-
-
-def fetch_inventory_order_reports(output_directory):
-    script_path = os.path.join(BASE_DIR, ORDER_REPORT_SCRIPT)
-    if not os.path.exists(script_path):
-        print(f"[WARN] {ORDER_REPORT_SCRIPT} not found, skipping order-report fetch.")
-        return False
-
-    try:
-        print("[INFO] Running getInventoryOrderReport.py to fetch 7d/14d/30d order reports ...")
-        subprocess.check_call([sys.executable, script_path, output_directory])
-        print("[INFO] Inventory order report fetch complete.")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] {ORDER_REPORT_SCRIPT} failed: {e}")
-    except Exception as e:
-        print(f"[ERROR] Unexpected order-report fetch failure: {e}")
-    return False
 
 
 def write_inventory_link_manifest(date_str, today_name, brand_folder_links, brand_to_emails):
@@ -475,11 +564,14 @@ def process_file(file_path, output_directory, selected_brands):
         print(f"Error reading {file_path}: {e}")
         return None, None
 
-    existing_cols = [c for c in INPUT_COLUMNS + ['Cost'] if c in df.columns]
-    if not existing_cols:
-        print(f"[WARN] {file_path} is missing required columns. Skipped.")
+    if not all(column in df.columns for column in INPUT_COLUMNS):
+        print(
+            f"[WARN] {file_path} is missing required columns {INPUT_COLUMNS}. "
+            f"Found columns: {list(df.columns)}. Skipped."
+        )
         return None, None
 
+    existing_cols = [c for c in INPUT_COLUMNS + ['Cost'] if c in df.columns]
     df = df[existing_cols]
 
     # Filter out 'promo' or 'sample'
@@ -619,13 +711,12 @@ def process_files(input_directory, output_directory, selected_brands):
     safe_makedirs(output_directory)
 
     # Process each CSV
-    for fn in os.listdir(input_directory):
-        if fn.lower().endswith(".csv"):
-            csv_path = os.path.join(input_directory, fn)
-            try:
-                process_file(csv_path, output_directory, selected_brands)
-            except Exception as e:
-                print(f"[ERROR] While processing {fn}: {e}")
+    for fn in list_catalog_csv_files(input_directory):
+        csv_path = os.path.join(input_directory, fn)
+        try:
+            process_file(csv_path, output_directory, selected_brands)
+        except Exception as e:
+            print(f"[ERROR] While processing {fn}: {e}")
 
     # Re-organize by brand
     organize_by_brand(output_directory)
@@ -722,17 +813,33 @@ def main():
     if test_mode:
         print(f"[INFO] TEST MODE ON => all emails go to {test_email}")
 
-    # 5) Optionally call getCatalog.py
-    try:
-        print("[INFO] Running getCatalog.py to fetch latest CSV files ...")
-        subprocess.check_call([sys.executable, os.path.join(BASE_DIR, "getCatalog.py"), INPUT_DIRECTORY])
-        print("[INFO] CSV fetch complete.")
-    except FileNotFoundError:
-        print("[WARN] getCatalog.py not found, skipping CSV fetch step.")
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] getCatalog.py failed: {e}")
+    # 5) Refresh source exports with Dutchie API preference and browser fallback.
+    catalog_mode_used = None
+    order_mode_used = None
 
-    fetch_inventory_order_reports(INPUT_DIRECTORY)
+    try:
+        catalog_mode_used = refresh_catalog_exports(INPUT_DIRECTORY)
+    except FileNotFoundError as exc:
+        print(f"[WARN] {exc}. Skipping catalog refresh step.")
+    except subprocess.CalledProcessError as exc:
+        print(f"[ERROR] Catalog refresh failed: {exc}")
+    except Exception as exc:
+        print(f"[ERROR] Unexpected catalog refresh failure: {exc}")
+
+    try:
+        order_mode_used = refresh_inventory_order_reports(INPUT_DIRECTORY)
+    except FileNotFoundError as exc:
+        print(f"[WARN] {exc}. Skipping inventory order report refresh step.")
+    except subprocess.CalledProcessError as exc:
+        print(f"[ERROR] Inventory order report refresh failed: {exc}")
+    except Exception as exc:
+        print(f"[ERROR] Unexpected inventory order report refresh failure: {exc}")
+
+    if catalog_mode_used or order_mode_used:
+        print(
+            "[INFO] Source refresh summary: "
+            f"catalog={catalog_mode_used or 'skipped'}, order_reports={order_mode_used or 'skipped'}"
+        )
 
     # ----------------------------------------------------------------
     # 6) synonyms_for_today => process CSV
@@ -745,6 +852,11 @@ def main():
     if not generated_files:
         print("[INFO] No XLSX files were generated. Possibly no data matched.")
         return
+    print("[TEST] Skipping Google Drive and Gmail steps.")
+    print(f"[TEST] Generated {len(generated_files)} local file(s):")
+    for path in generated_files:
+        print(f"  - {path}")
+    return
 
     # 7) Upload to Google Drive
     drive_service = drive_authenticate()
