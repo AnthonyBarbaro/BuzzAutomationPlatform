@@ -31,7 +31,7 @@ def build_summary_rows(summary: Mapping[str, Any], max_rows: int = 3) -> list[li
     for index, (label, value) in enumerate(items):
         row_index = min(index // pairs_per_row, row_count - 1)
         rows[row_index].extend([label, value])
-    return rows
+    return [row for row in rows if row]
 
 
 def build_sheet_matrix(summary_rows: Sequence[Sequence[Any]], df: pd.DataFrame) -> tuple[list[list[Any]], int]:
@@ -369,12 +369,13 @@ def _format_ordering_sheet(
                     },
                     "cell": {
                         "userEnteredFormat": {
+                            "horizontalAlignment": "CENTER",
                             "verticalAlignment": "MIDDLE",
                             "wrapStrategy": "WRAP",
                             "textFormat": {"fontSize": 10},
                         }
                     },
-                    "fields": "userEnteredFormat(verticalAlignment,wrapStrategy,textFormat)",
+                    "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)",
                 }
             }
         )
@@ -429,6 +430,7 @@ def _format_ordering_sheet(
         }
     )
     requests.extend(_column_width_requests(sheet_id, headers))
+    requests.extend(_data_alignment_requests(sheet_id, headers, total_rows, header_row_number))
     requests.extend(
         _number_format_requests(
             sheet_id,
@@ -462,7 +464,6 @@ def _number_format_requests(
 
     requests: list[dict[str, Any]] = []
     currency_headers = {"Cost", "Price", "Inventory Value"}
-    percent_headers = {"Sell-Through 7d", "Sell-Through 14d", "Sell-Through 30d"}
     integer_headers = {
         "Available",
         "Units Sold 7d",
@@ -473,15 +474,13 @@ def _number_format_requests(
         "Proposed Order Qty",
         "Final Approved Qty",
     }
-    decimal_headers = {"Avg Daily Sold 30d", "Days of Supply"}
+    decimal_headers = {"Avg Daily Sold 14d", "Days of Supply"}
     date_headers = {"Last Sale Date"}
 
     for index, header in enumerate(headers):
         pattern = None
         if header in currency_headers:
             pattern = "$#,##0.00"
-        elif header in percent_headers:
-            pattern = "0.0%"
         elif header in integer_headers:
             pattern = "0"
         elif header in decimal_headers:
@@ -670,6 +669,42 @@ def _hidden_column_requests(sheet_id: int, headers: Sequence[str], hidden_header
     return requests
 
 
+def _data_alignment_requests(
+    sheet_id: int,
+    headers: Sequence[str],
+    total_rows: int,
+    header_row_number: int,
+) -> list[dict[str, Any]]:
+    if total_rows <= header_row_number:
+        return []
+
+    left_headers = {"Product", "Reorder Notes / Reason"}
+    requests: list[dict[str, Any]] = []
+    for index, header in enumerate(headers):
+        if header not in left_headers:
+            continue
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": header_row_number,
+                        "endRowIndex": total_rows,
+                        "startColumnIndex": index,
+                        "endColumnIndex": index + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "LEFT",
+                        }
+                    },
+                    "fields": "userEnteredFormat.horizontalAlignment",
+                }
+            }
+        )
+    return requests
+
+
 def _column_width_requests(sheet_id: int, headers: Sequence[str]) -> list[dict[str, Any]]:
     widths = {
         "Row Key": 140,
@@ -679,7 +714,6 @@ def _column_width_requests(sheet_id: int, headers: Sequence[str]) -> list[dict[s
         "Brand": 140,
         "Category": 120,
         "Product": 260,
-        "SKU": 140,
         "Available": 90,
         "Cost": 90,
         "Price": 90,
@@ -687,13 +721,11 @@ def _column_width_requests(sheet_id: int, headers: Sequence[str]) -> list[dict[s
         "Units Sold 7d": 100,
         "Units Sold 14d": 105,
         "Units Sold 30d": 105,
-        "Sell-Through 7d": 110,
-        "Sell-Through 14d": 115,
-        "Sell-Through 30d": 115,
-        "Avg Daily Sold 30d": 125,
+        "Sell-Through 7D/14D/30D": 170,
+        "Avg Daily Sold 14d": 125,
         "Days of Supply": 110,
         "Suggested Order Qty": 135,
-        "Reorder Notes / Reason": 250,
+        "Reorder Notes / Reason": 330,
         "Last Sale Date": 110,
         "Shelf Count Checked": 130,
         "Proposed Order Qty": 130,

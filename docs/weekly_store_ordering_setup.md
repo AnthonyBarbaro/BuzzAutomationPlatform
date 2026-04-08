@@ -19,6 +19,31 @@ The workflow supports two reorder modes:
 - `exact_sku`: reorder against the exact item row
 - `family_par`: reorder against a configurable replacement family / par bucket, with family summary rows followed by detail rows for strain choice and cross-check
 
+Current row ordering in the exported `AUTO` and `REVIEW` tabs is:
+
+- `Vendor`
+- `Brand`
+- `Category`
+- `Cost`
+- `Price`
+- `Reorder Priority`
+
+This keeps like items together for faster buying review inside each store tab.
+
+Default row filters also exclude:
+
+- items with `Cost < $1.00`
+- items with fewer than `3` units sold in the last `30` days
+
+The sheet summary area is intentionally minimal:
+
+- `Store`
+- `Week Of`
+- `Snapshot Generated At`
+- `Total Inventory Value`
+
+`Total Inventory Value` is calculated from the full normalized inventory snapshot before ordering filters are applied, so it reflects all inventory rather than only the rows that remain in the ordering tab.
+
 ## Required Inputs
 
 1. Dutchie API keys in `.env`
@@ -41,9 +66,11 @@ Important settings:
 - `sheet_names.auto_suffix` / `sheet_names.review_suffix`
 - `eligibility.mode`: default `brand_or_vendor`
 - `eligibility.include_sales_only_rows`: include recent sold items even if current inventory is zero/missing
+- `eligibility.min_units_sold_30d`: default `3`; rows under this 30-day sales floor are excluded from the final ordering tabs
 - `exclusions.pattern`: default sample/promo regex aligned to the existing reorder workflow
-- `exclusions.exclude_low_cost_rows`: optional low-cost suppression toggle
-- `reorder.velocity_window_days`: default `30`
+- `exclusions.exclude_low_cost_rows`: default `true`; excludes rows where cost is below the configured threshold
+- `exclusions.low_cost_threshold`: default `1.0`
+- `reorder.velocity_window_days`: default `14`
 - `reorder.target_cover_days`: default `14`
 - `reorder.days_of_supply_urgent`: default `3`
 - `reorder.days_of_supply_low`: default `7`
@@ -159,3 +186,27 @@ Recommended first run:
 2. Inspect `auto_preview.csv`, `review_preview.csv`, and `sheet_payload.json`
 3. Run a live single-store write
 4. Confirm review-column preservation by editing the `REVIEW` tab and rerunning the same week/store
+
+## Metric Notes
+
+`Sell-Through 7D/14D/30D` is a combined display column that shows all three sell-through windows in one field:
+
+- display format: `7d% / 14d% / 30d%`
+- sell-through formula for each window: `units sold in the window / (units sold in the window + current available units)`
+- example: `67% / 80% / 89%`
+
+Why this matters:
+
+- it keeps the short-, mid-, and month-view movement together in one easy scan line
+- it highlights products that are moving quickly relative to what is still on the shelf
+- it gives the reorder logic and the buyer a fast-turn signal without needing a separate beginning-inventory snapshot
+
+`Avg Daily Sold 14d` is:
+
+- formula: `Units Sold 14d / 14`
+
+Why this matters:
+
+- it uses a more recent demand window than the old 30-day display
+- it smooths day-to-day noise into a usable daily demand estimate
+- it gives buyers the same 14-day pace the reorder math now uses for `Days of Supply`, `Target Qty`, and `Suggested Order Qty`

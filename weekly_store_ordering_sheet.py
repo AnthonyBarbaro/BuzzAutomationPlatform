@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 from collections import Counter, OrderedDict
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -48,12 +49,10 @@ DEFAULT_CONFIG_PATH = BASE_DIR / "weekly_store_ordering_config.json"
 AUTO_COLUMNS = [
     "Row Key",
     "Reorder Priority",
-    "Needs Order",
     "Vendor",
     "Brand",
     "Category",
     "Product",
-    "SKU",
     "Available",
     "Cost",
     "Price",
@@ -61,10 +60,8 @@ AUTO_COLUMNS = [
     "Units Sold 7d",
     "Units Sold 14d",
     "Units Sold 30d",
-    "Sell-Through 7d",
-    "Sell-Through 14d",
-    "Sell-Through 30d",
-    "Avg Daily Sold 30d",
+    "Sell-Through 7D/14D/30D",
+    "Avg Daily Sold 14d",
     "Days of Supply",
     "Suggested Order Qty",
     "Reorder Notes / Reason",
@@ -76,13 +73,6 @@ SUMMARY_FIELD_ORDER = [
     "Week Of",
     "Snapshot Generated At",
     "Total Inventory Value",
-    "Total SKUs Considered",
-    "Total SKUs Needing Order",
-    "Total 7d Units Sold",
-    "Total 14d Units Sold",
-    "Total 30d Units Sold",
-    "Brands Included (count)",
-    "Vendors Included (count)",
 ]
 
 
@@ -104,14 +94,15 @@ def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PA
     config.setdefault("eligibility", {})
     config["eligibility"].setdefault("mode", "brand_or_vendor")
     config["eligibility"].setdefault("include_sales_only_rows", True)
+    config["eligibility"].setdefault("min_units_sold_30d", 3)
     config.setdefault("exclusions", {})
     config["exclusions"].setdefault("pattern", r"\b(sample|samples|promo|promos|promotional|display|tester)\b")
     config["exclusions"].setdefault("fields", ["product", "category", "tags", "brand", "vendor"])
     config["exclusions"].setdefault("extra_keywords", [])
-    config["exclusions"].setdefault("low_cost_threshold", 1.01)
-    config["exclusions"].setdefault("exclude_low_cost_rows", False)
+    config["exclusions"].setdefault("low_cost_threshold", 1.0)
+    config["exclusions"].setdefault("exclude_low_cost_rows", True)
     config.setdefault("reorder", {})
-    config["reorder"].setdefault("velocity_window_days", 30)
+    config["reorder"].setdefault("velocity_window_days", 14)
     config["reorder"].setdefault("target_cover_days", 14)
     config["reorder"].setdefault("needs_order_min_qty", 1)
     config["reorder"].setdefault("days_of_supply_urgent", 3.0)
@@ -325,11 +316,12 @@ def build_ordering_bundle(
         merged = merged[merged["inventory_row_count"] > 0].copy()
 
     metrics_df = compute_ordering_metrics(merged, config)
+    metrics_df, metric_filter_counts = apply_ordering_filters(metrics_df, config)
     metrics_df = sort_ordering_rows(metrics_df)
     auto_df = build_auto_sheet_df(metrics_df)
     review_df = build_review_sheet_df(metrics_df, config)
     summary = build_store_summary(
-        metrics_df=metrics_df,
+        inventory_prepared=inventory_prepared,
         store_code=store_code,
         week_of=week_of,
         snapshot_generated_at=snapshot_generated_at,
@@ -360,6 +352,7 @@ def build_ordering_bundle(
             "inventory_rows_out": int(len(inventory_filtered)),
             "sales_rows_in": int(len(sales_prepared)),
             "sales_rows_out": int(len(sales_filtered)),
+            "metric_filter_counts": dict(metric_filter_counts),
             "final_rows": int(len(metrics_df)),
             "needs_order_rows": int((metrics_df["Needs Order"] == "Y").sum()) if not metrics_df.empty else 0,
         },
@@ -393,8 +386,7 @@ def apply_exclusion_rules(
         tags = _clean_text(row.get("Tags"))
         brand = _clean_text(row.get("brand_name"), row.get("Brand"))
         vendor = _clean_text(row.get("Vendor"), row.get("Vendor Name"), row.get("Producer"))
-        price = _to_float(row.get("Price_Used"), row.get("Price"), row.get("merge_price_basis"))
-        cost = _to_float(row.get("Cost"), row.get("merge_cost_basis"))
+        cost = _maybe_float(row.get("Cost"), row.get("merge_cost_basis"))
 
         texts = {
             "product": product.lower(),
@@ -414,7 +406,7 @@ def apply_exclusion_rules(
                 if any(keyword in field_value for keyword in extra_keywords):
                     reason = f"keyword:{field}"
                     break
-        if not reason and exclude_low_cost_rows and max(cost, 0.0) <= low_cost_threshold and max(price, 0.0) <= low_cost_threshold:
+        if not reason and exclude_low_cost_rows and cost is not None and cost < low_cost_threshold:
             reason = "low_cost"
 
         keep_mask.append(not reason)
@@ -648,7 +640,17 @@ def apply_eligibility_rules(
 
 def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any]) -> pd.DataFrame:
     if merged_df is None or merged_df.empty:
-        return pd.DataFrame(columns=AUTO_COLUMNS + ["Target Qty", "Priority Rank"])
+        return pd.DataFrame(
+            columns=AUTO_COLUMNS
+            + [
+                "SKU",
+                "Sell-Through 7d",
+                "Sell-Through 14d",
+                "Sell-Through 30d",
+                "Target Qty",
+                "Priority Rank",
+            ]
+        )
 
     work = merged_df.copy()
     velocity_window_days = int(config.get("reorder", {}).get("velocity_window_days", 30))
@@ -658,6 +660,7 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
     low_days = float(config.get("reorder", {}).get("days_of_supply_low", 7.0))
     high_sell_through = float(config.get("reorder", {}).get("high_sell_through_30d", 0.6))
 
+    work["avg_daily_sold_14d"] = work["units_sold_14d"] / 14.0
     work["avg_daily_sold_30d"] = work["units_sold_30d"] / 30.0
     work["avg_daily_sold_velocity"] = work["units_sold_velocity"] / float(max(velocity_window_days, 1))
     work["sell_through_7d"] = _safe_sell_through(work["units_sold_7d"], work["available"])
@@ -682,8 +685,13 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
     for _, row in work.iterrows():
         priority, rank, note = classify_reorder_priority(
             available=float(row.get("available", 0.0) or 0.0),
+            units_sold_7d=float(row.get("units_sold_7d", 0.0) or 0.0),
+            units_sold_14d=float(row.get("units_sold_14d", 0.0) or 0.0),
             units_sold_30d=float(row.get("units_sold_30d", 0.0) or 0.0),
+            avg_daily_sold_14d=float(row.get("avg_daily_sold_14d", 0.0) or 0.0),
             days_of_supply=row.get("days_of_supply", np.nan),
+            sell_through_7d=float(row.get("sell_through_7d", 0.0) or 0.0),
+            sell_through_14d=float(row.get("sell_through_14d", 0.0) or 0.0),
             sell_through_30d=float(row.get("sell_through_30d", 0.0) or 0.0),
             suggested_order_qty=int(row.get("Suggested Order Qty", 0) or 0),
             target_cover_days=target_cover_days,
@@ -709,7 +717,15 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
     work["Sell-Through 7d"] = work["sell_through_7d"].fillna(0.0).astype(float)
     work["Sell-Through 14d"] = work["sell_through_14d"].fillna(0.0).astype(float)
     work["Sell-Through 30d"] = work["sell_through_30d"].fillna(0.0).astype(float)
-    work["Avg Daily Sold 30d"] = work["avg_daily_sold_30d"].fillna(0.0).astype(float)
+    work["Sell-Through 7D/14D/30D"] = work.apply(
+        lambda row: _format_sell_through_triplet(
+            row.get("Sell-Through 7d", 0.0),
+            row.get("Sell-Through 14d", 0.0),
+            row.get("Sell-Through 30d", 0.0),
+        ),
+        axis=1,
+    )
+    work["Avg Daily Sold 14d"] = work["avg_daily_sold_14d"].fillna(0.0).astype(float)
     work["Days of Supply"] = pd.to_numeric(work["days_of_supply"], errors="coerce")
     work["SKU"] = work["sku"].fillna("").astype(str)
     work["Vendor"] = work["vendor"].fillna("Unknown Vendor").astype(str)
@@ -721,6 +737,11 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
     return work[
         AUTO_COLUMNS
         + [
+            "Needs Order",
+            "SKU",
+            "Sell-Through 7d",
+            "Sell-Through 14d",
+            "Sell-Through 30d",
             "Target Qty",
             "Priority Rank",
             "store_code",
@@ -730,10 +751,48 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
     ].copy()
 
 
+def apply_ordering_filters(
+    metrics_df: pd.DataFrame,
+    config: Mapping[str, Any],
+) -> tuple[pd.DataFrame, Counter]:
+    if metrics_df is None or metrics_df.empty:
+        return pd.DataFrame(columns=metrics_df.columns if metrics_df is not None else AUTO_COLUMNS), Counter()
+
+    work = metrics_df.copy()
+    keep_mask = pd.Series(True, index=work.index, dtype=bool)
+    counts: Counter[str] = Counter()
+
+    exclude_low_cost_rows = bool(config.get("exclusions", {}).get("exclude_low_cost_rows", True))
+    low_cost_threshold = float(config.get("exclusions", {}).get("low_cost_threshold", 1.0))
+    if exclude_low_cost_rows:
+        cost_series = pd.to_numeric(work.get("Cost", 0.0), errors="coerce")
+        low_cost_mask = cost_series.notna() & (cost_series < low_cost_threshold)
+        excluded_low_cost = keep_mask & low_cost_mask
+        if excluded_low_cost.any():
+            counts["low_cost"] = int(excluded_low_cost.sum())
+        keep_mask &= ~low_cost_mask
+
+    min_units_sold_30d = float(config.get("eligibility", {}).get("min_units_sold_30d", 3))
+    if min_units_sold_30d > 0:
+        units_sold_30d = pd.to_numeric(work.get("Units Sold 30d", 0.0), errors="coerce").fillna(0.0)
+        low_sales_mask = units_sold_30d < min_units_sold_30d
+        excluded_low_sales = keep_mask & low_sales_mask
+        if excluded_low_sales.any():
+            counts["min_units_sold_30d"] = int(excluded_low_sales.sum())
+        keep_mask &= ~low_sales_mask
+
+    return work.loc[keep_mask].copy(), counts
+
+
 def classify_reorder_priority(
     available: float,
+    units_sold_7d: float,
+    units_sold_14d: float,
     units_sold_30d: float,
+    avg_daily_sold_14d: float,
     days_of_supply: Any,
+    sell_through_7d: float,
+    sell_through_14d: float,
     sell_through_30d: float,
     suggested_order_qty: int,
     target_cover_days: int,
@@ -741,21 +800,40 @@ def classify_reorder_priority(
     low_days: float,
     high_sell_through: float,
 ) -> tuple[str, int, str]:
+    sales_summary = f"{units_sold_7d:.0f}/7d, {units_sold_14d:.0f}/14d, {units_sold_30d:.0f}/30d"
+    sell_through_summary = _format_sell_through_triplet(sell_through_7d, sell_through_14d, sell_through_30d)
+    pace_summary = f"{avg_daily_sold_14d:.1f}/day over 14d"
+    trend_summary = _sales_trend_summary(units_sold_7d, units_sold_14d)
+
     if suggested_order_qty <= 0:
         if units_sold_30d <= 0:
-            return "Healthy", 0, "Eligible brand/vendor item with no SKU-level sales in the last 30 days."
-        return "Healthy", 0, f"Current stock already covers the {target_cover_days}d target."
+            return "Healthy", 0, "No reorder: no sales in the last 30 days."
+        return "Healthy", 0, f"No reorder: current stock covers the {target_cover_days}d target at {pace_summary}."
 
     finite_dos = pd.notna(days_of_supply)
     if available <= 0 and units_sold_30d > 0:
-        return "Urgent", 3, "Recent sales with zero current on-hand inventory."
+        note = f"Out of stock with recent sales ({sales_summary}); sell-through {sell_through_summary}; suggest {suggested_order_qty}."
+        return "Urgent", 3, _append_note_part(note, trend_summary)
     if finite_dos and float(days_of_supply) <= urgent_days:
-        return "Urgent", 3, f"{float(days_of_supply):.1f} days of supply vs {target_cover_days}d target."
+        note = (
+            f"{float(days_of_supply):.1f} days of supply vs {target_cover_days}d target; "
+            f"{pace_summary}; suggest {suggested_order_qty}."
+        )
+        return "Urgent", 3, _append_note_part(note, trend_summary)
     if finite_dos and float(days_of_supply) <= low_days:
-        return "Low Cover", 2, f"{float(days_of_supply):.1f} days of supply is below the reorder threshold."
+        note = (
+            f"{float(days_of_supply):.1f} days of supply is below the reorder threshold; "
+            f"{sales_summary}; suggest {suggested_order_qty}."
+        )
+        return "Low Cover", 2, _append_note_part(note, trend_summary)
     if sell_through_30d >= high_sell_through:
-        return "Reorder", 1, f"30d sell-through is {sell_through_30d:.1%}, above the configured urgency threshold."
-    return "Reorder", 1, "Below target stock cover based on recent demand."
+        note = (
+            f"Fast turn item: sell-through {sell_through_summary}; "
+            f"{pace_summary}; suggest {suggested_order_qty}."
+        )
+        return "Reorder", 1, _append_note_part(note, trend_summary)
+    note = f"Below target cover based on recent demand ({sales_summary}); suggest {suggested_order_qty}."
+    return "Reorder", 1, _append_note_part(note, trend_summary)
 
 
 def sort_ordering_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
@@ -765,20 +843,37 @@ def sort_ordering_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
     work = metrics_df.copy()
     work["_vendor_sort"] = work["Vendor"].fillna("").astype(str).str.upper()
     work["_brand_sort"] = work["Brand"].fillna("").astype(str).str.upper()
+    work["_category_sort"] = work["Category"].fillna("").astype(str).str.upper()
+    work["_cost_sort"] = pd.to_numeric(work["Cost"], errors="coerce").fillna(0.0)
+    work["_price_sort"] = pd.to_numeric(work["Price"], errors="coerce").fillna(0.0)
+    work["_priority_sort"] = pd.to_numeric(work["Priority Rank"], errors="coerce").fillna(0).astype(int)
     work["_product_sort"] = work["Product"].fillna("").astype(str).str.upper()
-    work["_needs_order_sort"] = np.where(work["Needs Order"] == "Y", 1, 0)
+    work["_sku_sort"] = work["SKU"].fillna("").astype(str).str.upper()
     work = work.sort_values(
         [
             "_vendor_sort",
             "_brand_sort",
-            "_needs_order_sort",
-            "Priority Rank",
-            "Suggested Order Qty",
+            "_category_sort",
+            "_cost_sort",
+            "_price_sort",
+            "_priority_sort",
             "_product_sort",
+            "_sku_sort",
         ],
-        ascending=[True, True, False, False, False, True],
+        ascending=[True, True, True, True, True, False, True, True],
     )
-    return work.drop(columns=["_vendor_sort", "_brand_sort", "_product_sort", "_needs_order_sort"])
+    return work.drop(
+        columns=[
+            "_vendor_sort",
+            "_brand_sort",
+            "_category_sort",
+            "_cost_sort",
+            "_price_sort",
+            "_priority_sort",
+            "_product_sort",
+            "_sku_sort",
+        ]
+    )
 
 
 def build_auto_sheet_df(metrics_df: pd.DataFrame) -> pd.DataFrame:
@@ -800,27 +895,31 @@ def build_review_sheet_df(metrics_df: pd.DataFrame, config: Mapping[str, Any]) -
 
 
 def build_store_summary(
-    metrics_df: pd.DataFrame,
+    inventory_prepared: pd.DataFrame,
     store_code: str,
     week_of: date,
     snapshot_generated_at: datetime,
 ) -> OrderedDict[str, Any]:
     store_name = bmp._store_name_from_abbr(store_code)
-    work = metrics_df.copy() if metrics_df is not None else pd.DataFrame()
     summary_values = {
         "Store": f"{store_code} - {store_name}",
         "Week Of": week_of.isoformat(),
         "Snapshot Generated At": snapshot_generated_at.astimezone(ZoneInfo(bmp.REPORT_TZ)).strftime("%Y-%m-%d %H:%M %Z"),
-        "Total Inventory Value": float(work["Inventory Value"].sum()) if not work.empty else 0.0,
-        "Total SKUs Considered": int(len(work)),
-        "Total SKUs Needing Order": int((work["Needs Order"] == "Y").sum()) if not work.empty else 0,
-        "Total 7d Units Sold": float(work["Units Sold 7d"].sum()) if not work.empty else 0.0,
-        "Total 14d Units Sold": float(work["Units Sold 14d"].sum()) if not work.empty else 0.0,
-        "Total 30d Units Sold": float(work["Units Sold 30d"].sum()) if not work.empty else 0.0,
-        "Brands Included (count)": int(work["Brand"].replace("", np.nan).dropna().nunique()) if not work.empty else 0,
-        "Vendors Included (count)": int(work["Vendor"].replace("", np.nan).dropna().nunique()) if not work.empty else 0,
+        "Total Inventory Value": compute_total_inventory_value(inventory_prepared),
     }
     return OrderedDict((field, summary_values[field]) for field in SUMMARY_FIELD_ORDER)
+
+
+def compute_total_inventory_value(inventory_prepared: pd.DataFrame) -> float:
+    if inventory_prepared is None or inventory_prepared.empty:
+        return 0.0
+
+    if "Inventory_Value" in inventory_prepared.columns:
+        return float(pd.to_numeric(inventory_prepared["Inventory_Value"], errors="coerce").fillna(0.0).sum())
+
+    available = pd.to_numeric(inventory_prepared.get("Available", 0.0), errors="coerce").fillna(0.0)
+    cost = pd.to_numeric(inventory_prepared.get("Cost", 0.0), errors="coerce").fillna(0.0)
+    return float((available * cost).sum())
 
 
 def write_store_artifacts(
@@ -1132,6 +1231,46 @@ def _safe_sell_through(units_sold: pd.Series, available: pd.Series) -> pd.Series
     return (units_sold.fillna(0.0) / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
+def _format_sell_through_triplet(value_7d: Any, value_14d: Any, value_30d: Any) -> str:
+    parts = [_format_percent_display(value) for value in [value_7d, value_14d, value_30d]]
+    if len(set(parts)) == 1:
+        return parts[0]
+    return " / ".join(parts)
+
+
+def _format_percent_display(value: Any) -> str:
+    try:
+        numeric = Decimal(str(float(value)))
+    except Exception:
+        numeric = Decimal("0")
+    percent = (numeric * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"{int(percent)}%"
+
+
+def _sales_trend_summary(units_sold_7d: float, units_sold_14d: float) -> str:
+    if units_sold_14d <= 0:
+        return ""
+
+    baseline_7d = units_sold_14d / 2.0
+    if baseline_7d <= 0:
+        return ""
+    if units_sold_7d >= baseline_7d * 1.25 and units_sold_14d >= 4:
+        return "7d pace is accelerating."
+    if units_sold_7d <= baseline_7d * 0.75 and units_sold_14d >= 4:
+        return "7d pace is slowing."
+    return ""
+
+
+def _append_note_part(note: str, extra: str) -> str:
+    base = str(note or "").strip()
+    tail = str(extra or "").strip()
+    if not tail:
+        return base
+    if not base:
+        return tail
+    return f"{base} {tail}"
+
+
 def _coalesce_text(df: pd.DataFrame, left_col: str, right_col: str, default: str = "") -> pd.Series:
     left = df[left_col].fillna("").astype(str).str.strip() if left_col in df.columns else pd.Series("", index=df.index)
     right = df[right_col].fillna("").astype(str).str.strip() if right_col in df.columns else pd.Series("", index=df.index)
@@ -1169,6 +1308,19 @@ def _to_float(*values: Any) -> float:
         except Exception:
             continue
     return 0.0
+
+
+def _maybe_float(*values: Any) -> float | None:
+    for value in values:
+        try:
+            if value is None or value == "":
+                continue
+            if pd.isna(value):
+                continue
+            return float(value)
+        except Exception:
+            continue
+    return None
 
 
 def _key_text(value: Any) -> str:

@@ -33,7 +33,8 @@
   },
   "eligibility": {
     "mode": "brand_or_vendor",
-    "include_sales_only_rows": true
+    "include_sales_only_rows": true,
+    "min_units_sold_30d": 3
   },
   "exclusions": {
     "pattern": "\\b(sample|samples|promo|promos|promotional|display|tester)\\b",
@@ -47,11 +48,11 @@
     "extra_keywords": [
       "west coast hookah & glass"
     ],
-    "low_cost_threshold": 1.01,
-    "exclude_low_cost_rows": false
+    "low_cost_threshold": 1.0,
+    "exclude_low_cost_rows": true
   },
   "reorder": {
-    "velocity_window_days": 30,
+    "velocity_window_days": 14,
     "target_cover_days": 14,
     "needs_order_min_qty": 1,
     "days_of_supply_urgent": 3.0,
