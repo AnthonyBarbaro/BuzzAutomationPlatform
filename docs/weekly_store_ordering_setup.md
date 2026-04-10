@@ -15,6 +15,7 @@ The flow is idempotent by store/week. A rerun updates the same:
 - `MV 2026-03-30 Review`
 
 It does not create duplicate weekly tabs for the same store/week.
+If one store fails during a multi-store run, the remaining stores still continue and the failure is recorded in `run_summary.json`.
 
 The workflow supports two reorder modes:
 

@@ -1,12 +1,15 @@
 import json
 import logging
+import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+import weekly_store_ordering_sheet as weekly_sheet
 from weekly_store_ordering_sheet import (
     _format_sell_through_triplet,
     apply_exclusion_rules,
@@ -297,6 +300,70 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(len(summary_rows), 2)
         self.assertEqual(header_row_number, 3)
         json.dumps({"values": values})
+
+    def test_main_continues_after_one_store_failure_and_records_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = json.loads(json.dumps(self.config))
+            config["stores"] = ["MV", "SV", "NC"]
+            config["output_root"] = tmpdir
+            config["sheet_outputs"] = {
+                "write_auto_tab": False,
+                "write_review_tab": True,
+            }
+
+            def fake_load_store_payloads(store_code, *_args, **_kwargs):
+                if store_code == "SV":
+                    raise RuntimeError("SV timed out")
+                return {"store_code": store_code}
+
+            def fake_build_ordering_bundle(store_code, week_of, *_args, **_kwargs):
+                return {
+                    "store_code": store_code,
+                    "auto_df": pd.DataFrame([{"Row Key": f"{store_code}|sku:1"}]),
+                    "review_df": pd.DataFrame([{"Row Key": f"{store_code}|sku:1"}]),
+                    "logs": {
+                        "needs_order_rows": 1,
+                        "inventory_exclusion_counts": {},
+                        "sales_exclusion_counts": {},
+                        "transaction_drop_counts": {},
+                    },
+                    "tab_titles": {
+                        "auto": build_tab_title(store_code, week_of, "Auto"),
+                        "review": build_tab_title(store_code, week_of, "Review"),
+                    },
+                }
+
+            def fake_write_store_artifacts(bundle, output_root):
+                payload_path = Path(output_root) / f"{bundle['store_code']}_payload.json"
+                payload_path.parent.mkdir(parents=True, exist_ok=True)
+                payload_path.write_text("{}", encoding="utf-8")
+                return {"sheet_payload": str(payload_path)}
+
+            with mock.patch.object(weekly_sheet, "load_ordering_config", return_value=config), \
+                 mock.patch.object(weekly_sheet, "load_store_payloads", side_effect=fake_load_store_payloads), \
+                 mock.patch.object(weekly_sheet, "build_ordering_bundle", side_effect=fake_build_ordering_bundle), \
+                 mock.patch.object(weekly_sheet, "write_store_artifacts", side_effect=fake_write_store_artifacts):
+                exit_code = weekly_sheet.main(["--dry-run", "--as-of-date", "2026-04-10"])
+
+            self.assertEqual(exit_code, 1)
+
+            summary_path = Path(tmpdir) / "2026-04-06" / "run_summary.json"
+            summary_rows = json.loads(summary_path.read_text(encoding="utf-8"))
+
+            self.assertEqual([row["store_code"] for row in summary_rows], ["MV", "SV", "NC"])
+
+            mv_row = summary_rows[0]
+            self.assertEqual(mv_row["status"], "ok")
+            self.assertEqual(mv_row["rows"], 1)
+
+            sv_row = summary_rows[1]
+            self.assertEqual(sv_row["status"], "failed")
+            self.assertEqual(sv_row["error_type"], "RuntimeError")
+            self.assertIn("SV timed out", sv_row["error"])
+
+            nc_row = summary_rows[2]
+            self.assertEqual(nc_row["status"], "ok")
+            self.assertEqual(nc_row["rows"], 1)
 
 
 if __name__ == "__main__":

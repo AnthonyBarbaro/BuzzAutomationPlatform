@@ -142,6 +142,13 @@ def build_tab_title(store_code: str, week_of: date, suffix: str) -> str:
     return f"{store_code} {week_of.isoformat()} {suffix}"
 
 
+def build_store_tab_titles(store_code: str, week_of: date, config: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "auto": build_tab_title(store_code, week_of, str(config.get("sheet_names", {}).get("auto_suffix", "Auto"))),
+        "review": build_tab_title(store_code, week_of, str(config.get("sheet_names", {}).get("review_suffix", "Review"))),
+    }
+
+
 def parse_spreadsheet_targets_text(text: str) -> dict[str, str]:
     stripped = str(text or "").strip()
     if not stripped:
@@ -420,10 +427,7 @@ def build_ordering_bundle(
         week_of=week_of,
         snapshot_generated_at=snapshot_generated_at,
     )
-    tab_titles = {
-        "auto": build_tab_title(store_code, week_of, str(config.get("sheet_names", {}).get("auto_suffix", "Auto"))),
-        "review": build_tab_title(store_code, week_of, str(config.get("sheet_names", {}).get("review_suffix", "Review"))),
-    }
+    tab_titles = build_store_tab_titles(store_code, week_of, config)
 
     return {
         "store_code": store_code,
@@ -1163,60 +1167,83 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     snapshot_generated_at = datetime.now(ZoneInfo(tz_name))
     proof_rows: list[dict[str, Any]] = []
+    failed_stores: list[str] = []
     for store_code in store_codes:
-        logger.info("[%s] Building weekly ordering bundle for week %s as of %s", store_code, week_of.isoformat(), as_of_day.isoformat())
-        payloads = load_store_payloads(store_code, as_of_day, config, args.env_file, fixture_root, logger)
-        bundle = build_ordering_bundle(
-            store_code=store_code,
-            week_of=week_of,
-            as_of_day=as_of_day,
-            payloads=payloads,
-            config=config,
-            snapshot_generated_at=snapshot_generated_at,
-            logger=logger,
-        )
-        artifact_paths = write_store_artifacts(bundle, output_root)
-        enabled_tab_titles = [
-            str(bundle["tab_titles"][tab_name])
-            for tab_name in ("auto", "review")
-            if output_flags[tab_name]
-        ]
-        logger.info(
-            "[%s] rows=%s needs_order=%s tabs=%s",
-            store_code,
-            len(bundle["auto_df"]),
-            bundle["logs"]["needs_order_rows"],
-            ", ".join(enabled_tab_titles),
-        )
-        logger.info(
-            "[%s] excluded inventory=%s sales=%s tx=%s",
-            store_code,
-            bundle["logs"]["inventory_exclusion_counts"],
-            bundle["logs"]["sales_exclusion_counts"],
-            bundle["logs"]["transaction_drop_counts"],
-        )
-        write_result = {"mode": "dry-run"}
-        if not args.dry_run:
-            spreadsheet_target = resolve_store_spreadsheet_target(spreadsheet_targets, store_code)
-            write_result = write_store_tabs_to_google_sheet(bundle, spreadsheet_target, config, logger)
-        proof_rows.append(
-            {
-                "store_code": store_code,
-                "tab_auto": bundle["tab_titles"]["auto"],
-                "tab_review": bundle["tab_titles"]["review"],
-                "tab_auto_enabled": output_flags["auto"],
-                "tab_review_enabled": output_flags["review"],
-                "rows": int(len(bundle["auto_df"])),
-                "needs_order_rows": int(bundle["logs"]["needs_order_rows"]),
-                "artifact_payload": artifact_paths["sheet_payload"],
-                "write_result": write_result,
-            }
-        )
+        tab_titles = build_store_tab_titles(store_code, week_of, config)
+        try:
+            logger.info("[%s] Building weekly ordering bundle for week %s as of %s", store_code, week_of.isoformat(), as_of_day.isoformat())
+            payloads = load_store_payloads(store_code, as_of_day, config, args.env_file, fixture_root, logger)
+            bundle = build_ordering_bundle(
+                store_code=store_code,
+                week_of=week_of,
+                as_of_day=as_of_day,
+                payloads=payloads,
+                config=config,
+                snapshot_generated_at=snapshot_generated_at,
+                logger=logger,
+            )
+            artifact_paths = write_store_artifacts(bundle, output_root)
+            enabled_tab_titles = [
+                str(bundle["tab_titles"][tab_name])
+                for tab_name in ("auto", "review")
+                if output_flags[tab_name]
+            ]
+            logger.info(
+                "[%s] rows=%s needs_order=%s tabs=%s",
+                store_code,
+                len(bundle["auto_df"]),
+                bundle["logs"]["needs_order_rows"],
+                ", ".join(enabled_tab_titles),
+            )
+            logger.info(
+                "[%s] excluded inventory=%s sales=%s tx=%s",
+                store_code,
+                bundle["logs"]["inventory_exclusion_counts"],
+                bundle["logs"]["sales_exclusion_counts"],
+                bundle["logs"]["transaction_drop_counts"],
+            )
+            write_result = {"mode": "dry-run"}
+            if not args.dry_run:
+                spreadsheet_target = resolve_store_spreadsheet_target(spreadsheet_targets, store_code)
+                write_result = write_store_tabs_to_google_sheet(bundle, spreadsheet_target, config, logger)
+            proof_rows.append(
+                {
+                    "store_code": store_code,
+                    "status": "ok",
+                    "tab_auto": bundle["tab_titles"]["auto"],
+                    "tab_review": bundle["tab_titles"]["review"],
+                    "tab_auto_enabled": output_flags["auto"],
+                    "tab_review_enabled": output_flags["review"],
+                    "rows": int(len(bundle["auto_df"])),
+                    "needs_order_rows": int(bundle["logs"]["needs_order_rows"]),
+                    "artifact_payload": artifact_paths["sheet_payload"],
+                    "write_result": write_result,
+                }
+            )
+        except Exception as exc:
+            failed_stores.append(store_code)
+            logger.exception("[%s] Failed weekly ordering run: %s", store_code, exc)
+            proof_rows.append(
+                {
+                    "store_code": store_code,
+                    "status": "failed",
+                    "tab_auto": tab_titles["auto"],
+                    "tab_review": tab_titles["review"],
+                    "tab_auto_enabled": output_flags["auto"],
+                    "tab_review_enabled": output_flags["review"],
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+            continue
 
     proof_path = output_root / week_of.isoformat() / "run_summary.json"
     proof_path.parent.mkdir(parents=True, exist_ok=True)
     proof_path.write_text(json.dumps(proof_rows, indent=2, default=str), encoding="utf-8")
     logger.info("Run summary saved to %s", proof_path)
+    if failed_stores:
+        logger.warning("Weekly ordering completed with failures for stores: %s", ", ".join(failed_stores))
+        return 1
     return 0
 
 
