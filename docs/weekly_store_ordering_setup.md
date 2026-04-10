@@ -2,10 +2,12 @@
 
 ## What This Flow Does
 
-`weekly_store_ordering_sheet.py` builds a store-first, Dutchie API-only weekly reorder workbook and writes two tabs per store into one Google Spreadsheet:
+`weekly_store_ordering_sheet.py` builds a store-first, Dutchie API-only weekly reorder workbook and can write up to two tabs per store into one Google Spreadsheet:
 
 - `AUTO`: script-owned reorder output
 - `REVIEW`: same metrics plus preserved staff review columns
+
+Current repo config writes only the `REVIEW` tab to Google Sheets. The `AUTO` tab can be re-enabled later through config without changing code.
 
 The flow is idempotent by store/week. A rerun updates the same:
 
@@ -55,6 +57,12 @@ The sheet summary area is intentionally minimal:
    - `WEEKLY_STORE_ORDERING_SHEET_URL`
    - `weekly_store_ordering_sheet_url.txt`
 
+`weekly_store_ordering_sheet_url.txt` supports either:
+
+- one shared spreadsheet URL/ID for all stores
+- store-specific mappings like `MV=https://...` and `LG=https://...`
+- an optional `DEFAULT=https://...` fallback for stores without an explicit mapping
+
 ## Config
 
 Main config file: [`weekly_store_ordering_config.json`](/home/anthony/projects/BuzzPythonGUI/weekly_store_ordering_config.json)
@@ -64,6 +72,8 @@ Important settings:
 - `stores`: store list used by `--all-stores`
 - `timezone`: default `America/Los_Angeles`
 - `sheet_names.auto_suffix` / `sheet_names.review_suffix`
+- `sheet_outputs.write_auto_tab`: currently `false`; set to `true` to re-enable the Google `AUTO` tab
+- `sheet_outputs.write_review_tab`: currently `true`
 - `eligibility.mode`: default `brand_or_vendor`
 - `eligibility.include_sales_only_rows`: include recent sold items even if current inventory is zero/missing
 - `eligibility.min_units_sold_30d`: default `3`; rows under this 30-day sales floor are excluded from the final ordering tabs
@@ -111,6 +121,12 @@ Live all-store write:
 .venv/bin/python weekly_store_ordering_sheet.py --all-stores
 ```
 
+Create one Google Spreadsheet per store and write their URLs into `weekly_store_ordering_sheet_url.txt`:
+
+```bash
+.venv/bin/python create_weekly_store_ordering_sheets.py
+```
+
 ## Artifacts And Proof
 
 Each run writes proof artifacts under:
@@ -130,6 +146,8 @@ These are written for dry runs and live runs.
 ## Review Preservation
 
 The `REVIEW` tab preserves manual columns on rerun by `Row Key`.
+
+Even when the Google `AUTO` tab is disabled, the local `auto_preview.csv` artifact is still written for proof/debugging.
 
 Current preserved columns:
 

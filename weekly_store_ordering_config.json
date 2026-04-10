@@ -15,6 +15,10 @@
     "auto_suffix": "Auto",
     "review_suffix": "Review"
   },
+  "sheet_outputs": {
+    "write_auto_tab": false,
+    "write_review_tab": true
+  },
   "sales": {
     "window_days": 30,
     "excluded_statuses": [

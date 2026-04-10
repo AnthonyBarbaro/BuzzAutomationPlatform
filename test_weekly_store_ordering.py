@@ -13,7 +13,10 @@ from weekly_store_ordering_sheet import (
     build_ordering_bundle,
     build_tab_title,
     load_ordering_config,
+    parse_spreadsheet_targets_text,
+    resolve_store_spreadsheet_target,
     resolve_week_of,
+    sheet_output_flags,
     sort_ordering_rows,
 )
 from weekly_store_ordering_sheets import build_sheet_matrix, build_summary_rows, merge_preserved_review_columns
@@ -79,6 +82,38 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
         self.assertNotIn("Vendor Beta", inventory_filtered["Vendor"].tolist())
         self.assertEqual(counts["keyword:vendor"], 1)
+
+    def test_spreadsheet_target_text_supports_default_and_store_specific_entries(self):
+        targets = parse_spreadsheet_targets_text(
+            """
+            # Weekly ordering targets
+            DEFAULT=https://docs.google.com/spreadsheets/d/default-sheet-id/edit
+            MV=https://docs.google.com/spreadsheets/d/mv-sheet-id/edit
+            lg=https://docs.google.com/spreadsheets/d/lg-sheet-id/edit
+            """
+        )
+
+        self.assertEqual(
+            resolve_store_spreadsheet_target(targets, "MV"),
+            "https://docs.google.com/spreadsheets/d/mv-sheet-id/edit",
+        )
+        self.assertEqual(
+            resolve_store_spreadsheet_target(targets, "LG"),
+            "https://docs.google.com/spreadsheets/d/lg-sheet-id/edit",
+        )
+        self.assertEqual(
+            resolve_store_spreadsheet_target(targets, "NC"),
+            "https://docs.google.com/spreadsheets/d/default-sheet-id/edit",
+        )
+
+    def test_sheet_output_flags_can_disable_auto_tab_while_keeping_review_enabled(self):
+        config = json.loads(json.dumps(self.config))
+        config["sheet_outputs"] = {
+            "write_auto_tab": False,
+            "write_review_tab": True,
+        }
+
+        self.assertEqual(sheet_output_flags(config), {"auto": False, "review": True})
 
     def test_low_cost_exclusion_uses_cost_only(self):
         config = json.loads(json.dumps(self.config))

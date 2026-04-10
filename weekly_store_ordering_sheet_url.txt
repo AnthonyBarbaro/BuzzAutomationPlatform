@@ -1,0 +1,10 @@
+# Store-specific weekly ordering spreadsheet targets.
+# Format: STORE_CODE=https://docs.google.com/spreadsheets/d/.../edit
+# The weekly ordering job will use the matching store URL for each run.
+
+MV=https://docs.google.com/spreadsheets/d/12nVHHW4lHyWMZrzLUGVJ2Dy5JihYXdPpZ0XaCEeWx08/edit
+LG=https://docs.google.com/spreadsheets/d/1RNqpw3UljZ0qHvglQzR661Q_qc9VH7Ot_1w1pRqSHns/edit
+LM=https://docs.google.com/spreadsheets/d/1cElC4LbgBzDSIhWrTIwuE7Rb9RLd7a437WDzOpBG9Sc/edit
+WP=https://docs.google.com/spreadsheets/d/1uIWe_BaEG2e8lvsKd5gMOzRdro8IA0KA06TzrHvMYaU/edit
+SV=https://docs.google.com/spreadsheets/d/13z6hCZReEYJSlJ04b_BIFLoIcCVXDu-5tQljTQy--7s/edit
+NC=https://docs.google.com/spreadsheets/d/1cD0EpQyp3tWNLcoQg7kt1WqCpjMVv9HDQLJskCuxtss/edit

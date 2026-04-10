@@ -45,6 +45,7 @@ from weekly_store_ordering_sheets import (
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = BASE_DIR / "weekly_store_ordering_config.json"
+DEFAULT_SPREADSHEET_TARGET_KEY = "DEFAULT"
 
 AUTO_COLUMNS = [
     "Row Key",
@@ -87,6 +88,9 @@ def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PA
     config.setdefault("sheet_names", {})
     config["sheet_names"].setdefault("auto_suffix", "Auto")
     config["sheet_names"].setdefault("review_suffix", "Review")
+    config.setdefault("sheet_outputs", {})
+    config["sheet_outputs"].setdefault("write_auto_tab", True)
+    config["sheet_outputs"].setdefault("write_review_tab", True)
     config.setdefault("sales", {})
     config["sales"].setdefault("window_days", 30)
     config["sales"].setdefault("excluded_statuses", ["cancelled", "canceled", "void", "voided", "deleted"])
@@ -112,6 +116,17 @@ def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PA
     return config
 
 
+def sheet_output_flags(config: Mapping[str, Any]) -> dict[str, bool]:
+    outputs = dict(config.get("sheet_outputs", {}) or {})
+    flags = {
+        "auto": bool(outputs.get("write_auto_tab", True)),
+        "review": bool(outputs.get("write_review_tab", True)),
+    }
+    if not any(flags.values()):
+        raise ValueError("At least one weekly ordering sheet tab must be enabled.")
+    return flags
+
+
 def resolve_as_of_day(as_of_text: str | None, tz_name: str) -> date:
     if as_of_text:
         return datetime.fromisoformat(str(as_of_text)).date()
@@ -125,6 +140,85 @@ def resolve_week_of(week_text: str | None, as_of_day: date) -> date:
 
 def build_tab_title(store_code: str, week_of: date, suffix: str) -> str:
     return f"{store_code} {week_of.isoformat()} {suffix}"
+
+
+def parse_spreadsheet_targets_text(text: str) -> dict[str, str]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return {}
+
+    if stripped.startswith("{"):
+        parsed = json.loads(stripped)
+        if isinstance(parsed, str):
+            clean_value = parsed.strip()
+            return {DEFAULT_SPREADSHEET_TARGET_KEY: clean_value} if clean_value else {}
+        if not isinstance(parsed, dict):
+            raise ValueError("Spreadsheet target JSON must be a string or object.")
+
+        targets: dict[str, str] = {}
+        for raw_key, raw_value in parsed.items():
+            key = str(raw_key or "").strip()
+            value = str(raw_value or "").strip()
+            if not key or not value:
+                continue
+            normalized_key = (
+                DEFAULT_SPREADSHEET_TARGET_KEY if key.lower() == "default" else key.upper()
+            )
+            targets[normalized_key] = value
+        return targets
+
+    targets: dict[str, str] = {}
+    plain_lines: list[str] = []
+    for raw_line in stripped.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            plain_lines.append(line)
+            continue
+
+        raw_key, raw_value = line.split("=", 1)
+        key = str(raw_key or "").strip()
+        value = str(raw_value or "").strip()
+        if not key or not value:
+            continue
+        normalized_key = DEFAULT_SPREADSHEET_TARGET_KEY if key.lower() == "default" else key.upper()
+        targets[normalized_key] = value
+
+    if plain_lines:
+        if len(plain_lines) == 1 and not targets:
+            return {DEFAULT_SPREADSHEET_TARGET_KEY: plain_lines[0]}
+        raise ValueError(
+            "Spreadsheet target text must be a single URL/ID or KEY=VALUE lines such as MV=https://... ."
+        )
+
+    return targets
+
+
+def resolve_spreadsheet_targets(args: argparse.Namespace, config: Mapping[str, Any]) -> dict[str, str]:
+    if args.sheet_url:
+        return parse_spreadsheet_targets_text(str(args.sheet_url))
+
+    env_name = str(config.get("spreadsheet_url_env", "")).strip()
+    if env_name and os.environ.get(env_name):
+        return parse_spreadsheet_targets_text(str(os.environ.get(env_name, "")))
+
+    file_name = str(config.get("spreadsheet_url_file", "")).strip()
+    if file_name:
+        path = BASE_DIR / file_name
+        if path.exists():
+            return parse_spreadsheet_targets_text(path.read_text(encoding="utf-8"))
+
+    return {}
+
+
+def resolve_store_spreadsheet_target(spreadsheet_targets: Mapping[str, str], store_code: str) -> str:
+    normalized_store = str(store_code or "").strip().upper()
+    if normalized_store and spreadsheet_targets.get(normalized_store):
+        return str(spreadsheet_targets[normalized_store]).strip()
+    if spreadsheet_targets.get(DEFAULT_SPREADSHEET_TARGET_KEY):
+        return str(spreadsheet_targets[DEFAULT_SPREADSHEET_TARGET_KEY]).strip()
+    return ""
 
 
 def default_store_selection(args: argparse.Namespace, config: Mapping[str, Any]) -> list[str]:
@@ -965,63 +1059,55 @@ def write_store_tabs_to_google_sheet(
     config: Mapping[str, Any],
     logger: logging.Logger,
 ) -> dict[str, Any]:
+    output_flags = sheet_output_flags(config)
     spreadsheet_id, _gid = parse_spreadsheet_target(spreadsheet_target)
     service = authenticate_sheets()
 
-    review_title = str(bundle["tab_titles"]["review"])
-    existing_review_values = read_sheet_values(service, spreadsheet_id, review_title)
-    preserved_review_df = merge_preserved_review_columns(
-        bundle["review_df"],
-        existing_review_values,
-        manual_columns=config.get("review_manual_columns", []),
-    )
-
     summary_rows = build_summary_rows(bundle["summary"])
-    auto_write = upsert_ordering_tab(
-        service=service,
-        spreadsheet_id=spreadsheet_id,
-        title=str(bundle["tab_titles"]["auto"]),
-        summary_rows=summary_rows,
-        df=bundle["auto_df"],
-        sheet_kind="auto",
-        hidden_headers={"Row Key"},
-    )
-    review_write = upsert_ordering_tab(
-        service=service,
-        spreadsheet_id=spreadsheet_id,
-        title=review_title,
-        summary_rows=summary_rows,
-        df=preserved_review_df,
-        sheet_kind="review",
-        hidden_headers={"Row Key"},
-    )
-    logger.info(
-        "[%s] Wrote tabs: %s, %s",
-        bundle["store_code"],
-        auto_write["title"],
-        review_write["title"],
-    )
-    return {
+    write_result: dict[str, Any] = {
         "spreadsheet_id": spreadsheet_id,
-        "auto": auto_write,
-        "review": review_write,
     }
 
+    written_titles: list[str] = []
+    if output_flags["auto"]:
+        auto_write = upsert_ordering_tab(
+            service=service,
+            spreadsheet_id=spreadsheet_id,
+            title=str(bundle["tab_titles"]["auto"]),
+            summary_rows=summary_rows,
+            df=bundle["auto_df"],
+            sheet_kind="auto",
+            hidden_headers={"Row Key"},
+        )
+        write_result["auto"] = auto_write
+        written_titles.append(auto_write["title"])
+    else:
+        write_result["auto"] = {"enabled": False, "title": str(bundle["tab_titles"]["auto"])}
 
-def resolve_spreadsheet_target(args: argparse.Namespace, config: Mapping[str, Any]) -> str:
-    if args.sheet_url:
-        return str(args.sheet_url).strip()
-    env_name = str(config.get("spreadsheet_url_env", "")).strip()
-    if env_name and os.environ.get(env_name):
-        return str(os.environ.get(env_name, "")).strip()
-    file_name = str(config.get("spreadsheet_url_file", "")).strip()
-    if file_name:
-        path = BASE_DIR / file_name
-        if path.exists():
-            text = path.read_text(encoding="utf-8").strip()
-            if text:
-                return text
-    return ""
+    if output_flags["review"]:
+        review_title = str(bundle["tab_titles"]["review"])
+        existing_review_values = read_sheet_values(service, spreadsheet_id, review_title)
+        preserved_review_df = merge_preserved_review_columns(
+            bundle["review_df"],
+            existing_review_values,
+            manual_columns=config.get("review_manual_columns", []),
+        )
+        review_write = upsert_ordering_tab(
+            service=service,
+            spreadsheet_id=spreadsheet_id,
+            title=review_title,
+            summary_rows=summary_rows,
+            df=preserved_review_df,
+            sheet_kind="review",
+            hidden_headers={"Row Key"},
+        )
+        write_result["review"] = review_write
+        written_titles.append(review_write["title"])
+    else:
+        write_result["review"] = {"enabled": False, "title": str(bundle["tab_titles"]["review"])}
+
+    logger.info("[%s] Wrote tabs: %s", bundle["store_code"], ", ".join(written_titles))
+    return write_result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1052,6 +1138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     config = load_ordering_config(args.config)
+    output_flags = sheet_output_flags(config)
     logger = configure_logging(args.log_level)
     tz_name = str(config.get("timezone", "America/Los_Angeles"))
     as_of_day = resolve_as_of_day(args.as_of_date, tz_name)
@@ -1059,10 +1146,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     store_codes = default_store_selection(args, config)
     fixture_root = Path(args.fixture_root).resolve() if args.fixture_root else None
     output_root = Path(args.output_root or config.get("output_root", "reports/store_weekly_ordering")).resolve()
-    spreadsheet_target = resolve_spreadsheet_target(args, config)
+    spreadsheet_targets = resolve_spreadsheet_targets(args, config)
 
-    if not args.dry_run and not spreadsheet_target:
-        parser.error("Google Sheets target missing. Provide --sheet-url or configure the sheet target in the config.")
+    if not args.dry_run:
+        missing_targets = [code for code in store_codes if not resolve_store_spreadsheet_target(spreadsheet_targets, code)]
+        if missing_targets:
+            if len(missing_targets) == len(store_codes):
+                parser.error(
+                    "Google Sheets target missing. Provide --sheet-url or configure the sheet target in the config."
+                )
+            parser.error(
+                "Missing Google Sheets targets for stores: "
+                + ", ".join(missing_targets)
+                + ". Add store-specific targets or a DEFAULT target."
+            )
 
     snapshot_generated_at = datetime.now(ZoneInfo(tz_name))
     proof_rows: list[dict[str, Any]] = []
@@ -1079,13 +1176,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger=logger,
         )
         artifact_paths = write_store_artifacts(bundle, output_root)
+        enabled_tab_titles = [
+            str(bundle["tab_titles"][tab_name])
+            for tab_name in ("auto", "review")
+            if output_flags[tab_name]
+        ]
         logger.info(
-            "[%s] rows=%s needs_order=%s tabs=%s / %s",
+            "[%s] rows=%s needs_order=%s tabs=%s",
             store_code,
             len(bundle["auto_df"]),
             bundle["logs"]["needs_order_rows"],
-            bundle["tab_titles"]["auto"],
-            bundle["tab_titles"]["review"],
+            ", ".join(enabled_tab_titles),
         )
         logger.info(
             "[%s] excluded inventory=%s sales=%s tx=%s",
@@ -1096,12 +1197,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         write_result = {"mode": "dry-run"}
         if not args.dry_run:
+            spreadsheet_target = resolve_store_spreadsheet_target(spreadsheet_targets, store_code)
             write_result = write_store_tabs_to_google_sheet(bundle, spreadsheet_target, config, logger)
         proof_rows.append(
             {
                 "store_code": store_code,
                 "tab_auto": bundle["tab_titles"]["auto"],
                 "tab_review": bundle["tab_titles"]["review"],
+                "tab_auto_enabled": output_flags["auto"],
+                "tab_review_enabled": output_flags["review"],
                 "rows": int(len(bundle["auto_df"])),
                 "needs_order_rows": int(bundle["logs"]["needs_order_rows"]),
                 "artifact_payload": artifact_paths["sheet_payload"],
