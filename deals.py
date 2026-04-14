@@ -618,6 +618,12 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.50,
            'kickback': 0.30,
            'brands': ['LIME |']},
+    'Decibel': {'vendors': ['Decibel Enterprise Inc.'],
+           'days': ['Saturday'], #Started March 2
+           'discount': 0.50,
+           'kickback': 0.25,
+           'stores': ['MV','SV'],
+           'brands': ['Decibel |']},
 }
 
 brand_criteria = DEFAULT_BRAND_CRITERIA
@@ -913,7 +919,9 @@ def _contains_any(haystack_series, needles):
     if not needles:
         return haystack_series.notna()  # no-op
     s = haystack_series.astype(str).str.lower()
-    return s.apply(lambda x: any(n in x for n in needles))
+    if s.empty:
+        return pd.Series(index=s.index, dtype=bool)
+    return s.apply(lambda x: any(n in x for n in needles)).astype(bool)
 
 def filter_by_rule(df, rule):
     """
