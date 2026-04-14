@@ -6,6 +6,7 @@ from pathlib import Path
 
 from deals_brand_config_sync import authenticate_sheets
 from dutchie_api_reports import STORE_CODES
+from weekly_store_ordering_sheets import upsert_readme_tab
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -54,6 +55,13 @@ def create_spreadsheet(service, store_code: str, store_name: str, title_prefix: 
     ).execute()
     spreadsheet_id = str(result.get("spreadsheetId", "")).strip()
     spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit" if spreadsheet_id else ""
+    if spreadsheet_id:
+        upsert_readme_tab(
+            service=service,
+            spreadsheet_id=spreadsheet_id,
+            store_code=store_code,
+            store_name=store_name,
+        )
     return spreadsheet_id, spreadsheet_url
 
 

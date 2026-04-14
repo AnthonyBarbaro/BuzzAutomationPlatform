@@ -37,8 +37,10 @@ from weekly_store_ordering_sheets import (
     authenticate_sheets,
     build_summary_rows,
     merge_preserved_review_columns,
+    move_latest_tabs_next_to_readme,
     parse_spreadsheet_target,
     read_sheet_values,
+    upsert_readme_tab,
     upsert_ordering_tab,
 )
 
@@ -1109,6 +1111,28 @@ def write_store_tabs_to_google_sheet(
         written_titles.append(review_write["title"])
     else:
         write_result["review"] = {"enabled": False, "title": str(bundle["tab_titles"]["review"])}
+
+    store_name = bmp._store_name_from_abbr(str(bundle["store_code"]))
+    readme_write = upsert_readme_tab(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        store_code=str(bundle["store_code"]),
+        store_name=store_name,
+        output_flags=output_flags,
+        week_of=str(bundle["week_of"]),
+        tab_titles=bundle["tab_titles"],
+        manual_columns=config.get("review_manual_columns", []),
+        snapshot_generated_at=str(bundle["snapshot_generated_at"]),
+    )
+    write_result["readme"] = readme_write
+
+    latest_tab_order = []
+    if output_flags["review"]:
+        latest_tab_order.append(str(bundle["tab_titles"]["review"]))
+    if output_flags["auto"]:
+        latest_tab_order.append(str(bundle["tab_titles"]["auto"]))
+    moved_titles = move_latest_tabs_next_to_readme(service, spreadsheet_id, latest_tab_order)
+    write_result["front_tab_order"] = ["README"] + moved_titles
 
     logger.info("[%s] Wrote tabs: %s", bundle["store_code"], ", ".join(written_titles))
     return write_result

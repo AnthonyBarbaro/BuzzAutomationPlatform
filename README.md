@@ -195,15 +195,44 @@ Start with inventory calls disabled:
 ```
 
 ### 2f) Weekly store ordering sheets
+What this flow does:
+- Builds weekly reorder tabs from live Dutchie API data
+- Uses the store list in `weekly_store_ordering_config.json` when you run `--all-stores`
+- Defaults `--as-of-date` to today in `America/Los_Angeles`
+- Defaults `--week` to the Monday of the chosen `--as-of-date`
+- Updates the same store/week tabs on rerun instead of creating duplicates
+
+Before the first live run, make sure you have:
+- Dutchie API keys in `.env`
+- `credentials.json` and `token_sheets.json` for Google Sheets access
+- `weekly_store_ordering_sheet_url.txt` or `WEEKLY_STORE_ORDERING_SHEET_URL` pointing to the target spreadsheet(s)
+
 Dry-run with the bundled fixture:
 ```bash
 .venv/bin/python weekly_store_ordering_sheet.py --store MV --week 2026-03-30 --as-of-date 2026-04-03 --fixture-root tests/fixtures/weekly_store_ordering --dry-run
+```
+
+Dry-run against the live store list without writing to Google Sheets:
+```bash
+.venv/bin/python weekly_store_ordering_sheet.py --all-stores --dry-run --week 2026-04-13 --as-of-date 2026-04-14
+```
+
+Live single-store write:
+```bash
+.venv/bin/python weekly_store_ordering_sheet.py --store MV --week 2026-04-13 --as-of-date 2026-04-14
 ```
 
 Live all-store write:
 ```bash
 .venv/bin/python weekly_store_ordering_sheet.py --all-stores
 ```
+
+Outputs to check after a run:
+- `reports/store_weekly_ordering/<week_of>/run_summary.json`
+- `reports/store_weekly_ordering/<week_of>/<STORE>/review_preview.csv`
+- `reports/store_weekly_ordering/<week_of>/<STORE>/sheet_payload.json`
+
+Current repo config writes the `Review` tab to Google Sheets. Local proof artifacts are still written for every run.
 
 Setup and cron details:
 - [`docs/weekly_store_ordering_setup.md`](/home/anthony/projects/BuzzPythonGUI/docs/weekly_store_ordering_setup.md)

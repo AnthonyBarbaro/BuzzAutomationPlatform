@@ -45,6 +45,123 @@ def build_sheet_matrix(summary_rows: Sequence[Sequence[Any]], df: pd.DataFrame) 
     return rows, header_row_number
 
 
+def build_readme_rows(
+    store_code: str,
+    store_name: str,
+    output_flags: Mapping[str, Any] | None = None,
+    week_of: str | None = None,
+    tab_titles: Mapping[str, Any] | None = None,
+    manual_columns: Sequence[str] | None = None,
+    snapshot_generated_at: str | None = None,
+) -> list[list[Any]]:
+    normalized_store = str(store_code or "").strip().upper()
+    clean_store_name = str(store_name or "").strip()
+    store_label = f"{normalized_store} - {clean_store_name}" if clean_store_name else normalized_store
+
+    enabled_outputs = {str(key).strip().lower(): bool(value) for key, value in (output_flags or {}).items()}
+    clean_tab_titles = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in (tab_titles or {}).items()
+        if str(value or "").strip()
+    }
+    clean_manual_columns = [str(value).strip() for value in (manual_columns or []) if str(value).strip()]
+
+    latest_review_title = clean_tab_titles.get("review", "Created on the next live run.")
+    latest_week = str(week_of or "").strip() or "Populated after the first live run."
+    latest_snapshot = str(snapshot_generated_at or "").strip() or "Updated on the next live run."
+
+    if not enabled_outputs:
+        current_output = "Google Sheet output is controlled by the repo config. The next live run will refresh this note."
+    elif enabled_outputs.get("auto") and enabled_outputs.get("review"):
+        current_output = "This repo currently writes both the AUTO and REVIEW tabs to Google Sheets."
+    elif enabled_outputs.get("auto"):
+        current_output = "This repo currently writes the AUTO tab to Google Sheets."
+    else:
+        current_output = "This repo currently writes the REVIEW tab to Google Sheets."
+
+    latest_tabs: list[str] = []
+    for tab_kind in ("review", "auto"):
+        title = clean_tab_titles.get(tab_kind)
+        if title:
+            latest_tabs.append(f"- {title}")
+    latest_tabs_text = "\n".join(latest_tabs) if latest_tabs else "Generated week tabs will appear here after the first live run."
+
+    manual_columns_text = (
+        ", ".join(clean_manual_columns)
+        if clean_manual_columns
+        else (
+            "Shelf Count Checked, Proposed Order Qty, Final Approved Qty, Ordered?, "
+            "Buyer Initials, Reviewer Initials, Cross-Check Status, Notes, PO / Vendor Ref"
+        )
+    )
+
+    start_here = "\n".join(
+        [
+            "1. Open the newest generated tab for the current week, usually REVIEW.",
+            "2. Use the filter arrows on the header row. Filters are already turned on for the weekly tab.",
+            "3. Work one vendor at a time so the PO stays clean and easy to review.",
+        ]
+    )
+    vendor_brand_guide = (
+        "Filter Vendor to the company you are ordering from first. If that vendor carries multiple brands, "
+        "keep Vendor filtered and then use Brand to narrow the list further."
+    )
+    filter_stack = "\n".join(
+        [
+            "Recommended filter order:",
+            "Vendor -> Brand -> Needs Order = Y",
+            "Then optionally narrow by Reorder Priority or Category.",
+        ]
+    )
+    read_suggestions = (
+        "Use Available, Units Sold 7d/14d/30d, Avg Daily Sold 14d, Days of Supply, "
+        "Suggested Order Qty, and Reorder Notes / Reason to sanity-check each item."
+    )
+    order_workflow = "\n".join(
+        [
+            "1. Check shelf and backstock counts before ordering.",
+            "2. Fill Shelf Count Checked if the physical count differs from the sheet.",
+            "3. Use Proposed Order Qty for your first pass.",
+            "4. Set Final Approved Qty for what you actually want to buy.",
+            "5. Mark Ordered?, add initials, notes, and PO / Vendor Ref after the order is placed.",
+        ]
+    )
+    rerun_safety = (
+        "Reruns for the same week update the script-owned columns but preserve the manual review columns, "
+        "so you can refresh demand data without losing buyer notes."
+    )
+
+    return [
+        ["Buzz Weekly Store Ordering", ""],
+        ["Store", store_label],
+        [
+            "Use This Workbook For",
+            "Review weekly reorder suggestions for this store and capture final buying decisions in the weekly ordering tabs.",
+        ],
+        ["Start Here", start_here],
+        ["Pick A Vendor Or Brand", vendor_brand_guide],
+        ["Recommended Filters", filter_stack],
+        ["How To Read The Suggestions", read_suggestions],
+        ["How To Work The Order", order_workflow],
+        ["Current Google Sheet Output", current_output],
+        ["Latest Week Generated", latest_week],
+        ["Latest Snapshot Generated At", latest_snapshot],
+        ["Latest Review Tab", latest_review_title],
+        ["Latest Weekly Tabs", latest_tabs_text],
+        ["Rerun Safety", rerun_safety],
+        ["Manual Columns Preserved On Rerun", manual_columns_text],
+        [
+            "Do Not Edit",
+            "Row Key or the script-owned metric columns. Those values are regenerated and may change on rerun.",
+        ],
+        [
+            "Run Defaults",
+            "If you omit dates, the script uses today in America/Los_Angeles and the Monday of that week.",
+        ],
+        ["Data Source", "Dutchie API inventory, product, and transaction data."],
+    ]
+
+
 def merge_preserved_review_columns(
     review_df: pd.DataFrame,
     existing_values: Sequence[Sequence[Any]] | None,
@@ -112,6 +229,60 @@ def read_sheet_values(service: Any, spreadsheet_id: str, title: str) -> list[lis
         return []
 
 
+def upsert_readme_tab(
+    service: Any,
+    spreadsheet_id: str,
+    store_code: str,
+    store_name: str,
+    output_flags: Mapping[str, Any] | None = None,
+    week_of: str | None = None,
+    tab_titles: Mapping[str, Any] | None = None,
+    manual_columns: Sequence[str] | None = None,
+    snapshot_generated_at: str | None = None,
+    title: str = "README",
+) -> dict[str, Any]:
+    sheet_info = ensure_sheet(service, spreadsheet_id, title, "readme")
+    values = build_readme_rows(
+        store_code=store_code,
+        store_name=store_name,
+        output_flags=output_flags,
+        week_of=week_of,
+        tab_titles=tab_titles,
+        manual_columns=manual_columns,
+        snapshot_generated_at=snapshot_generated_at,
+    )
+    total_rows = max(len(values), 1)
+    total_columns = max(max((len(row) for row in values), default=0), 2)
+
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=_sheet_range(title),
+        body={},
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=_sheet_start_range(title),
+        valueInputOption="RAW",
+        body={"values": values},
+    ).execute()
+
+    refreshed_info = get_sheet_info_by_title(service, spreadsheet_id, title)
+    if not refreshed_info:
+        raise RuntimeError(f"Unable to reload sheet metadata for {title}.")
+    _format_readme_sheet(
+        service=service,
+        spreadsheet_id=spreadsheet_id,
+        sheet_info=refreshed_info,
+        total_rows=total_rows,
+        total_columns=total_columns,
+    )
+    return {
+        "title": title,
+        "sheet_id": sheet_info["sheet_id"],
+        "rows_written": len(values),
+    }
+
+
 def upsert_ordering_tab(
     service: Any,
     spreadsheet_id: str,
@@ -162,6 +333,52 @@ def upsert_ordering_tab(
         "header_row_number": header_row_number,
         "rows_written": max(len(df), 0),
     }
+
+
+def move_sheet_to_index(service: Any, spreadsheet_id: str, title: str, index: int) -> None:
+    sheet_info = get_sheet_info_by_title(service, spreadsheet_id, title)
+    if not sheet_info or sheet_info.get("sheet_id") is None:
+        return
+
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": int(sheet_info["sheet_id"]),
+                            "index": max(int(index), 0),
+                        },
+                        "fields": "index",
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+
+def move_latest_tabs_next_to_readme(
+    service: Any,
+    spreadsheet_id: str,
+    titles: Sequence[str],
+    readme_title: str = "README",
+) -> list[str]:
+    ordered_titles: list[str] = []
+    seen: set[str] = set()
+    for raw_title in titles:
+        title = str(raw_title or "").strip()
+        if not title or title == readme_title or title in seen:
+            continue
+        ordered_titles.append(title)
+        seen.add(title)
+
+    move_sheet_to_index(service, spreadsheet_id, readme_title, 0)
+    next_index = 1
+    for title in ordered_titles:
+        move_sheet_to_index(service, spreadsheet_id, title, next_index)
+        next_index += 1
+    return ordered_titles
 
 
 def ensure_sheet(service: Any, spreadsheet_id: str, title: str, sheet_kind: str) -> dict[str, Any]:
@@ -443,6 +660,176 @@ def _format_ordering_sheet(
     )
     requests.extend(_conditional_format_requests(sheet_id, headers, total_rows, header_row_number))
     requests.extend(_hidden_column_requests(sheet_id, headers, hidden_headers))
+
+    if requests:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests},
+        ).execute()
+
+
+def _format_readme_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    sheet_info: Mapping[str, Any],
+    total_rows: int,
+    total_columns: int,
+) -> None:
+    sheet_id = int(sheet_info["sheet_id"])
+    requests: list[dict[str, Any]] = []
+
+    for banded_range in sheet_info.get("banded_ranges", []):
+        banded_range_id = banded_range.get("bandedRangeId")
+        if banded_range_id is not None:
+            requests.append({"deleteBanding": {"bandedRangeId": banded_range_id}})
+
+    conditional_rules = list(sheet_info.get("conditional_rules", []))
+    for index in range(len(conditional_rules) - 1, -1, -1):
+        requests.append(
+            {
+                "deleteConditionalFormatRule": {
+                    "sheetId": sheet_id,
+                    "index": index,
+                }
+            }
+        )
+
+    requests.append(
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"frozenRowCount": 1},
+                    "tabColor": _tab_color("readme"),
+                },
+                "fields": "gridProperties.frozenRowCount,tabColor",
+            }
+        }
+    )
+
+    requests.append(
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": total_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": total_columns,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _rgb("#FFFFFF"),
+                        "horizontalAlignment": "LEFT",
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
+                        "textFormat": {"fontSize": 10},
+                    }
+                },
+                "fields": (
+                    "userEnteredFormat(backgroundColor,horizontalAlignment,"
+                    "verticalAlignment,wrapStrategy,textFormat)"
+                ),
+            }
+        }
+    )
+    requests.append(
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": total_columns,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _rgb("#F6EDD9"),
+                        "textFormat": {"bold": True, "fontSize": 14},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        }
+    )
+    requests.append(
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": total_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _rgb("#F7F7F7"),
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        }
+    )
+    requests.append(
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,
+                    "endIndex": 1,
+                },
+                "properties": {"pixelSize": 240},
+                "fields": "pixelSize",
+            }
+        }
+    )
+    requests.append(
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 1,
+                    "endIndex": 2,
+                },
+                "properties": {"pixelSize": 620},
+                "fields": "pixelSize",
+            }
+        }
+    )
+    requests.append(
+        {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": 1,
+                },
+                "properties": {"pixelSize": 38},
+                "fields": "pixelSize",
+            }
+        }
+    )
+    if total_rows > 1:
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": 1,
+                        "endIndex": total_rows,
+                    },
+                    "properties": {"pixelSize": 60},
+                    "fields": "pixelSize",
+                }
+            }
+        )
 
     if requests:
         service.spreadsheets().batchUpdate(
@@ -810,7 +1197,12 @@ def _sheet_range(title: str) -> str:
 
 
 def _tab_color(sheet_kind: str) -> dict[str, float]:
-    return _rgb("#4B6A4F" if sheet_kind.lower() == "auto" else "#356A8A")
+    kind = sheet_kind.lower()
+    if kind == "auto":
+        return _rgb("#4B6A4F")
+    if kind == "readme":
+        return _rgb("#8A6B3D")
+    return _rgb("#356A8A")
 
 
 def _rgb(hex_color: str) -> dict[str, float]:
@@ -848,12 +1240,16 @@ def _column_letter(column_number: int) -> str:
 
 __all__ = [
     "authenticate_sheets",
+    "build_readme_rows",
     "build_sheet_matrix",
     "build_summary_rows",
     "ensure_sheet",
     "get_sheet_info_by_title",
     "merge_preserved_review_columns",
+    "move_latest_tabs_next_to_readme",
+    "move_sheet_to_index",
     "parse_spreadsheet_target",
     "read_sheet_values",
+    "upsert_readme_tab",
     "upsert_ordering_tab",
 ]

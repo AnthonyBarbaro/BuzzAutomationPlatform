@@ -64,6 +64,56 @@ The sheet summary area is intentionally minimal:
 - store-specific mappings like `MV=https://...` and `LG=https://...`
 - an optional `DEFAULT=https://...` fallback for stores without an explicit mapping
 
+## Quick Start
+
+Use this section if you just want to know how to run the weekly ordering flow safely.
+
+Default behavior:
+
+- `--all-stores` uses the `stores` list from `weekly_store_ordering_config.json`
+- if you omit `--as-of-date`, the script uses today in `America/Los_Angeles`
+- if you omit `--week`, the script uses the Monday of the chosen `--as-of-date`
+- rerunning the same store/week updates the same tabs instead of creating duplicates
+- current repo config writes only the `REVIEW` tab to Google Sheets
+
+Recommended operator flow:
+
+1. Confirm `.env`, `credentials.json`, `token_sheets.json`, and `weekly_store_ordering_sheet_url.txt` are present.
+2. Run a dry run first so you can inspect the generated proof files without touching Google Sheets.
+3. If the output looks right, run one store live.
+4. Then run all stores live.
+
+Safe all-store dry run:
+
+```bash
+.venv/bin/python weekly_store_ordering_sheet.py \
+  --all-stores \
+  --dry-run \
+  --week 2026-04-13 \
+  --as-of-date 2026-04-14
+```
+
+Live single-store validation run:
+
+```bash
+.venv/bin/python weekly_store_ordering_sheet.py \
+  --store MV \
+  --week 2026-04-13 \
+  --as-of-date 2026-04-14
+```
+
+Live all-store run:
+
+```bash
+.venv/bin/python weekly_store_ordering_sheet.py --all-stores
+```
+
+Where to look after a run:
+
+- `reports/store_weekly_ordering/<week_of>/run_summary.json`
+- `reports/store_weekly_ordering/<week_of>/<STORE>/review_preview.csv`
+- `reports/store_weekly_ordering/<week_of>/<STORE>/sheet_payload.json`
+
 ## Config
 
 Main config file: [`weekly_store_ordering_config.json`](/home/anthony/projects/BuzzPythonGUI/weekly_store_ordering_config.json)

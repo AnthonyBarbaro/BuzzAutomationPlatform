@@ -22,7 +22,7 @@ from weekly_store_ordering_sheet import (
     sheet_output_flags,
     sort_ordering_rows,
 )
-from weekly_store_ordering_sheets import build_sheet_matrix, build_summary_rows, merge_preserved_review_columns
+from weekly_store_ordering_sheets import build_readme_rows, build_sheet_matrix, build_summary_rows, merge_preserved_review_columns, move_latest_tabs_next_to_readme
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "tests" / "fixtures" / "weekly_store_ordering"
@@ -117,6 +117,50 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         }
 
         self.assertEqual(sheet_output_flags(config), {"auto": False, "review": True})
+
+    def test_build_readme_rows_includes_latest_review_tab_and_manual_columns(self):
+        rows = build_readme_rows(
+            store_code="NC",
+            store_name="National City",
+            output_flags={"auto": False, "review": True},
+            week_of="2026-04-13",
+            tab_titles={"review": "NC 2026-04-13 Review"},
+            manual_columns=["Shelf Count Checked", "Final Approved Qty", "Notes"],
+            snapshot_generated_at="2026-04-14T08:05:00-07:00",
+        )
+
+        self.assertEqual(rows[0][0], "Buzz Weekly Store Ordering")
+        self.assertIn(["Store", "NC - National City"], rows)
+        self.assertIn(["Latest Week Generated", "2026-04-13"], rows)
+        self.assertIn(["Latest Review Tab", "NC 2026-04-13 Review"], rows)
+        self.assertIn(["Current Google Sheet Output", "This repo currently writes the REVIEW tab to Google Sheets."], rows)
+        vendor_row = next(row for row in rows if row[0] == "Pick A Vendor Or Brand")
+        self.assertIn("Filter Vendor", vendor_row[1])
+        filter_row = next(row for row in rows if row[0] == "Recommended Filters")
+        self.assertIn("Needs Order = Y", filter_row[1])
+        manual_row = next(row for row in rows if row[0] == "Manual Columns Preserved On Rerun")
+        self.assertIn("Shelf Count Checked", manual_row[1])
+        self.assertIn("Final Approved Qty", manual_row[1])
+        self.assertIn("Notes", manual_row[1])
+
+    def test_move_latest_tabs_next_to_readme_keeps_readme_first_and_dedupes_titles(self):
+        service = object()
+        with mock.patch("weekly_store_ordering_sheets.move_sheet_to_index") as mock_move:
+            ordered_titles = move_latest_tabs_next_to_readme(
+                service,
+                "spreadsheet-123",
+                ["NC 2026-04-13 Review", "NC 2026-04-13 Auto", "NC 2026-04-13 Review"],
+            )
+
+        self.assertEqual(ordered_titles, ["NC 2026-04-13 Review", "NC 2026-04-13 Auto"])
+        self.assertEqual(
+            mock_move.call_args_list,
+            [
+                mock.call(service, "spreadsheet-123", "README", 0),
+                mock.call(service, "spreadsheet-123", "NC 2026-04-13 Review", 1),
+                mock.call(service, "spreadsheet-123", "NC 2026-04-13 Auto", 2),
+            ],
+        )
 
     def test_low_cost_exclusion_uses_cost_only(self):
         config = json.loads(json.dumps(self.config))
