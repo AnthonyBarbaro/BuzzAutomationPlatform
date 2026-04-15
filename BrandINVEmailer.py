@@ -27,6 +27,7 @@ import shutil
 import re
 import pandas as pd
 import time
+from dotenv import load_dotenv
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
@@ -43,12 +44,17 @@ from inventory_order_reports import (
 # ------------------------- CONFIG / CONSTANTS ----------------------------------
 # ------------------------------------------------------------------------------
 
+load_dotenv()
+BASE_DIR = os.getenv(
+    "BASE_DIR",
+    os.path.dirname(os.path.abspath(__file__)),
+)
+
 # Folders for CSV input and XLSX output
-INPUT_DIRECTORY = "files"       # Where CSVs land
-LOCAL_REPORTS_FOLDER = "brand_reports_tmp"  # Local subfolder for generated reports
-INVENTORY_LINKS_DIR = "inventory_links"
-BASE_DIR = "/home/anthony/projects/BuzzPythonGUI"
-BRAND_CONFIG_JSON = "brand_config2.json"
+INPUT_DIRECTORY = os.path.join(BASE_DIR, "files")       # Where CSVs land
+LOCAL_REPORTS_FOLDER = os.path.join(BASE_DIR, "brand_reports_tmp")  # Local subfolder for generated reports
+INVENTORY_LINKS_DIR = os.path.join(BASE_DIR, "inventory_links")
+BRAND_CONFIG_JSON = os.path.join(BASE_DIR, "brand_config2.json")
 CATALOG_API_SCRIPT = "getCatalog.py"
 CATALOG_BROWSER_SCRIPT = "getCatalog_browser.py"
 ORDER_REPORT_API_SCRIPT = "getInventoryOrderReport_api.py"
@@ -63,9 +69,9 @@ ORDER_REPORT_FILE_PATTERN = re.compile(
 DRIVE_PARENT_FOLDER_NAME = "INVENTORY"
 
 # OAuth credential files
-CREDENTIALS_FILE = "credentials.json"
-TOKEN_DRIVE_FILE = "token_drive.json"   # Stores Drive API tokens
-TOKEN_GMAIL_FILE = "token_gmail.json"   # Stores Gmail API tokens
+CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
+TOKEN_DRIVE_FILE = os.path.join(BASE_DIR, "token_drive.json")   # Stores Drive API tokens
+TOKEN_GMAIL_FILE = os.path.join(BASE_DIR, "token_gmail.json")   # Stores Gmail API tokens
 
 # Google Drive API Scopes
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
