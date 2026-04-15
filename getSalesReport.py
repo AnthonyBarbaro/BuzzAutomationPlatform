@@ -29,6 +29,8 @@ from login import username, password
 
 CONFIG_FILE = "config.txt"
 INPUT_COLUMNS = ['Available', 'Product', 'Category', 'Brand']
+BROWSER_EXPORT_MAX_WINDOW_DAYS = 30
+EXPORT_HEADER_ROW_INDEX = 4
 
 store_abbr_map = {
     "Buzz Cannabis - Mission Valley": "MV",
@@ -57,6 +59,36 @@ LOADING_SELECTORS = [
     "[data-testid='loading-spinner_icon']",
     "[aria-label='Loading'][aria-valuetext='Loading']",
 ]
+
+
+def _files_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+
+
+def _coerce_report_datetime(value):
+    if isinstance(value, datetime):
+        return datetime(value.year, value.month, value.day)
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day"):
+        return datetime(value.year, value.month, value.day)
+    raise TypeError(f"Unsupported date value: {value!r}")
+
+
+def _iter_export_chunks(start_date, end_date, max_days=BROWSER_EXPORT_MAX_WINDOW_DAYS):
+    start_dt = _coerce_report_datetime(start_date)
+    end_dt = _coerce_report_datetime(end_date)
+
+    if end_dt < start_dt:
+        return []
+
+    chunks = []
+    window_days = max(1, int(max_days))
+    chunk_start = start_dt
+    while chunk_start <= end_dt:
+        chunk_end = min(chunk_start + timedelta(days=window_days - 1), end_dt)
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end + timedelta(days=1)
+
+    return chunks
 
 
 def _is_loading_data_visible():
@@ -399,22 +431,66 @@ def _snapshot_files(folder_path):
             continue
     return snap
 
+
 def _expected_store_filename(current_store):
-    if current_store == "Buzz Cannabis - Mission Valley":
-        return "salesMV.xlsx"
-    if current_store == "Buzz Cannabis-La Mesa":
-        return "salesLM.xlsx"
-    if current_store == "Buzz Cannabis - SORRENTO VALLEY":
-        return "salesSV.xlsx"
-    if current_store == "Buzz Cannabis - Lemon Grove":
-        return "salesLG.xlsx"
-    if current_store == "Buzz Cannabis (National City)":
-        return "salesNC.xlsx"
-    if current_store == "Buzz Cannabis Wildomar Palomar":
-        return "salesWP.xlsx"
+    store_code = store_abbr_map.get(current_store)
+    if store_code:
+        return f"sales{store_code}.xlsx"
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", current_store).strip("_")
     return f"sales_{safe_name}_{timestamp}.xlsx"
+
+
+def _chunk_store_filename(current_store, chunk_start, chunk_end, chunk_index, total_chunks, run_token):
+    store_code = store_abbr_map.get(current_store)
+    if store_code:
+        return (
+            f"sales{store_code}__part_{chunk_index:02d}_of_{total_chunks:02d}"
+            f"_{chunk_start:%Y%m%d}_to_{chunk_end:%Y%m%d}_{run_token}.xlsx"
+        )
+
+    safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", current_store).strip("_")
+    return (
+        f"sales_{safe_name}__part_{chunk_index:02d}_of_{total_chunks:02d}"
+        f"_{chunk_start:%Y%m%d}_to_{chunk_end:%Y%m%d}_{run_token}.xlsx"
+    )
+
+
+def _read_export_dataframe(file_path):
+    frame = pd.read_excel(file_path, header=EXPORT_HEADER_ROW_INDEX)
+    frame = frame.dropna(how="all")
+    return frame.reset_index(drop=True)
+
+
+def _write_merged_export(frame, output_path):
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, startrow=EXPORT_HEADER_ROW_INDEX)
+
+
+def _merge_export_chunk_files(chunk_paths, output_path):
+    merged_frames = []
+    export_columns = None
+
+    for chunk_path in chunk_paths:
+        chunk_frame = _read_export_dataframe(chunk_path)
+        if export_columns is None:
+            export_columns = list(chunk_frame.columns)
+        if export_columns:
+            chunk_frame = chunk_frame.reindex(columns=export_columns)
+        merged_frames.append(chunk_frame)
+
+    if export_columns is None:
+        export_columns = []
+
+    merged_frame = (
+        pd.concat(merged_frames, ignore_index=True)
+        if merged_frames
+        else pd.DataFrame(columns=export_columns)
+    )
+
+    _write_merged_export(merged_frame, output_path)
+    return len(merged_frame)
+
 
 def _wait_for_downloaded_export(files_dir, before_snapshot, timeout=EXPORT_DOWNLOAD_TIMEOUT_SECONDS):
     """
@@ -448,10 +524,11 @@ def _wait_for_downloaded_export(files_dir, before_snapshot, timeout=EXPORT_DOWNL
         time.sleep(1)
     return None
 
-def clickActionsAndExport(current_store):
+
+def clickActionsAndExport(current_store, target_filename=None):
     try:
         print(f"\n=== Exporting data for store: {current_store} ===")
-        files_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+        files_dir = _files_dir()
         os.makedirs(files_dir, exist_ok=True)
 
         # Capture initial state of the download folder
@@ -478,7 +555,7 @@ def clickActionsAndExport(current_store):
             return False
 
         print(f"Export file detected: {os.path.basename(exported_path)}")
-        new_filename = _expected_store_filename(current_store)
+        new_filename = target_filename or _expected_store_filename(current_store)
         new_path = os.path.join(files_dir, new_filename)
 
         # Replace old target if present, then move into canonical store filename.
@@ -502,18 +579,87 @@ def clickActionsAndExport(current_store):
         print(f"An error occurred during export: {traceback.format_exc()}")
         return False
 
-def export_store_with_retries(current_store, start_date, end_date, attempts=EXPORT_ATTEMPTS_PER_STORE):
+
+def export_store_with_retries(current_store, start_date, end_date, target_filename=None, attempts=EXPORT_ATTEMPTS_PER_STORE):
     for attempt in range(1, attempts + 1):
         print(f"[EXPORT] {current_store}: attempt {attempt}/{attempts}")
         try:
             set_date_range(start_date, end_date)
             click_run_button()
-            if clickActionsAndExport(current_store):
+            if clickActionsAndExport(current_store, target_filename=target_filename):
                 return True
         except Exception:
             print(f"[WARN] Export attempt {attempt} failed for {current_store}: {traceback.format_exc()}")
         time.sleep(3)
     return False
+
+
+def export_store_date_range(current_store, start_date, end_date):
+    chunk_ranges = _iter_export_chunks(start_date, end_date)
+    if not chunk_ranges:
+        print(f"[WARN] No export chunks generated for {current_store}.")
+        return False
+
+    if len(chunk_ranges) == 1:
+        return export_store_with_retries(current_store, start_date, end_date)
+
+    files_dir = _files_dir()
+    os.makedirs(files_dir, exist_ok=True)
+    run_token = datetime.now().strftime("%Y%m%d%H%M%S")
+    temp_chunk_paths = []
+
+    print(
+        f"[EXPORT] {current_store}: splitting "
+        f"{chunk_ranges[0][0]:%Y-%m-%d} -> {chunk_ranges[-1][1]:%Y-%m-%d} "
+        f"into {len(chunk_ranges)} chunk(s) of up to {BROWSER_EXPORT_MAX_WINDOW_DAYS} days"
+    )
+
+    for idx, (chunk_start, chunk_end) in enumerate(chunk_ranges, start=1):
+        target_filename = _chunk_store_filename(
+            current_store,
+            chunk_start,
+            chunk_end,
+            idx,
+            len(chunk_ranges),
+            run_token,
+        )
+        target_path = os.path.join(files_dir, target_filename)
+        if os.path.exists(target_path):
+            os.remove(target_path)
+
+        print(
+            f"[EXPORT] {current_store}: chunk {idx}/{len(chunk_ranges)} "
+            f"{chunk_start:%Y-%m-%d} -> {chunk_end:%Y-%m-%d}"
+        )
+        ok = export_store_with_retries(
+            current_store,
+            chunk_start,
+            chunk_end,
+            target_filename=target_filename,
+        )
+        if not ok:
+            print(f"[WARN] Chunk export failed for {current_store}; keeping completed chunk files for debugging.")
+            return False
+        temp_chunk_paths.append(target_path)
+
+    final_output_path = os.path.join(files_dir, _expected_store_filename(current_store))
+    try:
+        merged_rows = _merge_export_chunk_files(temp_chunk_paths, final_output_path)
+        print(
+            f"[EXPORT] {current_store}: merged {len(temp_chunk_paths)} chunk(s) "
+            f"into {os.path.basename(final_output_path)} with {merged_rows} row(s)"
+        )
+    except Exception:
+        print(f"[WARN] Failed to merge chunk exports for {current_store}: {traceback.format_exc()}")
+        return False
+
+    for temp_chunk_path in temp_chunk_paths:
+        try:
+            os.remove(temp_chunk_path)
+        except OSError:
+            pass
+
+    return True
 
 def update_days_combobox(year_combo, month_combo, day_combo):
     # Weekday abbreviations
@@ -695,7 +841,7 @@ def open_gui_and_run():
                     print(f"[WARN] Could not select store: {store}")
                     failed_stores.append(store)
                     continue
-                ok = export_store_with_retries(store, start_date, end_date)
+                ok = export_store_date_range(store, start_date, end_date)
                 if not ok:
                     print(f"[WARN] Export failed for store: {store}")
                     failed_stores.append(store)
@@ -733,7 +879,7 @@ def run_sales_report(start_date, end_date):
                     print(f"[WARN] Could not select store: {store}")
                     failed_stores.append(store)
                     continue
-                ok = export_store_with_retries(store, start_date, end_date)
+                ok = export_store_date_range(store, start_date, end_date)
                 if not ok:
                     print(f"[WARN] Export failed for store: {store}")
                     failed_stores.append(store)
