@@ -473,14 +473,7 @@ DEFAULT_BRAND_CRITERIA = {
         'discount': 0.50,
         'kickback': 0.0,
         'brands': ['Kushy Punch |']
-    },
-    "American Weed": {
-        'vendors': ['Garden Of Weeden','Garden Of Weeden Inc.'],
-        'days': ['Wednesday','Thursday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        'brands': ['American Weed']
-    },    
+    },   
     'Josh Wax': {  # merged
         'vendors': ['Zasp', 'Garden Of Weeden Inc.', 'Garden Of Weeden'],
         'brands': ['Josh Wax'],
@@ -618,12 +611,6 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.50,
            'kickback': 0.30,
            'brands': ['LIME |']},
-    'Decibel': {'vendors': ['Decibel Enterprise Inc.'],
-           'days': ['Saturday'], #Started March 2
-           'discount': 0.50,
-           'kickback': 0.25,
-           'stores': ['MV','SV'],
-           'brands': ['Decibel |']},
 }
 
 brand_criteria = DEFAULT_BRAND_CRITERIA
