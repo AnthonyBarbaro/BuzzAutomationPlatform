@@ -61,6 +61,22 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
         self.assertEqual(len(auto_df), 3)
         self.assertNotIn("SKU", auto_df.columns)
+        self.assertEqual(
+            list(auto_df.columns),
+            [
+                "Row Key",
+                "Brand",
+                "Category",
+                "Product",
+                "Available",
+                "Par Level",
+                "Cost",
+                "Price",
+                "Units Sold 7d",
+                "Units Sold 14d",
+                "Units Sold 30d",
+            ],
+        )
         self.assertNotIn("SKU-SAMPLE", metric_skus)
         self.assertNotIn("SKU-DRINK", metric_skus)
         self.assertNotIn("SKU-NOSALES", metric_skus)
@@ -109,6 +125,14 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
             "https://docs.google.com/spreadsheets/d/default-sheet-id/edit",
         )
 
+    def test_resolve_week_of_uses_next_monday_when_week_is_omitted_midweek(self):
+        self.assertEqual(resolve_week_of(None, date(2026, 4, 22)).isoformat(), "2026-04-27")
+        self.assertEqual(resolve_week_of(None, date(2026, 4, 20)).isoformat(), "2026-04-20")
+
+    def test_resolve_week_of_still_normalizes_explicit_dates_to_their_monday(self):
+        self.assertEqual(resolve_week_of("2026-04-22", date(2026, 4, 22)).isoformat(), "2026-04-20")
+        self.assertEqual(resolve_week_of("2026-04-27", date(2026, 4, 22)).isoformat(), "2026-04-27")
+
     def test_sheet_output_flags_can_disable_auto_tab_while_keeping_review_enabled(self):
         config = json.loads(json.dumps(self.config))
         config["sheet_outputs"] = {
@@ -118,14 +142,14 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
         self.assertEqual(sheet_output_flags(config), {"auto": False, "review": True})
 
-    def test_build_readme_rows_includes_latest_review_tab_and_manual_columns(self):
+    def test_build_readme_rows_includes_latest_review_tab_and_reflects_script_owned_layout(self):
         rows = build_readme_rows(
             store_code="NC",
             store_name="National City",
             output_flags={"auto": False, "review": True},
             week_of="2026-04-13",
             tab_titles={"review": "NC 2026-04-13 Review"},
-            manual_columns=["Shelf Count Checked", "Final Approved Qty", "Notes"],
+            manual_columns=[],
             snapshot_generated_at="2026-04-14T08:05:00-07:00",
         )
 
@@ -135,13 +159,13 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertIn(["Latest Review Tab", "NC 2026-04-13 Review"], rows)
         self.assertIn(["Current Google Sheet Output", "This repo currently writes the REVIEW tab to Google Sheets."], rows)
         vendor_row = next(row for row in rows if row[0] == "Pick A Vendor Or Brand")
-        self.assertIn("Filter Vendor", vendor_row[1])
+        self.assertIn("Filter Brand", vendor_row[1])
         filter_row = next(row for row in rows if row[0] == "Recommended Filters")
-        self.assertIn("Needs Order = Y", filter_row[1])
+        self.assertIn("Brand -> Category", filter_row[1])
         manual_row = next(row for row in rows if row[0] == "Manual Columns Preserved On Rerun")
-        self.assertIn("Shelf Count Checked", manual_row[1])
-        self.assertIn("Final Approved Qty", manual_row[1])
-        self.assertIn("Notes", manual_row[1])
+        self.assertEqual(manual_row[1], "None. This sheet is script-owned and safe to rerun.")
+        defaults_row = next(row for row in rows if row[0] == "Run Defaults")
+        self.assertIn("next Monday", defaults_row[1])
 
     def test_move_latest_tabs_next_to_readme_keeps_readme_first_and_dedupes_titles(self):
         service = object()
@@ -186,7 +210,8 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(int(flower["Units Sold 7d"]), 2)
         self.assertEqual(int(flower["Units Sold 14d"]), 4)
         self.assertEqual(int(flower["Units Sold 30d"]), 8)
-        self.assertEqual(int(flower["Suggested Order Qty"]), 3)
+        self.assertEqual(int(flower["Par Level"]), 5)
+        self.assertEqual(int(flower["Suggested Order Qty"]), 4)
         self.assertEqual(flower["Needs Order"], "Y")
         self.assertEqual(str(flower["Last Sale Date"]), "2026-04-02")
         self.assertAlmostEqual(float(flower["Sell-Through 30d"]), 8.0 / 9.0, places=4)
@@ -199,22 +224,24 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(int(gummy["Units Sold 7d"]), 5)
         self.assertEqual(int(gummy["Units Sold 14d"]), 8)
         self.assertEqual(int(gummy["Units Sold 30d"]), 12)
-        self.assertEqual(int(gummy["Suggested Order Qty"]), 4)
+        self.assertEqual(int(gummy["Par Level"]), 10)
+        self.assertEqual(int(gummy["Suggested Order Qty"]), 6)
         self.assertEqual(gummy["Needs Order"], "Y")
         self.assertEqual(gummy["Reorder Priority"], "Low Cover")
         self.assertIn("7.0 days of supply", gummy["Reorder Notes / Reason"])
-        self.assertIn("suggest 4", gummy["Reorder Notes / Reason"])
+        self.assertIn("suggest 6", gummy["Reorder Notes / Reason"])
 
         self.assertNotIn("SKU-NOSALES", metrics.index)
 
         zero_inventory = metrics.loc["SKU-ZEROINV"]
         self.assertEqual(int(zero_inventory["Available"]), 0)
         self.assertEqual(int(zero_inventory["Units Sold 30d"]), 3)
-        self.assertEqual(int(zero_inventory["Suggested Order Qty"]), 2)
+        self.assertEqual(int(zero_inventory["Par Level"]), 4)
+        self.assertEqual(int(zero_inventory["Suggested Order Qty"]), 4)
         self.assertEqual(zero_inventory["Reorder Priority"], "Urgent")
         self.assertIn("Out of stock", zero_inventory["Reorder Notes / Reason"])
 
-    def test_sorting_groups_rows_by_vendor_brand_category_cost_price_and_reorder_priority(self):
+    def test_sorting_groups_rows_by_brand_category_and_priority_with_slimmer_columns(self):
         bundle = self.build_bundle()
         auto_df = bundle["auto_df"]
 
@@ -222,13 +249,87 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
             auto_df["Row Key"].tolist(),
             ["MV|sku:SKU-ZEROINV", "MV|sku:SKU-GUMMY", "MV|sku:SKU-FLOWER"],
         )
-        self.assertNotIn("Needs Order", auto_df.columns)
+        self.assertNotIn("Vendor", auto_df.columns)
+        self.assertNotIn("Reorder Priority", auto_df.columns)
+        self.assertNotIn("Inventory Value", auto_df.columns)
         self.assertEqual(auto_df["Category"].tolist(), ["Edibles", "Edibles", "Flower"])
-        self.assertEqual(auto_df["Cost"].tolist(), [7.0, 8.0, 12.0])
         self.assertEqual(
-            auto_df["Sell-Through 7D/14D/30D"].tolist(),
-            ["100%", "56% / 67% / 75%", "67% / 80% / 89%"],
+            auto_df["Product"].tolist(),
+            [
+                "Brand A | Gummies 10pk | Tropical",
+                "Brand A | Gummies 100mg | Mixed Berry",
+                "Brand A | Flower 3.5g | Blue Dream",
+            ],
         )
+        self.assertEqual(auto_df["Par Level"].tolist(), [4, 10, 5])
+        self.assertEqual(auto_df["Cost"].tolist(), [7.0, 8.0, 12.0])
+
+    def test_recent_velocity_and_low_stock_can_push_par_above_14d_sales(self):
+        par_level = weekly_sheet._estimate_par_level(
+            {
+                "units_sold_7d": 10.0,
+                "units_sold_14d": 11.0,
+                "units_sold_30d": 22.0,
+                "available": 4.0,
+                "sell_through_7d": 10.0 / 14.0,
+                "sell_through_14d": 11.0 / 15.0,
+                "sell_through_30d": 22.0 / 26.0,
+            },
+            self.config,
+            14,
+        )
+
+        self.assertEqual(par_level, 18)
+
+    def test_recent_sales_cost_is_preferred_over_bad_inventory_average(self):
+        inventory_agg = pd.DataFrame(
+            [
+                {
+                    "row_key": "MV|sku:40905401",
+                    "store_code": "MV",
+                    "store_name": "Morena Vista",
+                    "sku": "40905401",
+                    "vendor": "Vino & Cigarro, LLC",
+                    "vendor_key": "vinoycigarro",
+                    "brand": "CLSICS",
+                    "brand_key": "clsics",
+                    "category": "Prerolls",
+                    "product": "Hash IN Pre-roll 1g | Blue Crack",
+                    "available": 4.0,
+                    "cost": 13.75,
+                    "price": 12.0,
+                    "inventory_value": 55.0,
+                    "inventory_row_count": 2,
+                }
+            ]
+        )
+        sales_agg = pd.DataFrame(
+            [
+                {
+                    "row_key": "MV|sku:40905401",
+                    "store_code": "MV",
+                    "store_name": "Morena Vista",
+                    "sku": "40905401",
+                    "vendor": "Vino & Cigarro, LLC",
+                    "vendor_key": "vinoycigarro",
+                    "brand": "CLSICS",
+                    "brand_key": "clsics",
+                    "category": "Prerolls",
+                    "product": "Hash IN Pre-roll 1g | Blue Crack",
+                    "units_sold_7d": 10.0,
+                    "units_sold_14d": 11.0,
+                    "units_sold_30d": 22.0,
+                    "units_sold_velocity": 11.0,
+                    "cost": 4.0,
+                    "price": 12.0,
+                    "last_sale_date": date(2026, 4, 21),
+                    "sales_row_count": 22,
+                }
+            ]
+        )
+
+        merged = weekly_sheet.merge_inventory_sales(inventory_agg, sales_agg)
+        self.assertEqual(float(merged.loc[0, "cost"]), 4.0)
 
     def test_sell_through_display_rounds_to_whole_percent_and_collapses_matching_values(self):
         self.assertEqual(_format_sell_through_triplet(1.0, 1.0, 1.0), "100%")
@@ -278,6 +379,114 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(sorted_df["Reorder Priority"].tolist(), ["Urgent", "Low Cover", "Reorder"])
         self.assertEqual(sorted_df["SKU"].tolist(), ["SKU-A", "SKU-B", "SKU-C"])
 
+    def test_line_items_stay_separate_even_when_strain_family_matches(self):
+        merged_df = pd.DataFrame(
+            [
+                {
+                    "row_key": "NC|sku:1",
+                    "store_code": "NC",
+                    "store_name": "National City",
+                    "sku": "1",
+                    "vendor": "Vendor Alpha",
+                    "vendor_key": "vendoralpha",
+                    "brand": "CAM",
+                    "brand_key": "cam",
+                    "category": "Eighths",
+                    "product": "CAM | Flower 3.5G | H | Coconut Milk",
+                    "available": 2.0,
+                    "cost": 25.0,
+                    "price": 58.0,
+                    "inventory_value": 50.0,
+                    "inventory_row_count": 1,
+                    "units_sold_7d": 14.0,
+                    "units_sold_14d": 14.0,
+                    "units_sold_30d": 14.0,
+                    "units_sold_velocity": 14.0,
+                    "last_sale_date": date(2026, 4, 13),
+                    "sales_row_count": 1,
+                    "has_inventory": True,
+                    "eligible_brand_30d": True,
+                    "eligible_vendor_30d": True,
+                },
+                {
+                    "row_key": "NC|sku:2",
+                    "store_code": "NC",
+                    "store_name": "National City",
+                    "sku": "2",
+                    "vendor": "Vendor Alpha",
+                    "vendor_key": "vendoralpha",
+                    "brand": "CAM",
+                    "brand_key": "cam",
+                    "category": "Eighths",
+                    "product": "CAM | Flower 3.5G | H | GG #4",
+                    "available": 4.0,
+                    "cost": 25.0,
+                    "price": 58.0,
+                    "inventory_value": 100.0,
+                    "inventory_row_count": 1,
+                    "units_sold_7d": 12.0,
+                    "units_sold_14d": 12.0,
+                    "units_sold_30d": 12.0,
+                    "units_sold_velocity": 12.0,
+                    "last_sale_date": None,
+                    "sales_row_count": 1,
+                    "has_inventory": True,
+                    "eligible_brand_30d": True,
+                    "eligible_vendor_30d": True,
+                },
+                {
+                    "row_key": "NC|sku:3",
+                    "store_code": "NC",
+                    "store_name": "National City",
+                    "sku": "3",
+                    "vendor": "Vendor Alpha",
+                    "vendor_key": "vendoralpha",
+                    "brand": "CAM",
+                    "brand_key": "cam",
+                    "category": "Eighths",
+                    "product": "CAM | Flower 3.5G | I | Bubba's Girl",
+                    "available": 5.0,
+                    "cost": 25.0,
+                    "price": 58.0,
+                    "inventory_value": 125.0,
+                    "inventory_row_count": 1,
+                    "units_sold_7d": 11.0,
+                    "units_sold_14d": 11.0,
+                    "units_sold_30d": 27.0,
+                    "units_sold_velocity": 11.0,
+                    "last_sale_date": date(2026, 4, 13),
+                    "sales_row_count": 1,
+                    "has_inventory": True,
+                    "eligible_brand_30d": True,
+                    "eligible_vendor_30d": True,
+                },
+            ]
+        )
+
+        metrics = weekly_sheet.compute_ordering_metrics(merged_df, self.config).set_index("Product")
+        self.assertEqual(
+            metrics.index.tolist(),
+            [
+                "CAM | Flower 3.5G | H | Coconut Milk",
+                "CAM | Flower 3.5G | H | GG #4",
+                "CAM | Flower 3.5G | I | Bubba's Girl",
+            ],
+        )
+
+        coconut = metrics.loc["CAM | Flower 3.5G | H | Coconut Milk"]
+        self.assertEqual(int(coconut["Available"]), 2)
+        self.assertEqual(int(coconut["Par Level"]), 23)
+        self.assertEqual(int(coconut["Suggested Order Qty"]), 21)
+        self.assertEqual(coconut["Reorder Priority"], "Urgent")
+        self.assertEqual(str(coconut["Row Key"]), "NC|sku:1")
+
+        gg4 = metrics.loc["CAM | Flower 3.5G | H | GG #4"]
+        self.assertEqual(int(gg4["Available"]), 4)
+        self.assertEqual(int(gg4["Par Level"]), 19)
+        self.assertEqual(int(gg4["Suggested Order Qty"]), 15)
+        self.assertEqual(gg4["Reorder Priority"], "Low Cover")
+        self.assertEqual(str(gg4["Row Key"]), "NC|sku:2")
+
     def test_store_identity_and_tab_naming_are_stable(self):
         bundle = self.build_bundle()
         metrics = bundle["sku_metrics"]
@@ -288,53 +497,13 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(build_tab_title("MV", self.week_of, "Auto"), "MV 2026-03-30 Auto")
         self.assertEqual(build_tab_title("MV", self.week_of, "Review"), "MV 2026-03-30 Review")
 
-    def test_review_columns_are_preserved_on_rerun(self):
+    def test_review_tab_matches_auto_columns_when_manual_columns_are_removed(self):
         bundle = self.build_bundle()
         review_df = bundle["review_df"]
-        existing_values = [
-            list(review_df.columns),
-            [
-                "MV|sku:SKU-FLOWER",
-                "Urgent",
-                "Vendor Alpha",
-                "Brand A",
-                "Flower",
-                "Brand A | Flower 3.5g | Blue Dream",
-                1,
-                12,
-                35,
-                12,
-                2,
-                4,
-                8,
-                "67% / 80% / 89%",
-                0.2857,
-                3.5,
-                3,
-                "3.5 days of supply is below the reorder threshold; 2/7d, 4/14d, 8/30d; suggest 3.",
-                "2026-04-02",
-                "2",
-                "3",
-                "2",
-                "Y",
-                "AB",
-                "CD",
-                "Matched",
-                "Checked backstock",
-                "PO-55",
-            ],
-        ]
 
-        merged = merge_preserved_review_columns(
-            review_df,
-            existing_values,
-            manual_columns=self.config["review_manual_columns"],
-        )
-        flower = merged.set_index("Row Key").loc["MV|sku:SKU-FLOWER"]
-        self.assertEqual(flower["Shelf Count Checked"], "2")
-        self.assertEqual(flower["Final Approved Qty"], "2")
-        self.assertEqual(flower["Buyer Initials"], "AB")
-        self.assertEqual(flower["PO / Vendor Ref"], "PO-55")
+        self.assertEqual(list(review_df.columns), list(bundle["auto_df"].columns))
+        merged = merge_preserved_review_columns(review_df, [list(review_df.columns)], manual_columns=self.config["review_manual_columns"])
+        pd.testing.assert_frame_equal(merged, review_df)
 
     def test_sheet_payload_is_json_serializable(self):
         bundle = self.build_bundle()
@@ -391,7 +560,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
 
-            summary_path = Path(tmpdir) / "2026-04-06" / "run_summary.json"
+            summary_path = Path(tmpdir) / "2026-04-13" / "run_summary.json"
             summary_rows = json.loads(summary_path.read_text(encoding="utf-8"))
 
             self.assertEqual([row["store_code"] for row in summary_rows], ["MV", "SV", "NC"])

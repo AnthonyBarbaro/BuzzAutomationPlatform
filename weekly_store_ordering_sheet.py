@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -51,24 +52,38 @@ DEFAULT_SPREADSHEET_TARGET_KEY = "DEFAULT"
 
 AUTO_COLUMNS = [
     "Row Key",
-    "Reorder Priority",
-    "Vendor",
     "Brand",
     "Category",
     "Product",
     "Available",
+    "Par Level",
     "Cost",
     "Price",
-    "Inventory Value",
     "Units Sold 7d",
     "Units Sold 14d",
     "Units Sold 30d",
+]
+
+METRIC_EXPORT_COLUMNS = AUTO_COLUMNS + [
+    "Vendor",
+    "Reorder Priority",
+    "Inventory Value",
     "Sell-Through 7D/14D/30D",
     "Avg Daily Sold 14d",
     "Days of Supply",
     "Suggested Order Qty",
     "Reorder Notes / Reason",
     "Last Sale Date",
+    "Needs Order",
+    "SKU",
+    "Sell-Through 7d",
+    "Sell-Through 14d",
+    "Sell-Through 30d",
+    "Target Qty",
+    "Priority Rank",
+    "store_code",
+    "eligible_brand_30d",
+    "eligible_vendor_30d",
 ]
 
 SUMMARY_FIELD_ORDER = [
@@ -114,6 +129,11 @@ def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PA
     config["reorder"].setdefault("days_of_supply_urgent", 3.0)
     config["reorder"].setdefault("days_of_supply_low", 7.0)
     config["reorder"].setdefault("high_sell_through_30d", 0.6)
+    config["reorder"].setdefault("par_weight_7d", 0.5)
+    config["reorder"].setdefault("par_weight_14d", 0.3)
+    config["reorder"].setdefault("par_weight_30d", 0.2)
+    config["reorder"].setdefault("par_stale_30d_dampener", 0.6)
+    config["reorder"].setdefault("par_stockout_uplift_max", 0.25)
     config.setdefault("review_manual_columns", [])
     return config
 
@@ -136,8 +156,14 @@ def resolve_as_of_day(as_of_text: str | None, tz_name: str) -> date:
 
 
 def resolve_week_of(week_text: str | None, as_of_day: date) -> date:
-    source_day = datetime.fromisoformat(str(week_text)).date() if week_text else as_of_day
-    return source_day - timedelta(days=source_day.weekday())
+    if week_text:
+        source_day = datetime.fromisoformat(str(week_text)).date()
+        return source_day - timedelta(days=source_day.weekday())
+
+    current_monday = as_of_day - timedelta(days=as_of_day.weekday())
+    if as_of_day > current_monday:
+        return current_monday + timedelta(days=7)
+    return current_monday
 
 
 def build_tab_title(store_code: str, week_of: date, suffix: str) -> str:
@@ -417,7 +443,6 @@ def build_ordering_bundle(
     merged = apply_eligibility_rules(merged, eligible_brand_keys, eligible_vendor_keys, config)
     if not bool(config.get("eligibility", {}).get("include_sales_only_rows", True)):
         merged = merged[merged["inventory_row_count"] > 0].copy()
-
     metrics_df = compute_ordering_metrics(merged, config)
     metrics_df, metric_filter_counts = apply_ordering_filters(metrics_df, config)
     metrics_df = sort_ordering_rows(metrics_df)
@@ -588,9 +613,12 @@ def sales_rows_for_ordering(prepared_df: pd.DataFrame, store_code: str) -> pd.Da
         return pd.DataFrame(columns=_ordering_row_columns("sales"))
     work["sale_date"] = pd.to_datetime(work.get("_date"), errors="coerce").dt.date
     work["price"] = pd.to_numeric(work.get("merge_price_basis", work.get("Price", 0.0)), errors="coerce").fillna(0.0).astype(float)
-    work["cost"] = pd.to_numeric(work.get("merge_cost_basis", 0.0), errors="coerce").fillna(0.0).astype(float)
-    if "merge_cost_basis" not in work.columns:
-        work["cost"] = (pd.to_numeric(work.get("_cogs_real", 0.0), errors="coerce").fillna(0.0) / work["qty"].replace({0: np.nan})).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    merge_cost = pd.to_numeric(work.get("merge_cost_basis", 0.0), errors="coerce")
+    realized_cost = (
+        pd.to_numeric(work.get("_cogs_real", 0.0), errors="coerce").fillna(0.0)
+        / work["qty"].replace({0: np.nan})
+    ).replace([np.inf, -np.inf], np.nan)
+    work["cost"] = realized_cost.where(realized_cost > 0, merge_cost).fillna(0.0).astype(float)
     return work[_ordering_row_columns("sales")].copy()
 
 
@@ -700,7 +728,7 @@ def merge_inventory_sales(inventory_agg: pd.DataFrame, sales_agg: pd.DataFrame) 
     merged["units_sold_30d"] = pd.to_numeric(merged.get("units_sold_30d", 0.0), errors="coerce").fillna(0.0).astype(float)
     merged["units_sold_velocity"] = pd.to_numeric(merged.get("units_sold_velocity", 0.0), errors="coerce").fillna(0.0).astype(float)
     merged["sales_row_count"] = pd.to_numeric(merged.get("sales_row_count", 0), errors="coerce").fillna(0).astype(int)
-    merged["cost"] = np.where(merged["cost_inv"].fillna(0.0) > 0, merged["cost_inv"], merged["cost_sales"]).astype(float)
+    merged["cost"] = np.where(merged["cost_sales"].fillna(0.0) > 0, merged["cost_sales"], merged["cost_inv"]).astype(float)
     merged["price"] = np.where(merged["price_inv"].fillna(0.0) > 0, merged["price_inv"], merged["price_sales"]).astype(float)
     merged["last_sale_date"] = pd.to_datetime(merged.get("last_sale_date", pd.NaT), errors="coerce").dt.date
     merged["has_inventory"] = merged["inventory_row_count"].fillna(0).astype(float) > 0
@@ -738,19 +766,80 @@ def apply_eligibility_rules(
     return filtered
 
 
+def aggregate_family_par_rows(merged_df: pd.DataFrame) -> pd.DataFrame:
+    if merged_df is None or merged_df.empty:
+        return pd.DataFrame(columns=_merged_columns())
+
+    work = merged_df.copy()
+    group_meta = pd.DataFrame(
+        [
+            _build_family_group_metadata(
+                store_code=row.get("store_code", ""),
+                vendor_key=row.get("vendor_key", ""),
+                brand_key=row.get("brand_key", ""),
+                category=row.get("category", ""),
+                product=row.get("product", ""),
+                row_key=row.get("row_key", ""),
+            )
+            for _, row in work.iterrows()
+        ],
+        index=work.index,
+    )
+    work = pd.concat([work, group_meta], axis=1)
+    work["last_sale_date"] = pd.to_datetime(work.get("last_sale_date"), errors="coerce")
+    work["group_weight"] = np.where(
+        pd.to_numeric(work["available"], errors="coerce").fillna(0.0) > 0,
+        pd.to_numeric(work["available"], errors="coerce").fillna(0.0),
+        np.where(
+            pd.to_numeric(work["units_sold_14d"], errors="coerce").fillna(0.0) > 0,
+            pd.to_numeric(work["units_sold_14d"], errors="coerce").fillna(0.0),
+            np.where(
+                pd.to_numeric(work["units_sold_30d"], errors="coerce").fillna(0.0) > 0,
+                pd.to_numeric(work["units_sold_30d"], errors="coerce").fillna(0.0),
+                1.0,
+            ),
+        ),
+    ).astype(float)
+
+    grouped = work.groupby("group_row_key", as_index=False).agg(
+        row_key=("group_row_key", _first_mode),
+        store_code=("store_code", _first_mode),
+        store_name=("store_name", _first_mode),
+        sku=("sku", _first_mode),
+        vendor=("vendor", _first_mode),
+        vendor_key=("vendor_key", _first_mode),
+        brand=("brand", _first_mode),
+        brand_key=("brand_key", _first_mode),
+        category=("category", _first_mode),
+        product=("group_product", _combine_group_products),
+        group_is_family=("group_is_family", "max"),
+        available=("available", "sum"),
+        inventory_value=("inventory_value", "sum"),
+        group_weight=("group_weight", "sum"),
+        cost_num=("cost", lambda series: float((pd.to_numeric(series, errors="coerce").fillna(0.0) * work.loc[series.index, "group_weight"]).sum())),
+        price_num=("price", lambda series: float((pd.to_numeric(series, errors="coerce").fillna(0.0) * work.loc[series.index, "group_weight"]).sum())),
+        inventory_row_count=("inventory_row_count", "sum"),
+        units_sold_7d=("units_sold_7d", "sum"),
+        units_sold_14d=("units_sold_14d", "sum"),
+        units_sold_30d=("units_sold_30d", "sum"),
+        units_sold_velocity=("units_sold_velocity", "sum"),
+        last_sale_date=("last_sale_date", _latest_timestamp),
+        sales_row_count=("sales_row_count", "sum"),
+        has_inventory=("has_inventory", "max"),
+        eligible_brand_30d=("eligible_brand_30d", "max"),
+        eligible_vendor_30d=("eligible_vendor_30d", "max"),
+    )
+    grouped["cost"] = grouped["cost_num"] / grouped["group_weight"].replace({0: np.nan})
+    grouped["price"] = grouped["price_num"] / grouped["group_weight"].replace({0: np.nan})
+    grouped["sku"] = np.where(grouped["group_is_family"].astype(bool), "", grouped["sku"].fillna("").astype(str))
+    grouped["last_sale_date"] = pd.to_datetime(grouped["last_sale_date"], errors="coerce").dt.date
+    grouped = grouped.replace([np.inf, -np.inf], np.nan).fillna({"cost": 0.0, "price": 0.0})
+    return grouped[_merged_columns()].copy()
+
+
 def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any]) -> pd.DataFrame:
     if merged_df is None or merged_df.empty:
-        return pd.DataFrame(
-            columns=AUTO_COLUMNS
-            + [
-                "SKU",
-                "Sell-Through 7d",
-                "Sell-Through 14d",
-                "Sell-Through 30d",
-                "Target Qty",
-                "Priority Rank",
-            ]
-        )
+        return pd.DataFrame(columns=METRIC_EXPORT_COLUMNS)
 
     work = merged_df.copy()
     velocity_window_days = int(config.get("reorder", {}).get("velocity_window_days", 30))
@@ -771,11 +860,8 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
         work["available"] / work["avg_daily_sold_velocity"].replace({0: np.nan}),
         np.nan,
     )
-    work["Target Qty"] = np.where(
-        work["avg_daily_sold_velocity"] > 0,
-        np.ceil(work["avg_daily_sold_velocity"] * float(target_cover_days)),
-        0.0,
-    ).astype(int)
+    work["Par Level"] = work.apply(lambda row: _estimate_par_level(row, config, target_cover_days), axis=1)
+    work["Target Qty"] = work["Par Level"].astype(int)
     work["Suggested Order Qty"] = np.ceil((work["Target Qty"] - work["available"]).clip(lower=0.0)).astype(int)
     work["Needs Order"] = np.where(work["Suggested Order Qty"] >= needs_order_min_qty, "Y", "N")
 
@@ -808,6 +894,7 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
     work["Reorder Notes / Reason"] = notes
     work["Last Sale Date"] = pd.to_datetime(work["last_sale_date"], errors="coerce").dt.date
     work["Available"] = work["available"].fillna(0.0).astype(float)
+    work["Par Level"] = work["Par Level"].fillna(0).astype(int)
     work["Cost"] = work["cost"].fillna(0.0).astype(float)
     work["Price"] = work["price"].fillna(0.0).astype(float)
     work["Inventory Value"] = work["inventory_value"].fillna(0.0).astype(float)
@@ -834,21 +921,7 @@ def compute_ordering_metrics(merged_df: pd.DataFrame, config: Mapping[str, Any])
     work["Product"] = work["product"].fillna("Unknown Product").astype(str)
     work["Row Key"] = work["row_key"].fillna("").astype(str)
 
-    return work[
-        AUTO_COLUMNS
-        + [
-            "Needs Order",
-            "SKU",
-            "Sell-Through 7d",
-            "Sell-Through 14d",
-            "Sell-Through 30d",
-            "Target Qty",
-            "Priority Rank",
-            "store_code",
-            "eligible_brand_30d",
-            "eligible_vendor_30d",
-        ]
-    ].copy()
+    return work[METRIC_EXPORT_COLUMNS].copy()
 
 
 def apply_ordering_filters(
@@ -941,7 +1014,6 @@ def sort_ordering_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=metrics_df.columns if metrics_df is not None else AUTO_COLUMNS)
 
     work = metrics_df.copy()
-    work["_vendor_sort"] = work["Vendor"].fillna("").astype(str).str.upper()
     work["_brand_sort"] = work["Brand"].fillna("").astype(str).str.upper()
     work["_category_sort"] = work["Category"].fillna("").astype(str).str.upper()
     work["_cost_sort"] = pd.to_numeric(work["Cost"], errors="coerce").fillna(0.0)
@@ -951,20 +1023,18 @@ def sort_ordering_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
     work["_sku_sort"] = work["SKU"].fillna("").astype(str).str.upper()
     work = work.sort_values(
         [
-            "_vendor_sort",
             "_brand_sort",
             "_category_sort",
+            "_priority_sort",
             "_cost_sort",
             "_price_sort",
-            "_priority_sort",
             "_product_sort",
             "_sku_sort",
         ],
-        ascending=[True, True, True, True, True, False, True, True],
+        ascending=[True, True, False, True, True, True, True],
     )
     return work.drop(
         columns=[
-            "_vendor_sort",
             "_brand_sort",
             "_category_sort",
             "_cost_sort",
@@ -1400,6 +1470,165 @@ def _format_percent_display(value: Any) -> str:
         numeric = Decimal("0")
     percent = (numeric * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return f"{int(percent)}%"
+
+
+def _build_family_group_metadata(
+    store_code: Any,
+    vendor_key: Any,
+    brand_key: Any,
+    category: Any,
+    product: Any,
+    row_key: Any,
+) -> dict[str, str]:
+    raw_product = str(product or "").strip()
+    parts = [part.strip() for part in raw_product.split("|") if part.strip()]
+    product_parts = parts[1:] if len(parts) > 1 else ([raw_product] if raw_product else [])
+
+    strain_index = None
+    strain_bucket = ""
+    for index, token in enumerate(product_parts):
+        normalized = _normalize_strain_bucket(token)
+        if normalized:
+            strain_index = index
+            strain_bucket = normalized
+            break
+
+    if strain_index is not None and strain_index > 0:
+        base_parts = product_parts[:strain_index]
+        family_display = " | ".join(base_parts + [strain_bucket]).strip()
+        family_key = _key_text(family_display)
+        category_key = _key_text(category)
+        vendor_text = str(vendor_key or "").strip() or "unknownvendor"
+        brand_text = str(brand_key or "").strip() or "unknownbrand"
+        return {
+            "group_row_key": f"{store_code}|family:{vendor_text}|{brand_text}|{category_key}|{family_key}",
+            "group_product": _display_product_without_brand(raw_product),
+            "group_is_family": True,
+        }
+
+    return {
+        "group_row_key": str(row_key or "").strip(),
+        "group_product": _display_product_without_brand(raw_product),
+        "group_is_family": False,
+    }
+
+
+def _display_product_without_brand(product: Any) -> str:
+    raw_product = str(product or "").strip()
+    if not raw_product:
+        return ""
+    parts = [part.strip() for part in raw_product.split("|") if part.strip()]
+    if len(parts) <= 1:
+        return raw_product
+    return " | ".join(parts[1:])
+
+
+def _combine_group_products(values: Any) -> str:
+    unique_values = list(
+        OrderedDict.fromkeys(
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+        )
+    )
+    if not unique_values:
+        return ""
+    if len(unique_values) == 1:
+        return unique_values[0]
+
+    tokenized = [[part.strip() for part in value.split("|") if part.strip()] for value in unique_values]
+    min_len = min((len(tokens) for tokens in tokenized), default=0)
+    prefix_length = 0
+    for index in range(min_len):
+        candidate = tokenized[0][index]
+        candidate_key = _key_text(candidate)
+        if all(_key_text(tokens[index]) == candidate_key for tokens in tokenized[1:]):
+            prefix_length += 1
+            continue
+        break
+
+    if prefix_length > 0:
+        prefix = tokenized[0][:prefix_length]
+        suffixes = list(
+            OrderedDict.fromkeys(
+                " | ".join(tokens[prefix_length:]).strip()
+                for tokens in tokenized
+                if " | ".join(tokens[prefix_length:]).strip()
+            )
+        )
+        if suffixes:
+            return " | ".join(prefix + [" / ".join(suffixes)])
+
+    return " / ".join(unique_values)
+
+
+def _normalize_strain_bucket(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if re.fullmatch(r"i|ind|indica", text):
+        return "I"
+    if re.fullmatch(r"h|hyb|hybrid", text):
+        return "H"
+    if re.fullmatch(r"s|sat|sativa", text):
+        return "S"
+    return ""
+
+
+def _latest_timestamp(series: pd.Series) -> Any:
+    timestamps = pd.to_datetime(series, errors="coerce")
+    if timestamps.isna().all():
+        return pd.NaT
+    return timestamps.max()
+
+
+def _estimate_par_level(row: Mapping[str, Any], config: Mapping[str, Any], target_cover_days: int) -> int:
+    reorder_config = dict(config.get("reorder", {}) or {})
+    units_sold_7d = max(0.0, _to_float(row.get("units_sold_7d", row.get("Units Sold 7d", 0.0))))
+    units_sold_14d = max(0.0, _to_float(row.get("units_sold_14d", row.get("Units Sold 14d", 0.0))))
+    units_sold_30d = max(0.0, _to_float(row.get("units_sold_30d", row.get("Units Sold 30d", 0.0))))
+    available = max(0.0, _to_float(row.get("available", row.get("Available", 0.0))))
+    sell_through_7d = max(0.0, _to_float(row.get("sell_through_7d", row.get("Sell-Through 7d", 0.0))))
+    sell_through_14d = max(0.0, _to_float(row.get("sell_through_14d", row.get("Sell-Through 14d", 0.0))))
+    sell_through_30d = max(0.0, _to_float(row.get("sell_through_30d", row.get("Sell-Through 30d", 0.0))))
+
+    if units_sold_7d <= 0 and units_sold_14d <= 0 and units_sold_30d <= 0:
+        return 0
+
+    target_cover_days = max(int(target_cover_days or 14), 1)
+    projected_7d = units_sold_7d * (target_cover_days / 7.0)
+    projected_14d = units_sold_14d * (target_cover_days / 14.0)
+    projected_30d = units_sold_30d * (target_cover_days / 30.0)
+
+    weight_7d = float(reorder_config.get("par_weight_7d", 0.5) or 0.0)
+    weight_14d = float(reorder_config.get("par_weight_14d", 0.3) or 0.0)
+    weight_30d = float(reorder_config.get("par_weight_30d", 0.2) or 0.0)
+    weight_total = weight_7d + weight_14d + weight_30d
+    if weight_total <= 0:
+        weight_7d, weight_14d, weight_30d = 0.5, 0.3, 0.2
+        weight_total = 1.0
+
+    projected_two_weeks = (
+        (projected_7d * weight_7d)
+        + (projected_14d * weight_14d)
+        + (projected_30d * weight_30d)
+    ) / weight_total
+
+    # If the last 14 days are empty, keep older 30-day sales on a short leash so stale items do not overinflate.
+    if units_sold_7d <= 0 and units_sold_14d <= 0 and units_sold_30d > 0:
+        projected_two_weeks *= float(reorder_config.get("par_stale_30d_dampener", 0.6) or 0.6)
+
+    # Low available units plus high sell-through usually means observed sales were capped by stock on hand.
+    max_sell_through = max(sell_through_7d, sell_through_14d, sell_through_30d)
+    projected_floor = max(projected_two_weeks, projected_14d)
+    if projected_floor > 0:
+        coverage_ratio = min(1.0, available / projected_floor)
+        sell_pressure = max(0.0, (max_sell_through - 0.55) / 0.45)
+        uplift_max = float(reorder_config.get("par_stockout_uplift_max", 0.25) or 0.25)
+        uplift = min(uplift_max, max(0.0, (1.0 - coverage_ratio) * sell_pressure * uplift_max))
+        projected_two_weeks *= 1.0 + uplift
+
+    return int(math.ceil(max(projected_two_weeks, 0.0)))
 
 
 def _sales_trend_summary(units_sold_7d: float, units_sold_14d: float) -> str:

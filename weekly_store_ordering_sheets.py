@@ -89,46 +89,42 @@ def build_readme_rows(
     manual_columns_text = (
         ", ".join(clean_manual_columns)
         if clean_manual_columns
-        else (
-            "Shelf Count Checked, Proposed Order Qty, Final Approved Qty, Ordered?, "
-            "Buyer Initials, Reviewer Initials, Cross-Check Status, Notes, PO / Vendor Ref"
-        )
+        else "None. This sheet is script-owned and safe to rerun."
     )
 
     start_here = "\n".join(
         [
             "1. Open the newest generated tab for the current week, usually REVIEW.",
             "2. Use the filter arrows on the header row. Filters are already turned on for the weekly tab.",
-            "3. Work one vendor at a time so the PO stays clean and easy to review.",
+            "3. Work the red and orange rows first. Those are the items sitting furthest below par.",
         ]
     )
     vendor_brand_guide = (
-        "Filter Vendor to the company you are ordering from first. If that vendor carries multiple brands, "
-        "keep Vendor filtered and then use Brand to narrow the list further."
+        "Filter Brand first, then Category. The weekly sheet stays line-by-line by product so each SKU keeps "
+        "its own row and par target."
     )
     filter_stack = "\n".join(
         [
             "Recommended filter order:",
-            "Vendor -> Brand -> Needs Order = Y",
-            "Then optionally narrow by Reorder Priority or Category.",
+            "Brand -> Category",
+            "Then optionally sort Available low-to-high to see the biggest par gaps first.",
         ]
     )
     read_suggestions = (
-        "Use Available, Units Sold 7d/14d/30d, Avg Daily Sold 14d, Days of Supply, "
-        "Suggested Order Qty, and Reorder Notes / Reason to sanity-check each item."
+        "Use Available versus Par Level together with Units Sold 7d/14d/30d to spot which rows are "
+        "short and which ones are already covered."
     )
     order_workflow = "\n".join(
         [
-            "1. Check shelf and backstock counts before ordering.",
-            "2. Fill Shelf Count Checked if the physical count differs from the sheet.",
-            "3. Use Proposed Order Qty for your first pass.",
-            "4. Set Final Approved Qty for what you actually want to buy.",
-            "5. Mark Ordered?, add initials, notes, and PO / Vendor Ref after the order is placed.",
+            "1. Review the red rows first, then orange, then yellow.",
+            "2. Compare Available to Par Level to estimate the gap for each line item.",
+            "3. Use the 14d and 30d sales columns to sanity-check whether the SKU still deserves shelf space.",
+            "4. If a SKU is gone, look for replacements nearby in the same brand and category.",
         ]
     )
     rerun_safety = (
-        "Reruns for the same week update the script-owned columns but preserve the manual review columns, "
-        "so you can refresh demand data without losing buyer notes."
+        "Reruns for the same week update the same script-owned ordering rows, so you can refresh the par view "
+        "without rebuilding the sheet layout by hand."
     )
 
     return [
@@ -156,7 +152,7 @@ def build_readme_rows(
         ],
         [
             "Run Defaults",
-            "If you omit dates, the script uses today in America/Los_Angeles and the Monday of that week.",
+            "If you omit dates, the script uses today in America/Los_Angeles and defaults the tab week to the next Monday once the current week's Monday has passed.",
         ],
         ["Data Source", "Dutchie API inventory, product, and transaction data."],
     ]
@@ -641,11 +637,26 @@ def _format_ordering_sheet(
                     "startIndex": header_row_index,
                     "endIndex": header_row_index + 1,
                 },
-                "properties": {"pixelSize": 34},
+                "properties": {"pixelSize": 33},
                 "fields": "pixelSize",
             }
         }
     )
+    if total_rows > header_row_number:
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": data_start_row_index,
+                        "endIndex": total_rows,
+                    },
+                    "properties": {"pixelSize": 33},
+                    "fields": "pixelSize",
+                }
+            }
+        )
     requests.extend(_column_width_requests(sheet_id, headers))
     requests.extend(_data_alignment_requests(sheet_id, headers, total_rows, header_row_number))
     requests.extend(
@@ -850,19 +861,16 @@ def _number_format_requests(
         return []
 
     requests: list[dict[str, Any]] = []
-    currency_headers = {"Cost", "Price", "Inventory Value"}
+    currency_headers = {"Cost", "Price"}
     integer_headers = {
         "Available",
+        "Par Level",
         "Units Sold 7d",
         "Units Sold 14d",
         "Units Sold 30d",
-        "Suggested Order Qty",
-        "Shelf Count Checked",
-        "Proposed Order Qty",
-        "Final Approved Qty",
     }
-    decimal_headers = {"Avg Daily Sold 14d", "Days of Supply"}
-    date_headers = {"Last Sale Date"}
+    decimal_headers: set[str] = set()
+    date_headers: set[str] = set()
 
     for index, header in enumerate(headers):
         pattern = None
@@ -973,9 +981,9 @@ def _conditional_format_requests(
     if total_rows <= header_row_number:
         return []
 
-    needs_order_index = _safe_index(headers, "Needs Order")
-    priority_index = _safe_index(headers, "Reorder Priority")
-    if needs_order_index is None and priority_index is None:
+    available_index = _safe_index(headers, "Available")
+    par_index = _safe_index(headers, "Par Level")
+    if available_index is None or par_index is None:
         return []
 
     start_row = header_row_number + 1
@@ -988,50 +996,66 @@ def _conditional_format_requests(
     }
 
     requests: list[dict[str, Any]] = []
-    if needs_order_index is not None:
-        needs_col = _column_letter(needs_order_index + 1)
-        requests.append(
-            {
-                "addConditionalFormatRule": {
-                    "index": 0,
-                    "rule": {
-                        "ranges": [data_range],
-                        "booleanRule": {
-                            "condition": {
-                                "type": "CUSTOM_FORMULA",
-                                "values": [{"userEnteredValue": f"=${needs_col}{start_row}=\"Y\""}],
-                            },
-                            "format": {
-                                "backgroundColor": _rgb("#FFF2D9"),
-                            },
+    available_col = _column_letter(available_index + 1)
+    par_col = _column_letter(par_index + 1)
+    requests.append(
+        {
+            "addConditionalFormatRule": {
+                "index": 0,
+                "rule": {
+                    "ranges": [data_range],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": f"=AND(${par_col}{start_row}>0,${available_col}{start_row}<=0)"}],
+                        },
+                        "format": {
+                            "backgroundColor": _rgb("#FAD7D2"),
+                            "textFormat": {"bold": True},
                         },
                     },
-                }
+                },
             }
-        )
-
-    if priority_index is not None:
-        priority_col = _column_letter(priority_index + 1)
-        requests.append(
-            {
-                "addConditionalFormatRule": {
-                    "index": 0,
-                    "rule": {
-                        "ranges": [data_range],
-                        "booleanRule": {
-                            "condition": {
-                                "type": "CUSTOM_FORMULA",
-                                "values": [{"userEnteredValue": f"=${priority_col}{start_row}=\"Urgent\""}],
-                            },
-                            "format": {
-                                "backgroundColor": _rgb("#FAD7D2"),
-                                "textFormat": {"bold": True},
-                            },
+        }
+    )
+    requests.append(
+        {
+            "addConditionalFormatRule": {
+                "index": 1,
+                "rule": {
+                    "ranges": [data_range],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": f"=AND(${par_col}{start_row}>0,${available_col}{start_row}>0,${available_col}{start_row}<(${par_col}{start_row}*0.5))"}],
+                        },
+                        "format": {
+                            "backgroundColor": _rgb("#FCE8C9"),
                         },
                     },
-                }
+                },
             }
-        )
+        }
+    )
+    requests.append(
+        {
+            "addConditionalFormatRule": {
+                "index": 2,
+                "rule": {
+                    "ranges": [data_range],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": f"=AND(${par_col}{start_row}>0,${available_col}{start_row}<${par_col}{start_row})"}],
+                        },
+                        "format": {
+                            "backgroundColor": _rgb("#FFF2D9"),
+                        },
+                    },
+                },
+            }
+        }
+    )
     return requests
 
 
@@ -1065,7 +1089,7 @@ def _data_alignment_requests(
     if total_rows <= header_row_number:
         return []
 
-    left_headers = {"Product", "Reorder Notes / Reason"}
+    left_headers = {"Product"}
     requests: list[dict[str, Any]] = []
     for index, header in enumerate(headers):
         if header not in left_headers:
@@ -1095,34 +1119,16 @@ def _data_alignment_requests(
 def _column_width_requests(sheet_id: int, headers: Sequence[str]) -> list[dict[str, Any]]:
     widths = {
         "Row Key": 140,
-        "Reorder Priority": 125,
-        "Needs Order": 90,
-        "Vendor": 160,
         "Brand": 140,
         "Category": 120,
-        "Product": 260,
+        "Product": 420,
         "Available": 90,
+        "Par Level": 90,
         "Cost": 90,
         "Price": 90,
-        "Inventory Value": 120,
         "Units Sold 7d": 100,
         "Units Sold 14d": 105,
         "Units Sold 30d": 105,
-        "Sell-Through 7D/14D/30D": 170,
-        "Avg Daily Sold 14d": 125,
-        "Days of Supply": 110,
-        "Suggested Order Qty": 135,
-        "Reorder Notes / Reason": 330,
-        "Last Sale Date": 110,
-        "Shelf Count Checked": 130,
-        "Proposed Order Qty": 130,
-        "Final Approved Qty": 130,
-        "Ordered?": 90,
-        "Buyer Initials": 100,
-        "Reviewer Initials": 110,
-        "Cross-Check Status": 140,
-        "Notes": 220,
-        "PO / Vendor Ref": 135,
     }
     requests: list[dict[str, Any]] = []
     for index, header in enumerate(headers):

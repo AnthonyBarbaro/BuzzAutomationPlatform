@@ -60,17 +60,12 @@
     "needs_order_min_qty": 1,
     "days_of_supply_urgent": 3.0,
     "days_of_supply_low": 7.0,
-    "high_sell_through_30d": 0.6
+    "high_sell_through_30d": 0.6,
+    "par_weight_7d": 0.5,
+    "par_weight_14d": 0.3,
+    "par_weight_30d": 0.2,
+    "par_stale_30d_dampener": 0.6,
+    "par_stockout_uplift_max": 0.25
   },
-  "review_manual_columns": [
-    "Shelf Count Checked",
-    "Proposed Order Qty",
-    "Final Approved Qty",
-    "Ordered?",
-    "Buyer Initials",
-    "Reviewer Initials",
-    "Cross-Check Status",
-    "Notes",
-    "PO / Vendor Ref"
-  ]
+  "review_manual_columns": []
 }
