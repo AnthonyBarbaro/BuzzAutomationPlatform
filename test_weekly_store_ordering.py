@@ -157,6 +157,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertIn(["Store", "NC - National City"], rows)
         self.assertIn(["Latest Week Generated", "2026-04-13"], rows)
         self.assertIn(["Latest Review Tab", "NC 2026-04-13 Review"], rows)
+        self.assertIn(["Training Video", "https://youtu.be/ri9VkqPGAUQ"], rows)
         self.assertIn(["Current Google Sheet Output", "This repo currently writes the REVIEW tab to Google Sheets."], rows)
         vendor_row = next(row for row in rows if row[0] == "Pick A Vendor Or Brand")
         self.assertIn("Filter Brand", vendor_row[1])
@@ -335,7 +336,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(_format_sell_through_triplet(1.0, 1.0, 1.0), "100%")
         self.assertEqual(_format_sell_through_triplet(0.375, 0.565, 0.60), "38% / 57% / 60%")
 
-    def test_sorting_uses_reorder_priority_after_price_within_same_group(self):
+    def test_sorting_uses_product_before_reorder_priority_within_same_group(self):
         metrics_df = pd.DataFrame(
             [
                 {
@@ -346,17 +347,6 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
                     "Price": 35.0,
                     "Reorder Priority": "Reorder",
                     "Priority Rank": 1,
-                    "Product": "Item C",
-                    "SKU": "SKU-C",
-                },
-                {
-                    "Vendor": "Vendor Alpha",
-                    "Brand": "Brand A",
-                    "Category": "Flower",
-                    "Cost": 12.0,
-                    "Price": 35.0,
-                    "Reorder Priority": "Urgent",
-                    "Priority Rank": 3,
                     "Product": "Item A",
                     "SKU": "SKU-A",
                 },
@@ -366,17 +356,29 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
                     "Category": "Flower",
                     "Cost": 12.0,
                     "Price": 35.0,
-                    "Reorder Priority": "Low Cover",
-                    "Priority Rank": 2,
+                    "Reorder Priority": "Urgent",
+                    "Priority Rank": 3,
                     "Product": "Item B",
                     "SKU": "SKU-B",
+                },
+                {
+                    "Vendor": "Vendor Alpha",
+                    "Brand": "Brand A",
+                    "Category": "Flower",
+                    "Cost": 12.0,
+                    "Price": 35.0,
+                    "Reorder Priority": "Low Cover",
+                    "Priority Rank": 2,
+                    "Product": "Item C",
+                    "SKU": "SKU-C",
                 },
             ]
         )
 
         sorted_df = sort_ordering_rows(metrics_df)
 
-        self.assertEqual(sorted_df["Reorder Priority"].tolist(), ["Urgent", "Low Cover", "Reorder"])
+        self.assertEqual(sorted_df["Product"].tolist(), ["Item A", "Item B", "Item C"])
+        self.assertEqual(sorted_df["Reorder Priority"].tolist(), ["Reorder", "Urgent", "Low Cover"])
         self.assertEqual(sorted_df["SKU"].tolist(), ["SKU-A", "SKU-B", "SKU-C"])
 
     def test_line_items_stay_separate_even_when_strain_family_matches(self):

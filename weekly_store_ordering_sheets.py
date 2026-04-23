@@ -10,6 +10,9 @@ import numpy as np
 
 from deals_brand_config_sync import _parse_sheet_target, authenticate_sheets
 
+WEEKLY_ORDERING_TRAINING_VIDEO_LABEL = "Training Video"
+WEEKLY_ORDERING_TRAINING_VIDEO_URL = "https://youtu.be/ri9VkqPGAUQ"
+
 
 def parse_spreadsheet_target(target: str) -> tuple[str, int | None]:
     text = str(target or "").strip()
@@ -134,6 +137,7 @@ def build_readme_rows(
             "Use This Workbook For",
             "Review weekly reorder suggestions for this store and capture final buying decisions in the weekly ordering tabs.",
         ],
+        [WEEKLY_ORDERING_TRAINING_VIDEO_LABEL, WEEKLY_ORDERING_TRAINING_VIDEO_URL],
         ["Start Here", start_here],
         ["Pick A Vendor Or Brand", vendor_brand_guide],
         ["Recommended Filters", filter_stack],
@@ -269,6 +273,7 @@ def upsert_readme_tab(
         service=service,
         spreadsheet_id=spreadsheet_id,
         sheet_info=refreshed_info,
+        values=values,
         total_rows=total_rows,
         total_columns=total_columns,
     )
@@ -683,6 +688,7 @@ def _format_readme_sheet(
     service: Any,
     spreadsheet_id: str,
     sheet_info: Mapping[str, Any],
+    values: Sequence[Sequence[Any]],
     total_rows: int,
     total_columns: int,
 ) -> None:
@@ -784,6 +790,60 @@ def _format_readme_sheet(
             }
         }
     )
+    training_video_row_index = next(
+        (
+            index
+            for index, row in enumerate(values)
+            if row and str(row[0]).strip() == "Training Video"
+        ),
+        None,
+    )
+    if training_video_row_index is not None:
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": training_video_row_index,
+                        "endRowIndex": training_video_row_index + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": total_columns,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": _rgb("#FFF2B3"),
+                            "textFormat": {"bold": True, "fontSize": 11},
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                }
+            }
+        )
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": training_video_row_index,
+                        "endRowIndex": training_video_row_index + 1,
+                        "startColumnIndex": 1,
+                        "endColumnIndex": min(total_columns, 2),
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": _rgb("#FFE08A"),
+                            "textFormat": {
+                                "bold": True,
+                                "fontSize": 11,
+                                "foregroundColor": _rgb("#0B57D0"),
+                                "underline": True,
+                            },
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                }
+            }
+        )
     requests.append(
         {
             "updateDimensionProperties": {
@@ -1200,6 +1260,16 @@ def _sheet_start_range(title: str) -> str:
 def _sheet_range(title: str) -> str:
     escaped = str(title).replace("'", "''")
     return f"'{escaped}'"
+
+
+def _find_readme_row_number(values: Sequence[Sequence[Any]], label: str) -> int | None:
+    target = str(label or "").strip()
+    if not target:
+        return None
+    for index, row in enumerate(values, start=1):
+        if row and str(row[0]).strip() == target:
+            return index
+    return None
 
 
 def _tab_color(sheet_kind: str) -> dict[str, float]:

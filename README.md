@@ -55,6 +55,11 @@ This repository is a Python automation stack (not a web backend) that:
 - `autoJob.py` - weekly orchestration (Dutchie API sales export -> deals -> upload -> email)
 - `listBrands.py` - lists unique brands from CSV files
 
+## Weekly Ordering Resources
+
+- Setup guide: `docs/weekly_store_ordering_setup.md`
+- Training video: https://youtu.be/ri9VkqPGAUQ
+
 ## Prerequisites
 
 - Python 3.10+

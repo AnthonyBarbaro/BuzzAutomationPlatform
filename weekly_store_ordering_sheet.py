@@ -1025,13 +1025,13 @@ def sort_ordering_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
         [
             "_brand_sort",
             "_category_sort",
-            "_priority_sort",
             "_cost_sort",
             "_price_sort",
             "_product_sort",
+            "_priority_sort",
             "_sku_sort",
         ],
-        ascending=[True, True, False, True, True, True, True],
+        ascending=[True, True, True, True, True, False, True],
     )
     return work.drop(
         columns=[

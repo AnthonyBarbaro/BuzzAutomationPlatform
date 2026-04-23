@@ -2,6 +2,8 @@
 
 ## What This Flow Does
 
+Training video: https://youtu.be/ri9VkqPGAUQ
+
 `weekly_store_ordering_sheet.py` builds a store-first, Dutchie API-only weekly reorder workbook and can write up to two tabs per store into one Google Spreadsheet:
 
 - `AUTO`: script-owned reorder output
@@ -24,11 +26,11 @@ The workflow supports two reorder modes:
 
 Current row ordering in the exported `AUTO` and `REVIEW` tabs is:
 
-- `Vendor`
 - `Brand`
 - `Category`
 - `Cost`
 - `Price`
+- `Product`
 - `Reorder Priority`
 
 This keeps like items together for faster buying review inside each store tab.
