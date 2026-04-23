@@ -108,6 +108,8 @@ def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PA
     config.setdefault("sheet_outputs", {})
     config["sheet_outputs"].setdefault("write_auto_tab", True)
     config["sheet_outputs"].setdefault("write_review_tab", True)
+    config.setdefault("sheet_formatting", {})
+    config["sheet_formatting"].setdefault("show_cost_price_separator_line", True)
     config.setdefault("sales", {})
     config["sales"].setdefault("window_days", 30)
     config["sales"].setdefault("excluded_statuses", ["cancelled", "canceled", "void", "voided", "deleted"])
@@ -1154,6 +1156,7 @@ def write_store_tabs_to_google_sheet(
             df=bundle["auto_df"],
             sheet_kind="auto",
             hidden_headers={"Row Key"},
+            show_cost_price_separator=bool(config.get("sheet_formatting", {}).get("show_cost_price_separator_line", True)),
         )
         write_result["auto"] = auto_write
         written_titles.append(auto_write["title"])
@@ -1176,6 +1179,7 @@ def write_store_tabs_to_google_sheet(
             df=preserved_review_df,
             sheet_kind="review",
             hidden_headers={"Row Key"},
+            show_cost_price_separator=bool(config.get("sheet_formatting", {}).get("show_cost_price_separator_line", True)),
         )
         write_result["review"] = review_write
         written_titles.append(review_write["title"])

@@ -19,6 +19,9 @@
     "write_auto_tab": false,
     "write_review_tab": true
   },
+  "sheet_formatting": {
+    "show_cost_price_separator_line": true
+  },
   "sales": {
     "window_days": 30,
     "excluded_statuses": [

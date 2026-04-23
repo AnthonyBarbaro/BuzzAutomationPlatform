@@ -292,6 +292,7 @@ def upsert_ordering_tab(
     df: pd.DataFrame,
     sheet_kind: str,
     hidden_headers: Iterable[str] | None = None,
+    show_cost_price_separator: bool = True,
 ) -> dict[str, Any]:
     sheet_info = ensure_sheet(service, spreadsheet_id, title, sheet_kind)
     values, header_row_number = build_sheet_matrix(summary_rows, df)
@@ -317,6 +318,7 @@ def upsert_ordering_tab(
         service=service,
         spreadsheet_id=spreadsheet_id,
         sheet_info=refreshed_info,
+        df=df,
         headers=list(df.columns),
         total_rows=total_rows,
         total_columns=total_columns,
@@ -326,6 +328,7 @@ def upsert_ordering_tab(
         header_row_number=header_row_number,
         hidden_headers=set(hidden_headers or []),
         sheet_kind=sheet_kind,
+        show_cost_price_separator=show_cost_price_separator,
     )
 
     return {
@@ -436,6 +439,7 @@ def _format_ordering_sheet(
     service: Any,
     spreadsheet_id: str,
     sheet_info: Mapping[str, Any],
+    df: pd.DataFrame,
     headers: Sequence[str],
     total_rows: int,
     total_columns: int,
@@ -445,6 +449,7 @@ def _format_ordering_sheet(
     header_row_number: int,
     hidden_headers: set[str],
     sheet_kind: str,
+    show_cost_price_separator: bool = True,
 ) -> None:
     sheet_id = int(sheet_info["sheet_id"])
     header_row_index = header_row_number - 1
@@ -664,6 +669,8 @@ def _format_ordering_sheet(
         )
     requests.extend(_column_width_requests(sheet_id, headers))
     requests.extend(_data_alignment_requests(sheet_id, headers, total_rows, header_row_number))
+    if show_cost_price_separator:
+        requests.extend(_cost_price_separator_requests(sheet_id, total_columns, df, header_row_number))
     requests.extend(
         _number_format_requests(
             sheet_id,
@@ -1176,6 +1183,38 @@ def _data_alignment_requests(
     return requests
 
 
+def _cost_price_separator_requests(
+    sheet_id: int,
+    total_columns: int,
+    df: pd.DataFrame,
+    header_row_number: int,
+) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+    if df is None or df.empty or total_columns <= 0:
+        return requests
+
+    for row_position in _cost_price_separator_positions(df):
+        sheet_row_index = header_row_number + row_position
+        requests.append(
+            {
+                "updateBorders": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": sheet_row_index,
+                        "endRowIndex": sheet_row_index + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": total_columns,
+                    },
+                    "top": {
+                        "style": "SOLID_THICK",
+                        "color": _rgb("#3C4043"),
+                    },
+                }
+            }
+        )
+    return requests
+
+
 def _column_width_requests(sheet_id: int, headers: Sequence[str]) -> list[dict[str, Any]]:
     widths = {
         "Row Key": 140,
@@ -1243,6 +1282,30 @@ def _sheet_safe_value(value: Any) -> Any:
     except Exception:
         pass
     return str(value)
+
+
+def _cost_price_separator_positions(df: pd.DataFrame) -> list[int]:
+    if df is None or df.empty:
+        return []
+
+    cost_series = pd.to_numeric(df.get("Cost"), errors="coerce") if "Cost" in df.columns else pd.Series(np.nan, index=df.index)
+    price_series = pd.to_numeric(df.get("Price"), errors="coerce") if "Price" in df.columns else pd.Series(np.nan, index=df.index)
+
+    separator_positions: list[int] = []
+    for row_position in range(1, len(df)):
+        cost_changed = not _numeric_values_match(cost_series.iloc[row_position - 1], cost_series.iloc[row_position])
+        price_changed = not _numeric_values_match(price_series.iloc[row_position - 1], price_series.iloc[row_position])
+        if cost_changed or price_changed:
+            separator_positions.append(row_position)
+    return separator_positions
+
+
+def _numeric_values_match(left: Any, right: Any) -> bool:
+    if pd.isna(left) and pd.isna(right):
+        return True
+    if pd.isna(left) or pd.isna(right):
+        return False
+    return float(left) == float(right)
 
 
 def build_summary_row_padding(row: Sequence[Any], width: int) -> list[Any]:

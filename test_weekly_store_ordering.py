@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 import weekly_store_ordering_sheet as weekly_sheet
+import weekly_store_ordering_sheets as weekly_sheet_sheets
 from weekly_store_ordering_sheet import (
     _format_sell_through_triplet,
     apply_exclusion_rules,
@@ -142,6 +143,9 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
         self.assertEqual(sheet_output_flags(config), {"auto": False, "review": True})
 
+    def test_sheet_formatting_defaults_enable_cost_price_separator_line(self):
+        self.assertTrue(self.config["sheet_formatting"]["show_cost_price_separator_line"])
+
     def test_build_readme_rows_includes_latest_review_tab_and_reflects_script_owned_layout(self):
         rows = build_readme_rows(
             store_code="NC",
@@ -186,6 +190,19 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
                 mock.call(service, "spreadsheet-123", "NC 2026-04-13 Auto", 2),
             ],
         )
+
+    def test_cost_price_separator_positions_mark_breaks_when_cost_or_price_changes(self):
+        df = pd.DataFrame(
+            [
+                {"Brand": "Ball Family Farms", "Category": "Flower", "Product": "Gelonade", "Cost": 12.0, "Price": 35.0},
+                {"Brand": "Ball Family Farms", "Category": "Flower", "Product": "Pookie", "Cost": 12.0, "Price": 35.0},
+                {"Brand": "Ball Family Farms", "Category": "Quarters", "Product": "A-Boogie", "Cost": 16.0, "Price": 45.0},
+                {"Brand": "Ball Family Farms", "Category": "Quarters", "Product": "Bishop", "Cost": 16.0, "Price": 45.0},
+                {"Brand": "Ball Family Farms", "Category": "Quarters", "Product": "Candy Gas", "Cost": 16.0, "Price": 50.0},
+            ]
+        )
+
+        self.assertEqual(weekly_sheet_sheets._cost_price_separator_positions(df), [2, 4])
 
     def test_low_cost_exclusion_uses_cost_only(self):
         config = json.loads(json.dumps(self.config))
