@@ -669,6 +669,7 @@ def _format_ordering_sheet(
         )
     requests.extend(_column_width_requests(sheet_id, headers))
     requests.extend(_data_alignment_requests(sheet_id, headers, total_rows, header_row_number))
+    requests.extend(_clear_cost_price_separator_border_requests(sheet_id, total_columns, total_rows, header_row_number))
     if show_cost_price_separator:
         requests.extend(_cost_price_separator_requests(sheet_id, total_columns, df, header_row_number))
     requests.extend(
@@ -1215,6 +1216,36 @@ def _cost_price_separator_requests(
     return requests
 
 
+def _clear_cost_price_separator_border_requests(
+    sheet_id: int,
+    total_columns: int,
+    total_rows: int,
+    header_row_number: int,
+) -> list[dict[str, Any]]:
+    if total_columns <= 0 or total_rows <= header_row_number:
+        return []
+
+    return [
+        {
+            "updateBorders": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": header_row_number,
+                    "endRowIndex": total_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": total_columns,
+                },
+                "top": {"style": "NONE"},
+                "bottom": {"style": "NONE"},
+                "left": {"style": "NONE"},
+                "right": {"style": "NONE"},
+                "innerHorizontal": {"style": "NONE"},
+                "innerVertical": {"style": "NONE"},
+            }
+        }
+    ]
+
+
 def _column_width_requests(sheet_id: int, headers: Sequence[str]) -> list[dict[str, Any]]:
     widths = {
         "Row Key": 140,
@@ -1290,12 +1321,14 @@ def _cost_price_separator_positions(df: pd.DataFrame) -> list[int]:
 
     cost_series = pd.to_numeric(df.get("Cost"), errors="coerce") if "Cost" in df.columns else pd.Series(np.nan, index=df.index)
     price_series = pd.to_numeric(df.get("Price"), errors="coerce") if "Price" in df.columns else pd.Series(np.nan, index=df.index)
+    category_series = df.get("Category") if "Category" in df.columns else pd.Series("", index=df.index)
 
     separator_positions: list[int] = []
     for row_position in range(1, len(df)):
         cost_changed = not _numeric_values_match(cost_series.iloc[row_position - 1], cost_series.iloc[row_position])
         price_changed = not _numeric_values_match(price_series.iloc[row_position - 1], price_series.iloc[row_position])
-        if cost_changed or price_changed:
+        category_changed = not _text_values_match(category_series.iloc[row_position - 1], category_series.iloc[row_position])
+        if cost_changed or price_changed or category_changed:
             separator_positions.append(row_position)
     return separator_positions
 
@@ -1305,7 +1338,17 @@ def _numeric_values_match(left: Any, right: Any) -> bool:
         return True
     if pd.isna(left) or pd.isna(right):
         return False
-    return float(left) == float(right)
+    # Compare using the same 2-decimal currency precision the sheet displays so
+    # tiny floating-point representation noise does not create fake separators.
+    return f"{float(left):.2f}" == f"{float(right):.2f}"
+
+
+def _text_values_match(left: Any, right: Any) -> bool:
+    if pd.isna(left) and pd.isna(right):
+        return True
+    if pd.isna(left) or pd.isna(right):
+        return False
+    return str(left).strip().upper() == str(right).strip().upper()
 
 
 def build_summary_row_padding(row: Sequence[Any], width: int) -> list[Any]:

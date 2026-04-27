@@ -27,10 +27,10 @@ The workflow supports two reorder modes:
 Current row ordering in the exported `AUTO` and `REVIEW` tabs is:
 
 - `Brand`
-- `Category`
 - `Cost`
 - `Price`
 - `Product`
+- `Category`
 - `Reorder Priority`
 
 This keeps like items together for faster buying review inside each store tab.

@@ -204,6 +204,28 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
         self.assertEqual(weekly_sheet_sheets._cost_price_separator_positions(df), [2, 4])
 
+    def test_cost_price_separator_positions_ignore_float_noise_that_displays_as_same_currency(self):
+        df = pd.DataFrame(
+            [
+                {"Brand": "710 Labs", "Category": "Eighths", "Product": "Cold Creek Kush", "Cost": 23.399999999999995, "Price": 65.0},
+                {"Brand": "710 Labs", "Category": "Eighths", "Product": "Rainbow Belts", "Cost": 23.4, "Price": 65.0},
+                {"Brand": "710 Labs", "Category": "Eighths", "Product": "Donny Burger", "Cost": 23.400000000000002, "Price": 65.0},
+            ]
+        )
+
+        self.assertEqual(weekly_sheet_sheets._cost_price_separator_positions(df), [])
+
+    def test_cost_price_separator_positions_mark_break_when_category_changes_with_same_cost_and_price(self):
+        df = pd.DataFrame(
+            [
+                {"Brand": "710 Labs", "Category": "Disposables", "Product": "710 | LRO AIO 1G | Upside Down Frown #15 + Gorilla Dosha #3", "Cost": 36.0, "Price": 90.0},
+                {"Brand": "710 Labs", "Category": "Concentrate", "Product": "710 | Persy Badder 1g | Grapefruit OG", "Cost": 36.0, "Price": 90.0},
+                {"Brand": "710 Labs", "Category": "Concentrate", "Product": "710 | Persy Badder 1g | Guava", "Cost": 36.0, "Price": 90.0},
+            ]
+        )
+
+        self.assertEqual(weekly_sheet_sheets._cost_price_separator_positions(df), [1])
+
     def test_low_cost_exclusion_uses_cost_only(self):
         config = json.loads(json.dumps(self.config))
         config["exclusions"]["exclude_low_cost_rows"] = True
@@ -397,6 +419,51 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(sorted_df["Product"].tolist(), ["Item A", "Item B", "Item C"])
         self.assertEqual(sorted_df["Reorder Priority"].tolist(), ["Reorder", "Urgent", "Low Cover"])
         self.assertEqual(sorted_df["SKU"].tolist(), ["SKU-A", "SKU-B", "SKU-C"])
+
+    def test_sorting_uses_product_before_category_within_same_brand_cost_price_block(self):
+        metrics_df = pd.DataFrame(
+            [
+                {
+                    "Brand": "710 Labs",
+                    "Category": "Disposables",
+                    "Cost": 36.0,
+                    "Price": 90.0,
+                    "Priority Rank": 1,
+                    "Product": "710 | LRO AIO 1G | Apple",
+                    "SKU": "SKU-B",
+                },
+                {
+                    "Brand": "710 Labs",
+                    "Category": "Concentrate",
+                    "Cost": 36.0,
+                    "Price": 90.0,
+                    "Priority Rank": 1,
+                    "Product": "710 | LRO AIO 1G | Banana",
+                    "SKU": "SKU-C",
+                },
+                {
+                    "Brand": "710 Labs",
+                    "Category": "Disposables",
+                    "Cost": 36.0,
+                    "Price": 90.0,
+                    "Priority Rank": 1,
+                    "Product": "710 | Persy Badder 1g | Guava",
+                    "SKU": "SKU-A",
+                },
+            ]
+        )
+
+        sorted_df = sort_ordering_rows(metrics_df)
+
+        self.assertEqual(
+            sorted_df["Product"].tolist(),
+            [
+                "710 | LRO AIO 1G | Apple",
+                "710 | LRO AIO 1G | Banana",
+                "710 | Persy Badder 1g | Guava",
+            ],
+        )
+        self.assertEqual(sorted_df["Category"].tolist(), ["Disposables", "Concentrate", "Disposables"])
 
     def test_line_items_stay_separate_even_when_strain_family_matches(self):
         merged_df = pd.DataFrame(
