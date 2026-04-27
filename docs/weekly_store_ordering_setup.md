@@ -27,13 +27,13 @@ The workflow supports two reorder modes:
 Current row ordering in the exported `AUTO` and `REVIEW` tabs is:
 
 - `Brand`
-- `Cost`
+- `Category`
 - `Price`
 - `Product`
-- `Category`
 - `Reorder Priority`
+- `Cost`
 
-This keeps like items together for faster buying review inside each store tab.
+This keeps like category blocks together and groups matching retail prices before cost differences inside each store tab.
 
 Default row filters also exclude:
 

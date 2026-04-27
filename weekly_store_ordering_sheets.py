@@ -1325,10 +1325,9 @@ def _cost_price_separator_positions(df: pd.DataFrame) -> list[int]:
 
     separator_positions: list[int] = []
     for row_position in range(1, len(df)):
-        cost_changed = not _numeric_values_match(cost_series.iloc[row_position - 1], cost_series.iloc[row_position])
         price_changed = not _numeric_values_match(price_series.iloc[row_position - 1], price_series.iloc[row_position])
         category_changed = not _text_values_match(category_series.iloc[row_position - 1], category_series.iloc[row_position])
-        if cost_changed or price_changed or category_changed:
+        if price_changed or category_changed:
             separator_positions.append(row_position)
     return separator_positions
 

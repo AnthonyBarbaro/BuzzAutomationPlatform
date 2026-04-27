@@ -384,6 +384,53 @@ def normalize_inventory_payload(inventory_payload: Any, store_code: str) -> pd.D
     return bmp.prepare_catalog_for_all_brands(normalized, [store_code])
 
 
+def normalize_products_payload(products_payload: Any, store_code: str) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    store_name = bmp._store_name_from_abbr(store_code)
+    for item in products_payload or []:
+        if not isinstance(item, dict):
+            continue
+
+        product_name = _clean_text(
+            item.get("productName"),
+            item.get("internalName"),
+            f"Unknown Product {item.get('productId')}",
+        )
+        category = _clean_text(item.get("category"), item.get("masterCategory"), "Unknown")
+        unit_price = _to_float(
+            item.get("price"),
+            item.get("recPrice"),
+            item.get("medPrice"),
+            item.get("unitPrice"),
+        )
+        brand_name = _clean_text(item.get("brandName"), bmp.osnap.parse_brand_from_product(product_name))
+
+        rows.append(
+            {
+                "SKU": _clean_text(item.get("sku")),
+                "Available": 0.0,
+                "Product": product_name,
+                "Cost": _to_float(item.get("unitCost")),
+                "Location price": unit_price,
+                "Price": unit_price,
+                "Category": category,
+                "Brand": brand_name,
+                "Strain": _clean_text(item.get("strain")),
+                "Vendor": _clean_text(item.get("vendorName"), item.get("producerName"), item.get("vendor")),
+                "Tags": "",
+                "Strain Type": _clean_text(item.get("strainType")),
+                "Store": store_name,
+                "Store Code": store_code,
+                "_store_abbr": store_code,
+            }
+        )
+
+    normalized = bmp._clean_flat_dataframe(pd.DataFrame(rows))
+    if normalized.empty:
+        return pd.DataFrame()
+    return bmp.prepare_catalog_for_all_brands(normalized, [store_code])
+
+
 def normalize_sales_payload(
     transactions_payload: Any,
     products_payload: Any,
@@ -415,12 +462,13 @@ def build_ordering_bundle(
     logger: logging.Logger,
 ) -> dict[str, Any]:
     filtered_transactions, transaction_drop_counts = filter_transaction_payload(payloads.get("transactions") or [], config)
+    catalog_prepared = normalize_products_payload(payloads.get("products"), store_code)
     inventory_prepared = normalize_inventory_payload(payloads.get("inventory"), store_code)
     sales_prepared = normalize_sales_payload(
         filtered_transactions,
         payloads.get("products"),
         store_code,
-        inventory_prepared,
+        catalog_prepared if not catalog_prepared.empty else inventory_prepared,
         logger,
     )
 
@@ -435,13 +483,14 @@ def build_ordering_bundle(
         as_of_day=as_of_day,
         velocity_window_days=int(config.get("reorder", {}).get("velocity_window_days", 30)),
     )
+    catalog_agg = aggregate_catalog_rows(catalog_prepared, store_code)
 
     eligible_brand_keys = set(sales_rows["brand_key"].dropna().astype(str).str.strip())
     eligible_brand_keys.discard("")
     eligible_vendor_keys = set(sales_rows["vendor_key"].dropna().astype(str).str.strip())
     eligible_vendor_keys.discard("")
 
-    merged = merge_inventory_sales(inventory_agg, sales_agg)
+    merged = merge_inventory_sales(inventory_agg, sales_agg, catalog_agg=catalog_agg)
     merged = apply_eligibility_rules(merged, eligible_brand_keys, eligible_vendor_keys, config)
     if not bool(config.get("eligibility", {}).get("include_sales_only_rows", True)):
         merged = merged[merged["inventory_row_count"] > 0].copy()
@@ -700,15 +749,39 @@ def aggregate_sales_rows(sales_rows: pd.DataFrame, as_of_day: date, velocity_win
     return grouped[_sales_agg_columns()].copy()
 
 
-def merge_inventory_sales(inventory_agg: pd.DataFrame, sales_agg: pd.DataFrame) -> pd.DataFrame:
+def aggregate_catalog_rows(catalog_prepared_df: pd.DataFrame, store_code: str) -> pd.DataFrame:
+    if catalog_prepared_df is None or catalog_prepared_df.empty:
+        return pd.DataFrame(columns=["row_key", "cost_catalog", "price_catalog"])
+
+    catalog_rows = inventory_rows_for_ordering(catalog_prepared_df, store_code)
+    if catalog_rows.empty:
+        return pd.DataFrame(columns=["row_key", "cost_catalog", "price_catalog"])
+
+    grouped = aggregate_inventory_rows(catalog_rows)
+    return grouped[["row_key", "cost", "price"]].rename(
+        columns={
+            "cost": "cost_catalog",
+            "price": "price_catalog",
+        }
+    )
+
+
+def merge_inventory_sales(
+    inventory_agg: pd.DataFrame,
+    sales_agg: pd.DataFrame,
+    catalog_agg: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if inventory_agg.empty and sales_agg.empty:
         return pd.DataFrame(columns=_merged_columns())
     if inventory_agg.empty:
         inventory_agg = pd.DataFrame(columns=_inventory_agg_columns())
     if sales_agg.empty:
         sales_agg = pd.DataFrame(columns=_sales_agg_columns())
+    if catalog_agg is None:
+        catalog_agg = pd.DataFrame(columns=["row_key", "cost_catalog", "price_catalog"])
 
     merged = inventory_agg.merge(sales_agg, on="row_key", how="outer", suffixes=("_inv", "_sales"))
+    merged = merged.merge(catalog_agg, on="row_key", how="left")
     for field, default in [
         ("store_code", ""),
         ("store_name", ""),
@@ -730,8 +803,16 @@ def merge_inventory_sales(inventory_agg: pd.DataFrame, sales_agg: pd.DataFrame) 
     merged["units_sold_30d"] = pd.to_numeric(merged.get("units_sold_30d", 0.0), errors="coerce").fillna(0.0).astype(float)
     merged["units_sold_velocity"] = pd.to_numeric(merged.get("units_sold_velocity", 0.0), errors="coerce").fillna(0.0).astype(float)
     merged["sales_row_count"] = pd.to_numeric(merged.get("sales_row_count", 0), errors="coerce").fillna(0).astype(int)
-    merged["cost"] = np.where(merged["cost_sales"].fillna(0.0) > 0, merged["cost_sales"], merged["cost_inv"]).astype(float)
-    merged["price"] = np.where(merged["price_inv"].fillna(0.0) > 0, merged["price_inv"], merged["price_sales"]).astype(float)
+    merged["cost"] = np.where(
+        pd.to_numeric(merged.get("cost_catalog"), errors="coerce").fillna(0.0) > 0,
+        merged["cost_catalog"],
+        np.where(merged["cost_sales"].fillna(0.0) > 0, merged["cost_sales"], merged["cost_inv"]),
+    ).astype(float)
+    merged["price"] = np.where(
+        pd.to_numeric(merged.get("price_catalog"), errors="coerce").fillna(0.0) > 0,
+        merged["price_catalog"],
+        np.where(merged["price_inv"].fillna(0.0) > 0, merged["price_inv"], merged["price_sales"]),
+    ).astype(float)
     merged["last_sale_date"] = pd.to_datetime(merged.get("last_sale_date", pd.NaT), errors="coerce").dt.date
     merged["has_inventory"] = merged["inventory_row_count"].fillna(0).astype(float) > 0
     merged["eligible_brand_30d"] = False
@@ -1026,14 +1107,14 @@ def sort_ordering_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
     work = work.sort_values(
         [
             "_brand_sort",
-            "_cost_sort",
+            "_category_sort",
             "_price_sort",
             "_product_sort",
-            "_category_sort",
             "_priority_sort",
+            "_cost_sort",
             "_sku_sort",
         ],
-        ascending=[True, True, True, True, True, False, True],
+        ascending=[True, True, True, True, False, True, True],
     )
     return work.drop(
         columns=[

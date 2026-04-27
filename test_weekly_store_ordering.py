@@ -191,7 +191,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
             ],
         )
 
-    def test_cost_price_separator_positions_mark_breaks_when_cost_or_price_changes(self):
+    def test_cost_price_separator_positions_mark_breaks_when_price_or_category_changes(self):
         df = pd.DataFrame(
             [
                 {"Brand": "Ball Family Farms", "Category": "Flower", "Product": "Gelonade", "Cost": 12.0, "Price": 35.0},
@@ -203,6 +203,17 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         )
 
         self.assertEqual(weekly_sheet_sheets._cost_price_separator_positions(df), [2, 4])
+
+    def test_cost_price_separator_positions_ignore_cost_only_changes(self):
+        df = pd.DataFrame(
+            [
+                {"Brand": "Cannabiotix (CBX)", "Category": "Eighths", "Product": "CBX | Flower 3.5g | H | Cereal Milk", "Cost": 17.92, "Price": 52.0},
+                {"Brand": "Cannabiotix (CBX)", "Category": "Eighths", "Product": "CBX | Flower 3.5g | I | 98 Octane", "Cost": 18.67, "Price": 52.0},
+                {"Brand": "Cannabiotix (CBX)", "Category": "Eighths", "Product": "CBX | Flower 3.5g | H | Kush Mountains", "Cost": 19.60, "Price": 52.0},
+            ]
+        )
+
+        self.assertEqual(weekly_sheet_sheets._cost_price_separator_positions(df), [])
 
     def test_cost_price_separator_positions_ignore_float_noise_that_displays_as_same_currency(self):
         df = pd.DataFrame(
@@ -321,7 +332,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
         self.assertEqual(par_level, 18)
 
-    def test_recent_sales_cost_is_preferred_over_bad_inventory_average(self):
+    def test_catalog_cost_and_price_are_preferred_over_sales_and_inventory_basis(self):
         inventory_agg = pd.DataFrame(
             [
                 {
@@ -367,9 +378,19 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
                 }
             ]
         )
+        catalog_agg = pd.DataFrame(
+            [
+                {
+                    "row_key": "MV|sku:40905401",
+                    "cost_catalog": 4.0,
+                    "price_catalog": 13.0,
+                }
+            ]
+        )
 
-        merged = weekly_sheet.merge_inventory_sales(inventory_agg, sales_agg)
+        merged = weekly_sheet.merge_inventory_sales(inventory_agg, sales_agg, catalog_agg=catalog_agg)
         self.assertEqual(float(merged.loc[0, "cost"]), 4.0)
+        self.assertEqual(float(merged.loc[0, "price"]), 13.0)
 
     def test_sell_through_display_rounds_to_whole_percent_and_collapses_matching_values(self):
         self.assertEqual(_format_sell_through_triplet(1.0, 1.0, 1.0), "100%")
@@ -420,7 +441,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(sorted_df["Reorder Priority"].tolist(), ["Reorder", "Urgent", "Low Cover"])
         self.assertEqual(sorted_df["SKU"].tolist(), ["SKU-A", "SKU-B", "SKU-C"])
 
-    def test_sorting_uses_product_before_category_within_same_brand_cost_price_block(self):
+    def test_sorting_uses_category_before_product_within_same_brand_price_block(self):
         metrics_df = pd.DataFrame(
             [
                 {
@@ -438,16 +459,16 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
                     "Cost": 36.0,
                     "Price": 90.0,
                     "Priority Rank": 1,
-                    "Product": "710 | LRO AIO 1G | Banana",
+                    "Product": "710 | Rosin 1G | Banana",
                     "SKU": "SKU-C",
                 },
                 {
                     "Brand": "710 Labs",
-                    "Category": "Disposables",
+                    "Category": "Eighths",
                     "Cost": 36.0,
                     "Price": 90.0,
                     "Priority Rank": 1,
-                    "Product": "710 | Persy Badder 1g | Guava",
+                    "Product": "710 | Flower 3.5g | Cherry",
                     "SKU": "SKU-A",
                 },
             ]
@@ -458,12 +479,57 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(
             sorted_df["Product"].tolist(),
             [
+                "710 | Rosin 1G | Banana",
                 "710 | LRO AIO 1G | Apple",
-                "710 | LRO AIO 1G | Banana",
-                "710 | Persy Badder 1g | Guava",
+                "710 | Flower 3.5g | Cherry",
             ],
         )
-        self.assertEqual(sorted_df["Category"].tolist(), ["Disposables", "Concentrate", "Disposables"])
+        self.assertEqual(sorted_df["Category"].tolist(), ["Concentrate", "Disposables", "Eighths"])
+
+    def test_sorting_uses_price_before_cost_within_same_brand_category_block(self):
+        metrics_df = pd.DataFrame(
+            [
+                {
+                    "Brand": "Cannabiotix (CBX)",
+                    "Category": "Eighths",
+                    "Cost": 17.92,
+                    "Price": 52.0,
+                    "Priority Rank": 1,
+                    "Product": "CBX | Flower 3.5g | H | Cereal Milk",
+                    "SKU": "SKU-A",
+                },
+                {
+                    "Brand": "Cannabiotix (CBX)",
+                    "Category": "Eighths",
+                    "Cost": 22.40,
+                    "Price": 52.0,
+                    "Priority Rank": 1,
+                    "Product": "CBX | Flower 3.5g | I | Jet Lag OG",
+                    "SKU": "SKU-B",
+                },
+                {
+                    "Brand": "Cannabiotix (CBX)",
+                    "Category": "Eighths",
+                    "Cost": 18.67,
+                    "Price": 65.0,
+                    "Priority Rank": 1,
+                    "Product": "CBX | Flower 3.5g | I | Red Eye OG",
+                    "SKU": "SKU-C",
+                },
+            ]
+        )
+
+        sorted_df = sort_ordering_rows(metrics_df)
+
+        self.assertEqual(
+            sorted_df["Product"].tolist(),
+            [
+                "CBX | Flower 3.5g | H | Cereal Milk",
+                "CBX | Flower 3.5g | I | Jet Lag OG",
+                "CBX | Flower 3.5g | I | Red Eye OG",
+            ],
+        )
+        self.assertEqual(sorted_df["Price"].tolist(), [52.0, 52.0, 65.0])
 
     def test_line_items_stay_separate_even_when_strain_family_matches(self):
         merged_df = pd.DataFrame(
