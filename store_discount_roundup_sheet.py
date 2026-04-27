@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import socket
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+from googleapiclient.errors import HttpError
 
 import owner_snapshot as osnap
 from deals_brand_config_sync import authenticate_sheets
@@ -27,6 +30,7 @@ THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV_FILE = THIS_DIR / ".env"
 SPREADSHEET_ID = "1MPE5ndMe3KKHr3KhO82aifusnl__hsCsRywzEYWsMk4"
 README_TITLE = "README"
+ALL_PRICING_TITLE = "All Pricing"
 STORE_TAB_TITLES = OrderedDict(
     [
         ("MV", "MV Pricing"),
@@ -43,10 +47,16 @@ CONTROL_HEADER_ROW = 2
 CONTROL_START_ROW = 3
 HEADER_ROW = 2
 DATA_START_ROW = HEADER_ROW + 1
-CONTROL_START_COL = 20  # T
-TOTAL_COLUMNS = 23  # A:W
+LEGACY_CONTROL_START_COL = 20  # T
+CONTROL_START_COL = 25  # Y
+TOTAL_COLUMNS = 29  # A:AC
 DEFAULT_DISCOUNT_CELL = "R1"
 TAX_MULTIPLIER_CELL = "P1"
+KICKBACK_DISCOUNT_THRESHOLD = 0.30
+DEFAULT_KICKBACK_PCT = 0.25
+SHEETS_WRITE_CHUNK_ROWS = 250
+SHEETS_WRITE_CHUNK_CHARS = 900_000
+SHEETS_WRITE_RETRY_ATTEMPTS = 4
 
 MAIN_HEADERS = [
     "Brand",
@@ -66,11 +76,35 @@ MAIN_HEADERS = [
     "Status",
     "Brand Notes",
     "Finished Helper",
+    "Cost Price",
+    "Kickback %",
+    "Old Margin %",
+    "New Projected Margin %",
 ]
-CONTROL_HEADERS = ["Brand", "Discount %", "Finished?", "Notes"]
+CONTROL_HEADERS = ["Brand", "Discount %", "Kickback %", "Finished?", "Notes"]
+LEGACY_CONTROL_HEADERS = ["Brand", "Discount %", "Finished?", "Notes"]
+ALL_PRICING_HEADERS = [
+    "Price Scope",
+    "Stores",
+    "Brand",
+    "Category",
+    "Product",
+    "Available",
+    "Current Shelf Price",
+    "Cost Price",
+    "Suggested Shared Shelf Price",
+    "Projected Shared OTD",
+    "Max Discount %",
+    "Max Kickback %",
+    "Worst Old Margin %",
+    "Worst Projected Margin %",
+    "Price Notes",
+    "Store Rows",
+]
 LEFT_ALIGN_HEADERS = {"Brand", "Category", "Product", "Brand Notes"}
 CURRENCY_HEADERS = {
     "Current Shelf Price",
+    "Cost Price",
     "Current Discounted Shelf",
     "Current Discounted OTD",
     "Rounded OTD Target",
@@ -79,9 +113,19 @@ CURRENCY_HEADERS = {
     "Suggested New OTD",
     "Price Change",
 }
-PERCENT_HEADERS = {"Applied Discount %", "Price Change %"}
+PERCENT_HEADERS = {"Applied Discount %", "Price Change %", "Kickback %", "Old Margin %", "New Projected Margin %"}
 INTEGER_HEADERS = {"Available"}
 HIDDEN_HEADERS = {"Finished Helper"}
+ALL_PRICING_LEFT_ALIGN_HEADERS = {"Price Scope", "Stores", "Brand", "Category", "Product", "Price Notes", "Store Rows"}
+ALL_PRICING_CURRENCY_HEADERS = {
+    "Current Shelf Price",
+    "Cost Price",
+    "Suggested Shared Shelf Price",
+    "Projected Shared OTD",
+}
+ALL_PRICING_PERCENT_HEADERS = {"Max Discount %", "Max Kickback %", "Worst Old Margin %", "Worst Projected Margin %"}
+ALL_PRICING_INTEGER_HEADERS = {"Available"}
+ALL_PRICING_HIDDEN_HEADERS = {"Store Rows"}
 
 
 @dataclass(frozen=True)
@@ -166,9 +210,39 @@ def _to_float(value: Any) -> float:
     try:
         if value in (None, ""):
             return 0.0
-        return float(value)
+        number = float(value)
+        if pd.isna(number):
+            return 0.0
+        return number
     except Exception:
         return 0.0
+
+
+def _first_positive_float(*values: Any) -> float:
+    for value in values:
+        number = _to_float(value)
+        if number > 0:
+            return number
+    return 0.0
+
+
+SOURCE_COLUMNS = [
+    "merge_key",
+    "Brand",
+    "Category",
+    "Product",
+    "Vendor",
+    "Current Shelf Price",
+    "Inventory Cost",
+    "Available",
+    "Product ID",
+    "Catalog Source",
+    "Inventory Source",
+]
+
+
+def _empty_source_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=SOURCE_COLUMNS)
 
 
 def _should_exclude_product(product_name: str, current_price: float) -> bool:
@@ -216,6 +290,14 @@ def _normalize_products_payload(products_payload: Any) -> pd.DataFrame:
                 item.get("medPrice"),
             )
         )
+        inventory_cost = _to_float(
+            _first_nonempty(
+                item.get("unitCost"),
+                item.get("cost"),
+                item.get("wholesaleCost"),
+                item.get("lastWholesaleCost"),
+            )
+        )
         product_id = _first_nonempty(item.get("productId"), item.get("id"), "")
         rows.append(
             {
@@ -225,6 +307,7 @@ def _normalize_products_payload(products_payload: Any) -> pd.DataFrame:
                 "Product": product_name,
                 "Vendor": vendor,
                 "Current Shelf Price": current_price,
+                "Inventory Cost": inventory_cost,
                 "Available": 0.0,
                 "Product ID": str(product_id).strip(),
                 "Catalog Source": True,
@@ -234,20 +317,7 @@ def _normalize_products_payload(products_payload: Any) -> pd.DataFrame:
 
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return pd.DataFrame(
-            columns=[
-                "merge_key",
-                "Brand",
-                "Category",
-                "Product",
-                "Vendor",
-                "Current Shelf Price",
-                "Available",
-                "Product ID",
-                "Catalog Source",
-                "Inventory Source",
-            ]
-        )
+        return _empty_source_frame()
     return frame
 
 
@@ -272,6 +342,14 @@ def _normalize_inventory_payload(inventory_payload: Any) -> pd.DataFrame:
                 item.get("price"),
             )
         )
+        inventory_cost = _to_float(
+            _first_nonempty(
+                item.get("unitCost"),
+                item.get("cost"),
+                item.get("wholesaleCost"),
+                item.get("lastWholesaleCost"),
+            )
+        )
         available = _to_float(item.get("quantityAvailable"))
         product_id = _first_nonempty(item.get("productId"), item.get("id"), "")
         rows.append(
@@ -282,6 +360,7 @@ def _normalize_inventory_payload(inventory_payload: Any) -> pd.DataFrame:
                 "Product": product_name,
                 "Vendor": vendor,
                 "Current Shelf Price": current_price,
+                "Inventory Cost": inventory_cost,
                 "Available": available,
                 "Product ID": str(product_id).strip(),
                 "Catalog Source": False,
@@ -291,20 +370,7 @@ def _normalize_inventory_payload(inventory_payload: Any) -> pd.DataFrame:
 
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return pd.DataFrame(
-            columns=[
-                "merge_key",
-                "Brand",
-                "Category",
-                "Product",
-                "Vendor",
-                "Current Shelf Price",
-                "Available",
-                "Product ID",
-                "Catalog Source",
-                "Inventory Source",
-            ]
-        )
+        return _empty_source_frame()
     return frame
 
 
@@ -312,25 +378,41 @@ def _dedupe_source_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
 
-    group_cols = ["merge_key"]
-    aggregated = (
-        frame.groupby(group_cols, as_index=False)
-        .agg(
+    working = frame.copy()
+    for column in SOURCE_COLUMNS:
+        if column not in working.columns:
+            working[column] = "" if column not in {"Current Shelf Price", "Inventory Cost", "Available"} else 0.0
+
+    rows: list[dict[str, Any]] = []
+    for merge_key, group in working.groupby("merge_key", dropna=False, sort=False):
+        costs = pd.to_numeric(group["Inventory Cost"], errors="coerce")
+        available = pd.to_numeric(group["Available"], errors="coerce").fillna(0.0)
+        valid_costs = costs.notna() & (costs > 0)
+
+        if bool(valid_costs.any()) and float(available[valid_costs].sum()) > 0:
+            inventory_cost = float((costs[valid_costs] * available[valid_costs]).sum() / available[valid_costs].sum())
+        elif bool(valid_costs.any()):
+            inventory_cost = float(costs[valid_costs].max())
+        else:
+            inventory_cost = 0.0
+
+        rows.append(
             {
-                "Brand": "first",
-                "Category": "first",
-                "Product": "first",
-                "Vendor": "first",
-                "Current Shelf Price": "max",
-                "Available": "sum",
-                "Product ID": "first",
-                "Catalog Source": "max",
-                "Inventory Source": "max",
+                "merge_key": merge_key,
+                "Brand": group["Brand"].iloc[0],
+                "Category": group["Category"].iloc[0],
+                "Product": group["Product"].iloc[0],
+                "Vendor": group["Vendor"].iloc[0],
+                "Current Shelf Price": float(pd.to_numeric(group["Current Shelf Price"], errors="coerce").fillna(0.0).max()),
+                "Inventory Cost": inventory_cost,
+                "Available": float(available.sum()),
+                "Product ID": group["Product ID"].iloc[0],
+                "Catalog Source": bool(group["Catalog Source"].max()),
+                "Inventory Source": bool(group["Inventory Source"].max()),
             }
         )
-        .copy()
-    )
-    return aggregated
+
+    return pd.DataFrame(rows, columns=SOURCE_COLUMNS)
 
 
 def _merge_similar_brand_rows(frame: pd.DataFrame) -> pd.DataFrame:
@@ -339,10 +421,11 @@ def _merge_similar_brand_rows(frame: pd.DataFrame) -> pd.DataFrame:
 
     working = frame.copy()
     working["Current Shelf Price"] = pd.to_numeric(working["Current Shelf Price"], errors="coerce").fillna(0).round(2)
+    working["Inventory Cost"] = pd.to_numeric(working.get("Inventory Cost", 0), errors="coerce").fillna(0).round(2)
     working["Available"] = pd.to_numeric(working["Available"], errors="coerce").fillna(0)
 
     merged_rows: list[dict[str, Any]] = []
-    for _, group in working.groupby(["Brand", "Category", "Current Shelf Price"], dropna=False, sort=False):
+    for _, group in working.groupby(["Brand", "Category", "Current Shelf Price", "Inventory Cost"], dropna=False, sort=False):
         if group.empty:
             continue
 
@@ -358,7 +441,7 @@ def _merge_similar_brand_rows(frame: pd.DataFrame) -> pd.DataFrame:
 
         row["Product"] = display_name
         row["Available"] = float(group["Available"].sum())
-        merged_rows.append(row[["Brand", "Category", "Product", "Available", "Current Shelf Price"]].to_dict())
+        merged_rows.append(row[["Brand", "Category", "Product", "Available", "Current Shelf Price", "Inventory Cost"]].to_dict())
 
     if not merged_rows:
         return frame.iloc[0:0].copy()
@@ -408,6 +491,7 @@ def build_store_catalog_frame(products_payload: Any, inventory_payload: Any) -> 
                 0.0,
             )
         )
+        cost = _first_positive_float(row.get("Inventory Cost_inventory"), row.get("Inventory Cost_catalog"))
         available = _to_float(row.get("Available_inventory"))
 
         if not product:
@@ -426,22 +510,23 @@ def build_store_catalog_frame(products_payload: Any, inventory_payload: Any) -> 
                 "Product": product,
                 "Available": available,
                 "Current Shelf Price": current_price,
+                "Inventory Cost": cost,
             }
         )
 
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return pd.DataFrame(columns=["Brand", "Category", "Product", "Available", "Current Shelf Price"])
+        return pd.DataFrame(columns=["Brand", "Category", "Product", "Available", "Current Shelf Price", "Inventory Cost"])
 
     frame = (
-        frame.groupby(["Brand", "Category", "Product", "Current Shelf Price"], as_index=False)
+        frame.groupby(["Brand", "Category", "Product", "Current Shelf Price", "Inventory Cost"], as_index=False)
         .agg({"Available": "sum"})
         .copy()
     )
-    frame = frame[["Brand", "Category", "Product", "Available", "Current Shelf Price"]]
+    frame = frame[["Brand", "Category", "Product", "Available", "Current Shelf Price", "Inventory Cost"]]
     frame = _merge_similar_brand_rows(frame)
     frame = frame.sort_values(
-        by=["Brand", "Category", "Current Shelf Price", "Product"],
+        by=["Brand", "Category", "Current Shelf Price", "Inventory Cost", "Product"],
         kind="stable",
     ).reset_index(drop=True)
     return frame
@@ -531,24 +616,69 @@ def _a1(sheet_title: str, a1_range: str) -> str:
     return f"'{escaped}'!{a1_range}"
 
 
-def read_existing_store_controls(service: Any, spreadsheet_id: str, title: str) -> tuple[Any, dict[str, dict[str, Any]]]:
-    values = _values_get(service, spreadsheet_id, _a1(title, "T2:W"), value_render_option="FORMULA")
+def _sheet_cell_ref(sheet_title: str, col_index: int, row_number: int) -> str:
+    escaped = sheet_title.replace("'", "''")
+    return f"'{escaped}'!${_column_letter(col_index)}${row_number}"
+
+
+def _control_read_range(start_col: int, header_count: int) -> str:
+    start_letter = _column_letter(start_col)
+    end_letter = _column_letter(start_col + header_count - 1)
+    return f"{start_letter}{CONTROL_HEADER_ROW}:{end_letter}"
+
+
+def _parse_control_rows(values: list[list[Any]]) -> dict[str, dict[str, Any]]:
     controls: dict[str, dict[str, Any]] = {}
-    if values:
-        rows = list(values)
-        header = [str(value).strip() for value in rows[0]]
-        if header[:4] == CONTROL_HEADERS:
-            for row in rows[1:]:
-                padded = list(row) + [""] * (4 - len(row))
-                brand = str(padded[0]).strip()
-                if not brand:
-                    continue
-                controls[brand.casefold()] = {
-                    "brand": brand,
-                    "discount": padded[1],
-                    "finished": padded[2],
-                    "notes": padded[3],
-                }
+    if not values:
+        return controls
+
+    rows = list(values)
+    header = [str(value).strip() for value in rows[0]]
+    if header[: len(CONTROL_HEADERS)] == CONTROL_HEADERS:
+        mode = "current"
+    elif header[: len(LEGACY_CONTROL_HEADERS)] == LEGACY_CONTROL_HEADERS:
+        mode = "legacy"
+    else:
+        return controls
+
+    for row in rows[1:]:
+        if mode == "current":
+            padded = list(row) + [""] * (len(CONTROL_HEADERS) - len(row))
+            brand, discount, kickback, finished, notes = padded[:5]
+        else:
+            padded = list(row) + [""] * (len(LEGACY_CONTROL_HEADERS) - len(row))
+            brand, discount, finished, notes = padded[:4]
+            kickback = ""
+
+        brand_text = str(brand).strip()
+        if not brand_text:
+            continue
+        controls[brand_text.casefold()] = {
+            "brand": brand_text,
+            "discount": discount,
+            "kickback": kickback,
+            "finished": finished,
+            "notes": notes,
+        }
+    return controls
+
+
+def read_existing_store_controls(service: Any, spreadsheet_id: str, title: str) -> tuple[Any, dict[str, dict[str, Any]]]:
+    current_values = _values_get(
+        service,
+        spreadsheet_id,
+        _a1(title, _control_read_range(CONTROL_START_COL, len(CONTROL_HEADERS))),
+        value_render_option="FORMULA",
+    )
+    controls = _parse_control_rows(current_values)
+    if not controls:
+        legacy_values = _values_get(
+            service,
+            spreadsheet_id,
+            _a1(title, _control_read_range(LEGACY_CONTROL_START_COL, len(LEGACY_CONTROL_HEADERS))),
+            value_render_option="FORMULA",
+        )
+        controls = _parse_control_rows(legacy_values)
 
     default_discount_values = _values_get(service, spreadsheet_id, _a1(title, DEFAULT_DISCOUNT_CELL), value_render_option="FORMULA")
     default_discount = default_discount_values[0][0] if default_discount_values and default_discount_values[0] else 0.30
@@ -579,15 +709,20 @@ def build_brand_control_rows(
     ordered = sorted((brand for brand in control_brands if brand), key=str.casefold)
 
     rows: list[list[Any]] = []
-    for brand in ordered:
+    discount_col_letter = _column_letter(CONTROL_START_COL + 1)
+    for offset, brand in enumerate(ordered):
+        row_number = CONTROL_START_ROW + offset
         existing = existing_controls.get(brand.casefold(), {})
         discount = existing.get("discount", "") if existing else ""
+        kickback = existing.get("kickback", "") if existing else ""
         finished = existing.get("finished", "") if existing else ""
         notes = existing.get("notes", "") if existing else ""
+        default_kickback_formula = f'=IF({discount_col_letter}{row_number}>{KICKBACK_DISCOUNT_THRESHOLD},{DEFAULT_KICKBACK_PCT},0)'
         rows.append(
             [
                 brand,
                 discount if str(discount).strip() else default_discount_formula,
+                kickback if str(kickback).strip() else default_kickback_formula,
                 _normalize_checkbox_value(finished),
                 notes,
             ]
@@ -611,9 +746,19 @@ def _sheet_value(value: Any) -> Any:
     return value
 
 
+def _open_col_range(col_index: int, start_row: int = CONTROL_START_ROW) -> str:
+    letter = _column_letter(col_index)
+    return f"${letter}${start_row}:${letter}"
+
+
 def _formula_for_row(row_number: int, column_name: str) -> str:
+    control_brand_range = _open_col_range(CONTROL_START_COL)
+    control_discount_range = _open_col_range(CONTROL_START_COL + 1)
+    control_kickback_range = _open_col_range(CONTROL_START_COL + 2)
+    control_finished_range = _open_col_range(CONTROL_START_COL + 3)
+    control_notes_range = _open_col_range(CONTROL_START_COL + 4)
     if column_name == "Applied Discount %":
-        return f'=IFNA(XLOOKUP($A{row_number},$T$3:$T,$U$3:$U),${DEFAULT_DISCOUNT_CELL})'
+        return f'=IFNA(XLOOKUP($A{row_number},{control_brand_range},{control_discount_range}),${DEFAULT_DISCOUNT_CELL})'
     if column_name == "Suggested Shelf Price":
         return f'=IF(OR($K{row_number}="",$G{row_number}>=1),"",ROUNDUP($K{row_number}/(1-$G{row_number}),2))'
     if column_name == "Current Discounted Shelf":
@@ -631,11 +776,21 @@ def _formula_for_row(row_number: int, column_name: str) -> str:
     if column_name == "Price Change %":
         return f'=IF(OR($M{row_number}="",$E{row_number}=0),"",$M{row_number}/$E{row_number})'
     if column_name == "Finished Helper":
-        return f'=IFNA(XLOOKUP($A{row_number},$T$3:$T,$V$3:$V),FALSE)'
+        return f'=IFNA(XLOOKUP($A{row_number},{control_brand_range},{control_finished_range}),FALSE)'
     if column_name == "Status":
         return f'=IF($Q{row_number},"Done","")'
     if column_name == "Brand Notes":
-        return f'=IFNA(XLOOKUP($A{row_number},$T$3:$T,$W$3:$W),"")'
+        return f'=IFNA(XLOOKUP($A{row_number},{control_brand_range},{control_notes_range}),"")'
+    if column_name == "Kickback %":
+        return f'=IFNA(XLOOKUP($A{row_number},{control_brand_range},{control_kickback_range}),0)'
+    if column_name == "Old Margin %":
+        revenue = f'ROUNDDOWN($I{row_number}/${TAX_MULTIPLIER_CELL},2)'
+        adjusted_cost = f'$R{row_number}*(1-$S{row_number})'
+        return f'=IFERROR(IF(OR($R{row_number}<=0,{revenue}<=0),"",({revenue}-({adjusted_cost}))/{revenue}),"")'
+    if column_name == "New Projected Margin %":
+        revenue = f'ROUNDDOWN($L{row_number}/${TAX_MULTIPLIER_CELL},2)'
+        adjusted_cost = f'$R{row_number}*(1-$S{row_number})'
+        return f'=IFERROR(IF(OR($R{row_number}<=0,$F{row_number}="",{revenue}<=0),"",({revenue}-({adjusted_cost}))/{revenue}),"")'
     return ""
 
 
@@ -682,6 +837,8 @@ def build_store_sheet_matrix(
         for col_index, header in enumerate(MAIN_HEADERS, start=1):
             if header in values:
                 set_cell(row_offset, col_index, values[header])
+            elif header == "Cost Price" and "Inventory Cost" in values:
+                set_cell(row_offset, col_index, values["Inventory Cost"])
             else:
                 formula = _formula_for_row(row_offset, header)
                 set_cell(row_offset, col_index, formula)
@@ -699,15 +856,31 @@ def build_readme_rows(generated_at: str) -> list[list[Any]]:
         ],
         [
             "How To Use",
-            "Each store tab has a Brand Controls box on the right. Change the brand-level discount there from the default 30% to 40% or 50% when needed, check Finished? when a brand is done, and the product rows update automatically.",
+            "Each store tab has a Brand Controls box on the right. Change brand-level Discount % and Kickback % there, check Finished? when a brand is done, and the product rows update automatically. Use All Pricing for shared price buckets across stores.",
         ],
         [
             "Main Formula",
             "Current Discounted OTD = Current Shelf Price x (1 - discount) x tax multiplier. Rounded OTD Target = ROUNDUP(Current Discounted OTD, 0). Suggested Shelf Price = ROUNDUP(ROUNDUP(Rounded OTD Target / tax multiplier, 2) / (1 - discount), 2).",
         ],
         [
-        "Rerun Safety",
-            "Brand-level Discount %, Finished?, and Notes are preserved on rerun for each store tab.",
+            "Margins",
+            "Old Margin % and New Projected Margin % use tax-backed revenue rounded down from OTD, then subtract Cost Price after Kickback %. New brand controls default Kickback % to 25% when Discount % is above the default 30%, and you can override it.",
+        ],
+        [
+            "Cost Price Reference",
+            "Cost Price comes from Dutchie unitCost when available and is shown on each store tab plus the All Pricing rollup.",
+        ],
+        [
+            "All Pricing",
+            "The All Pricing tab rolls store rows into shared price buckets. If the same product/cost has different shelf prices by store, those location-price buckets stay separate.",
+        ],
+        [
+            "Training Video",
+            "https://youtu.be/La_JT4Pir0I",
+        ],
+        [
+            "Rerun Safety",
+            "Brand-level Discount %, Kickback %, Finished?, and Notes are preserved on rerun for each store tab.",
         ],
         [
             "Excluded Rows",
@@ -715,7 +888,7 @@ def build_readme_rows(generated_at: str) -> list[list[Any]]:
         ],
         [
             "Consolidation",
-            "Products from the same brand and category with the same shelf price are grouped into one row, with product names rolled up automatically.",
+            "Products from the same brand and category with the same shelf price and inventory cost are grouped into one row, with product names rolled up automatically.",
         ],
         [
             "Store Tax Assumption",
@@ -723,23 +896,89 @@ def build_readme_rows(generated_at: str) -> list[list[Any]]:
         ],
         [
             "Store Tabs",
-            ", ".join(STORE_TAB_TITLES.values()),
+            ", ".join([ALL_PRICING_TITLE, *STORE_TAB_TITLES.values()]),
         ],
     ]
 
 
-def write_values(service: Any, spreadsheet_id: str, title: str, matrix: list[list[Any]]) -> None:
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=_a1(title, "A1:W"),
-        body={},
-    ).execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=_a1(title, "A1"),
-        valueInputOption="USER_ENTERED",
-        body={"values": matrix},
-    ).execute()
+def _is_retryable_google_error(error: HttpError) -> bool:
+    status = getattr(getattr(error, "resp", None), "status", None)
+    try:
+        status_int = int(status)
+    except Exception:
+        return False
+    return status_int in {429, 500, 502, 503, 504}
+
+
+def _execute_sheet_request(request: Any, label: str) -> Any:
+    for attempt in range(1, SHEETS_WRITE_RETRY_ATTEMPTS + 1):
+        try:
+            return request.execute()
+        except (TimeoutError, socket.timeout) as exc:
+            if attempt >= SHEETS_WRITE_RETRY_ATTEMPTS:
+                raise
+            wait_seconds = min(30, 2**attempt)
+            print(f"[RETRY] {label}: timed out ({exc}); retrying in {wait_seconds}s")
+            time.sleep(wait_seconds)
+        except HttpError as exc:
+            if attempt >= SHEETS_WRITE_RETRY_ATTEMPTS or not _is_retryable_google_error(exc):
+                raise
+            wait_seconds = min(30, 2**attempt)
+            print(f"[RETRY] {label}: Google API {exc.resp.status}; retrying in {wait_seconds}s")
+            time.sleep(wait_seconds)
+    return None
+
+
+def _matrix_batches(
+    matrix: list[list[Any]],
+    max_rows: int = SHEETS_WRITE_CHUNK_ROWS,
+    max_chars: int = SHEETS_WRITE_CHUNK_CHARS,
+) -> Iterable[tuple[int, list[list[Any]]]]:
+    start_index = 0
+    while start_index < len(matrix):
+        batch: list[list[Any]] = []
+        batch_chars = 0
+        index = start_index
+        while index < len(matrix):
+            row = matrix[index]
+            row_chars = sum(len(str(value)) for value in row)
+            if batch and (len(batch) >= max_rows or batch_chars + row_chars > max_chars):
+                break
+            batch.append(row)
+            batch_chars += row_chars
+            index += 1
+
+        yield start_index + 1, batch
+        start_index += len(batch)
+
+
+def write_values(service: Any, spreadsheet_id: str, title: str, matrix: list[list[Any]], total_columns: int | None = None) -> None:
+    width = total_columns or max((len(row) for row in matrix), default=TOTAL_COLUMNS)
+    _execute_sheet_request(
+        service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=_a1(title, f"A1:{_column_letter(width)}"),
+            body={},
+        ),
+        f"clear {title}",
+    )
+    if not matrix:
+        return
+
+    batches = list(_matrix_batches(matrix))
+    if len(batches) > 1:
+        print(f"[WRITE] {title}: sending {len(matrix)} rows in {len(batches)} chunk(s)")
+    for start_row, rows in batches:
+        end_row = start_row + len(rows) - 1
+        _execute_sheet_request(
+            service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=_a1(title, f"A{start_row}"),
+                valueInputOption="USER_ENTERED",
+                body={"values": rows},
+            ),
+            f"write {title} rows {start_row}-{end_row}",
+        )
 
 
 def _delete_existing_banding_and_rules(sheet_info: dict[str, Any]) -> list[dict[str, Any]]:
@@ -902,7 +1141,7 @@ def format_store_sheet(
                             "startRowIndex": HEADER_ROW - 1,
                             "endRowIndex": max(total_rows, HEADER_ROW),
                             "startColumnIndex": 0,
-                            "endColumnIndex": len(MAIN_HEADERS) - 1,
+                            "endColumnIndex": len(MAIN_HEADERS),
                         }
                     }
                 }
@@ -910,6 +1149,21 @@ def format_store_sheet(
         )
 
     if control_row_count:
+        if LEGACY_CONTROL_START_COL != CONTROL_START_COL:
+            requests.append(
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": CONTROL_START_ROW - 1,
+                            "endRowIndex": control_end_row,
+                            "startColumnIndex": LEGACY_CONTROL_START_COL + 1,
+                            "endColumnIndex": LEGACY_CONTROL_START_COL + 2,
+                        },
+                        "rule": None,
+                    }
+                }
+            )
         requests.append(
             {
                 "addBanding": {
@@ -931,8 +1185,8 @@ def format_store_sheet(
                         "sheetId": sheet_id,
                         "startRowIndex": CONTROL_START_ROW - 1,
                         "endRowIndex": control_end_row,
-                        "startColumnIndex": CONTROL_START_COL + 1,
-                        "endColumnIndex": CONTROL_START_COL + 2,
+                        "startColumnIndex": CONTROL_START_COL + 2,
+                        "endColumnIndex": CONTROL_START_COL + 3,
                     },
                     "rule": {
                         "condition": {"type": "BOOLEAN"},
@@ -1066,6 +1320,10 @@ def _column_width(header: str) -> int:
         "Status": 90,
         "Brand Notes": 220,
         "Finished Helper": 90,
+        "Cost Price": 115,
+        "Kickback %": 95,
+        "Old Margin %": 110,
+        "New Projected Margin %": 140,
     }
     return widths.get(header, 110)
 
@@ -1074,6 +1332,7 @@ def _control_column_width(header: str) -> int:
     widths = {
         "Brand": 150,
         "Discount %": 110,
+        "Kickback %": 110,
         "Finished?": 90,
         "Notes": 180,
     }
@@ -1147,6 +1406,7 @@ def _number_format_requests(sheet_id: int, total_rows: int, control_end_row: int
 
     if control_end_row >= CONTROL_START_ROW:
         add_repeat(CONTROL_START_COL + 1, "0.00%", CONTROL_START_ROW, control_end_row)
+        add_repeat(CONTROL_START_COL + 2, "0.00%", CONTROL_START_ROW, control_end_row)
 
     return requests
 
@@ -1159,7 +1419,7 @@ def _conditional_format_requests(sheet_id: int, total_rows: int, control_end_row
             "startRowIndex": DATA_START_ROW - 1,
             "endRowIndex": total_rows,
             "startColumnIndex": 0,
-            "endColumnIndex": len(MAIN_HEADERS) - 1,
+            "endColumnIndex": len(MAIN_HEADERS),
         }
         requests.extend(
             [
@@ -1235,7 +1495,7 @@ def _conditional_format_requests(sheet_id: int, total_rows: int, control_end_row
                         "booleanRule": {
                             "condition": {
                                 "type": "CUSTOM_FORMULA",
-                                "values": [{"userEnteredValue": f"=$V{CONTROL_START_ROW}=TRUE"}],
+                                "values": [{"userEnteredValue": f"=${_column_letter(CONTROL_START_COL + 3)}{CONTROL_START_ROW}=TRUE"}],
                             },
                             "format": {
                                 "backgroundColor": _rgb("#ECECEC"),
@@ -1247,6 +1507,469 @@ def _conditional_format_requests(sheet_id: int, total_rows: int, control_end_row
             }
         )
     return requests
+
+
+def _main_col(header: str) -> int:
+    return MAIN_HEADERS.index(header) + 1
+
+
+def _all_pricing_col(header: str) -> int:
+    return ALL_PRICING_HEADERS.index(header) + 1
+
+
+def _filtered_aggregate_inner(function_name: str, expressions: list[str]) -> str:
+    if not expressions:
+        return ""
+    array_literal = "{" + ";".join(expressions) + "}"
+    return f'IFERROR(LET(v,{array_literal},{function_name}(FILTER(v,v<>""))),"")'
+
+
+def _formula_max(expressions: list[str]) -> str:
+    inner = _filtered_aggregate_inner("MAX", expressions)
+    return f"={inner}" if inner else ""
+
+
+def _formula_min(expressions: list[str]) -> str:
+    inner = _filtered_aggregate_inner("MIN", expressions)
+    return f"={inner}" if inner else ""
+
+
+def _store_sort_key(store_code: str) -> int:
+    try:
+        return list(STORE_TAB_TITLES.keys()).index(str(store_code).upper())
+    except ValueError:
+        return 999
+
+
+def _store_list_label(store_codes: Iterable[str]) -> str:
+    ordered = sorted({str(code).upper() for code in store_codes if str(code).strip()}, key=_store_sort_key)
+    return ", ".join(ordered)
+
+
+def _display_product_name(values: Iterable[Any]) -> str:
+    names = sorted({str(value).strip() for value in values if str(value or "").strip()}, key=str.casefold)
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return f"{names[0]} (+{len(names) - 1} more)"
+
+
+def build_all_pricing_entries(
+    store_frames: dict[str, pd.DataFrame],
+    requested_codes: Iterable[str],
+) -> list[dict[str, Any]]:
+    requested = [str(code).upper() for code in requested_codes if str(code).strip()]
+    requested_set = set(requested)
+    source_rows: list[dict[str, Any]] = []
+    for store_code in requested:
+        frame = store_frames.get(store_code, pd.DataFrame())
+        if frame.empty:
+            continue
+        title = STORE_TAB_TITLES[store_code]
+        for index, row in frame.reset_index(drop=True).iterrows():
+            price = round(_to_float(row.get("Current Shelf Price")), 2)
+            cost = round(_to_float(row.get("Inventory Cost")), 2)
+            if price <= 0:
+                continue
+            source_rows.append(
+                {
+                    "store": store_code,
+                    "title": title,
+                    "row_number": DATA_START_ROW + int(index),
+                    "Brand": str(row.get("Brand", "")).strip() or "Unknown",
+                    "Category": str(row.get("Category", "")).strip() or "Unknown",
+                    "Product": str(row.get("Product", "")).strip(),
+                    "Available": _to_float(row.get("Available")),
+                    "Current Shelf Price": price,
+                    "Cost Price": cost,
+                }
+            )
+
+    grouped: dict[tuple[str, str, str, float], list[dict[str, Any]]] = {}
+    for source in source_rows:
+        key = (
+            _canon(source["Brand"]),
+            _canon(source["Category"]),
+            _canon(source["Product"]),
+            round(_to_float(source["Cost Price"]), 2),
+        )
+        grouped.setdefault(key, []).append(source)
+
+    entries: list[dict[str, Any]] = []
+    for group_rows in grouped.values():
+        price_groups: dict[float, list[dict[str, Any]]] = {}
+        for source in group_rows:
+            price_groups.setdefault(round(_to_float(source["Current Shelf Price"]), 2), []).append(source)
+
+        common_price = max(
+            price_groups,
+            key=lambda price: (
+                len({row["store"] for row in price_groups[price]}),
+                sum(_to_float(row["Available"]) for row in price_groups[price]),
+                -price,
+            ),
+        )
+        group_store_set = {row["store"] for row in group_rows}
+
+        for price, price_rows in price_groups.items():
+            stores = sorted({row["store"] for row in price_rows}, key=_store_sort_key)
+            if len(price_groups) == 1 and set(stores) == requested_set and len(stores) > 1:
+                scope = "All Stores"
+                notes = "All requested stores share this price."
+            elif len(price_groups) == 1 and len(stores) > 1:
+                scope = "Shared Price"
+                notes = "Shared by every requested store where this product is stocked."
+            elif len(price_groups) == 1:
+                scope = "Store Price"
+                notes = "Only one requested store has this product/price bucket."
+            elif price == common_price and len(stores) > 1:
+                scope = "Shared Price"
+                notes = "Common price bucket; location-price buckets are split separately."
+            else:
+                scope = "Location Price"
+                notes = "Location price kept separate from the common price bucket."
+
+            first = price_rows[0]
+            entries.append(
+                {
+                    "Price Scope": scope,
+                    "Stores": _store_list_label(stores),
+                    "Brand": first["Brand"],
+                    "Category": first["Category"],
+                    "Product": _display_product_name(row["Product"] for row in price_rows),
+                    "Available": sum(_to_float(row["Available"]) for row in price_rows),
+                    "Current Shelf Price": price,
+                    "Cost Price": round(_to_float(first["Cost Price"]), 2),
+                    "Price Notes": notes,
+                    "Store Rows": "; ".join(f'{row["store"]} row {row["row_number"]}' for row in price_rows),
+                    "source_refs": price_rows,
+                    "_scope_rank": {"All Stores": 0, "Shared Price": 1, "Store Price": 2, "Location Price": 3}.get(scope, 9),
+                    "_store_count": len(stores),
+                    "_group_store_count": len(group_store_set),
+                }
+            )
+
+    entries.sort(
+        key=lambda row: (
+            row["_scope_rank"],
+            str(row["Brand"]).casefold(),
+            str(row["Category"]).casefold(),
+            float(row["Current Shelf Price"] or 0.0),
+            str(row["Product"]).casefold(),
+        )
+    )
+    return entries
+
+
+def _all_pricing_formula_values(entry: dict[str, Any], row_number: int) -> dict[str, Any]:
+    refs = list(entry.get("source_refs") or [])
+    suggested_refs = [_sheet_cell_ref(ref["title"], _main_col("Suggested Shelf Price"), ref["row_number"]) for ref in refs]
+    discount_refs = [_sheet_cell_ref(ref["title"], _main_col("Applied Discount %"), ref["row_number"]) for ref in refs]
+    kickback_refs = [_sheet_cell_ref(ref["title"], _main_col("Kickback %"), ref["row_number"]) for ref in refs]
+    old_margin_refs = [_sheet_cell_ref(ref["title"], _main_col("Old Margin %"), ref["row_number"]) for ref in refs]
+
+    shared_price_cell = f'${_column_letter(_all_pricing_col("Suggested Shared Shelf Price"))}{row_number}'
+    projected_otd_expressions: list[str] = []
+    projected_margin_expressions: list[str] = []
+    for ref in refs:
+        title = ref["title"]
+        store_row = ref["row_number"]
+        discount_ref = _sheet_cell_ref(title, _main_col("Applied Discount %"), store_row)
+        kickback_ref = _sheet_cell_ref(title, _main_col("Kickback %"), store_row)
+        cost_ref = _sheet_cell_ref(title, _main_col("Cost Price"), store_row)
+        tax_ref = _sheet_cell_ref(title, 16, 1)
+        otd_expr = f"ROUND({shared_price_cell}*(1-{discount_ref})*{tax_ref},2)"
+        revenue_expr = f"ROUNDDOWN({otd_expr}/{tax_ref},2)"
+        projected_otd_expressions.append(otd_expr)
+        projected_margin_expressions.append(
+            f'IFERROR(IF(OR({cost_ref}<=0,{revenue_expr}<=0),"",({revenue_expr}-({cost_ref}*(1-{kickback_ref})))/{revenue_expr}),"")'
+        )
+
+    return {
+        "Suggested Shared Shelf Price": _formula_max(suggested_refs),
+        "Projected Shared OTD": f'=IF({shared_price_cell}="","",IFERROR(MAX({",".join(projected_otd_expressions)}),""))'
+        if projected_otd_expressions
+        else "",
+        "Max Discount %": _formula_max(discount_refs),
+        "Max Kickback %": _formula_max(kickback_refs),
+        "Worst Old Margin %": _formula_min(old_margin_refs),
+        "Worst Projected Margin %": f'=IF({shared_price_cell}="","",{_filtered_aggregate_inner("MIN", projected_margin_expressions)})'
+        if projected_margin_expressions
+        else "",
+    }
+
+
+def build_all_pricing_sheet_matrix(
+    store_frames: dict[str, pd.DataFrame],
+    requested_codes: Iterable[str],
+    generated_at: str,
+) -> list[list[Any]]:
+    entries = build_all_pricing_entries(store_frames, requested_codes)
+    total_rows = max(DATA_START_ROW + len(entries) - 1, HEADER_ROW)
+    matrix: list[list[Any]] = [["" for _ in range(len(ALL_PRICING_HEADERS))] for _ in range(total_rows)]
+
+    def set_cell(row_number: int, column_number: int, value: Any) -> None:
+        matrix[row_number - 1][column_number - 1] = _sheet_value(value)
+
+    set_cell(1, 1, "All Pricing")
+    set_cell(1, 5, "Generated")
+    set_cell(1, 6, generated_at)
+    set_cell(1, 8, "Shared Price Logic")
+    set_cell(1, 9, "Use the max suggested shelf price across source store rows; location-price buckets stay separate.")
+
+    for col_index, header in enumerate(ALL_PRICING_HEADERS, start=1):
+        set_cell(HEADER_ROW, col_index, header)
+
+    for row_offset, entry in enumerate(entries, start=DATA_START_ROW):
+        formulas = _all_pricing_formula_values(entry, row_offset)
+        for col_index, header in enumerate(ALL_PRICING_HEADERS, start=1):
+            if header in formulas:
+                set_cell(row_offset, col_index, formulas[header])
+            else:
+                set_cell(row_offset, col_index, entry.get(header, ""))
+
+    return matrix
+
+
+def _all_pricing_column_width(header: str) -> int:
+    widths = {
+        "Price Scope": 115,
+        "Stores": 110,
+        "Brand": 150,
+        "Category": 130,
+        "Product": 320,
+        "Available": 90,
+        "Current Shelf Price": 125,
+        "Cost Price": 115,
+        "Suggested Shared Shelf Price": 160,
+        "Projected Shared OTD": 145,
+        "Max Discount %": 115,
+        "Max Kickback %": 115,
+        "Worst Old Margin %": 135,
+        "Worst Projected Margin %": 155,
+        "Price Notes": 260,
+        "Store Rows": 220,
+    }
+    return widths.get(header, 120)
+
+
+def format_all_pricing_sheet(service: Any, spreadsheet_id: str, title: str, total_rows: int) -> None:
+    sheet_info = get_sheet_info_by_title(service, spreadsheet_id, title)
+    if not sheet_info or sheet_info.get("sheet_id") is None:
+        return
+    sheet_id = int(sheet_info["sheet_id"])
+    total_columns = len(ALL_PRICING_HEADERS)
+    requests: list[dict[str, Any]] = _delete_existing_banding_and_rules(sheet_info)
+    requests.extend(
+        [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": HEADER_ROW, "frozenColumnCount": 5},
+                        "tabColor": _rgb("#2F6F73"),
+                    },
+                    "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount,tabColor",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": total_rows, "startColumnIndex": 0, "endColumnIndex": total_columns},
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": _rgb("#F8FBFB"),
+                            "verticalAlignment": "MIDDLE",
+                            "wrapStrategy": "WRAP",
+                            "textFormat": {"fontSize": 10},
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,verticalAlignment,wrapStrategy,textFormat)",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": total_columns},
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": _rgb("#173F3A"),
+                            "wrapStrategy": "CLIP",
+                            "textFormat": {"fontSize": 10, "foregroundColor": _rgb("#FFFFFF")},
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,wrapStrategy,textFormat)",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 1},
+                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 13, "foregroundColor": _rgb("#FFFFFF")}}},
+                    "fields": "userEnteredFormat.textFormat",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {"sheetId": sheet_id, "startRowIndex": HEADER_ROW - 1, "endRowIndex": HEADER_ROW, "startColumnIndex": 0, "endColumnIndex": total_columns},
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": _rgb("#244B3C"),
+                            "horizontalAlignment": "CENTER",
+                            "textFormat": {"bold": True, "foregroundColor": _rgb("#FFFFFF")},
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)",
+                }
+            },
+        ]
+    )
+
+    if total_rows > HEADER_ROW:
+        data_range = {
+            "sheetId": sheet_id,
+            "startRowIndex": HEADER_ROW - 1,
+            "endRowIndex": total_rows,
+            "startColumnIndex": 0,
+            "endColumnIndex": total_columns,
+        }
+        requests.append(
+            {
+                "addBanding": {
+                    "bandedRange": {
+                        "range": data_range,
+                        "rowProperties": {
+                            "headerColor": _rgb("#244B3C"),
+                            "firstBandColor": _rgb("#F8FBFB"),
+                            "secondBandColor": _rgb("#EEF5F5"),
+                        },
+                    }
+                }
+            }
+        )
+        requests.append({"setBasicFilter": {"filter": {"range": data_range}}})
+        requests.append(
+            {
+                "addConditionalFormatRule": {
+                    "index": 0,
+                    "rule": {
+                        "ranges": [
+                            {
+                                "sheetId": sheet_id,
+                                "startRowIndex": DATA_START_ROW - 1,
+                                "endRowIndex": total_rows,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": total_columns,
+                            }
+                        ],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "CUSTOM_FORMULA",
+                                "values": [{"userEnteredValue": f'=$A{DATA_START_ROW}="Location Price"'}],
+                            },
+                            "format": {"backgroundColor": _rgb("#FFF3D6")},
+                        },
+                    },
+                }
+            }
+        )
+
+    for index, header in enumerate(ALL_PRICING_HEADERS, start=1):
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": index - 1, "endIndex": index},
+                    "properties": {"pixelSize": _all_pricing_column_width(header)},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+        if header in ALL_PRICING_HIDDEN_HEADERS:
+            requests.append(
+                {
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": index - 1, "endIndex": index},
+                        "properties": {"hiddenByUser": True},
+                        "fields": "hiddenByUser",
+                    }
+                }
+            )
+
+    requests.append(
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+                "properties": {"pixelSize": 34},
+                "fields": "pixelSize",
+            }
+        }
+    )
+    requests.append(
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": HEADER_ROW - 1, "endIndex": HEADER_ROW},
+                "properties": {"pixelSize": 36},
+                "fields": "pixelSize",
+            }
+        }
+    )
+
+    def add_number_format(col_index: int, pattern: str, start_row: int, end_row: int) -> None:
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": start_row - 1,
+                        "endRowIndex": end_row,
+                        "startColumnIndex": col_index - 1,
+                        "endColumnIndex": col_index,
+                    },
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": _number_format_type(pattern), "pattern": pattern}}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        )
+
+    if total_rows >= DATA_START_ROW:
+        for header in ALL_PRICING_HEADERS:
+            col_index = _all_pricing_col(header)
+            alignment = "LEFT" if header in ALL_PRICING_LEFT_ALIGN_HEADERS else "CENTER"
+            requests.append(
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": DATA_START_ROW - 1,
+                            "endRowIndex": total_rows,
+                            "startColumnIndex": col_index - 1,
+                            "endColumnIndex": col_index,
+                        },
+                        "cell": {"userEnteredFormat": {"horizontalAlignment": alignment}},
+                        "fields": "userEnteredFormat.horizontalAlignment",
+                    }
+                }
+            )
+            if header in ALL_PRICING_CURRENCY_HEADERS:
+                add_number_format(col_index, "$#,##0.00", DATA_START_ROW, total_rows)
+            elif header in ALL_PRICING_PERCENT_HEADERS:
+                add_number_format(col_index, "0.00%", DATA_START_ROW, total_rows)
+            elif header in ALL_PRICING_INTEGER_HEADERS:
+                add_number_format(col_index, "0", DATA_START_ROW, total_rows)
+
+    if requests:
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+
+
+def upsert_all_pricing_tab(
+    service: Any,
+    spreadsheet_id: str,
+    store_frames: dict[str, pd.DataFrame],
+    requested_codes: Iterable[str],
+    generated_at: str,
+) -> None:
+    ensure_sheet(service, spreadsheet_id, ALL_PRICING_TITLE, "review")
+    matrix = build_all_pricing_sheet_matrix(store_frames, requested_codes, generated_at)
+    write_values(service, spreadsheet_id, ALL_PRICING_TITLE, matrix, total_columns=len(ALL_PRICING_HEADERS))
+    format_all_pricing_sheet(service, spreadsheet_id, ALL_PRICING_TITLE, len(matrix))
 
 
 def format_readme_sheet(service: Any, spreadsheet_id: str, title: str, total_rows: int) -> None:
@@ -1421,13 +2144,15 @@ def main() -> int:
                 f"[DRY RUN] {store_code}: {len(frame)} row(s), "
                 f"{int((frame['Available'] > 0).sum()) if not frame.empty else 0} with stock"
             )
+        all_pricing_rows = build_all_pricing_entries(store_frames, requested_codes)
+        print(f"[DRY RUN] {ALL_PRICING_TITLE}: {len(all_pricing_rows)} shared/location pricing row(s)")
         return 0
 
     service = authenticate_sheets()
     upsert_readme(service, SPREADSHEET_ID, generated_at)
     move_sheet_to_index(service, SPREADSHEET_ID, README_TITLE, 0)
 
-    next_index = 1
+    next_index = 2
     for store_code in STORE_TAB_TITLES:
         if store_code not in requested_codes:
             continue
@@ -1443,6 +2168,16 @@ def main() -> int:
         move_sheet_to_index(service, SPREADSHEET_ID, STORE_TAB_TITLES[store_code], next_index)
         next_index += 1
         print(f"[SHEET] {store_code}: wrote {STORE_TAB_TITLES[store_code]}")
+
+    upsert_all_pricing_tab(
+        service=service,
+        spreadsheet_id=SPREADSHEET_ID,
+        store_frames=store_frames,
+        requested_codes=requested_codes,
+        generated_at=generated_at,
+    )
+    move_sheet_to_index(service, SPREADSHEET_ID, ALL_PRICING_TITLE, 1)
+    print(f"[SHEET] wrote {ALL_PRICING_TITLE}")
 
     print(f"[DONE] Updated spreadsheet: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit")
     return 0

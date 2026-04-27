@@ -32,6 +32,7 @@ This repository is a Python automation stack (not a web backend) that:
 - `dutchie_api_reports.py` - direct Dutchie POS API exporter for sales, catalog, inventory, and key verification
 - `weekly_store_ordering_sheet.py` - store-first weekly reorder workbook builder for one Google Spreadsheet with `AUTO` + `REVIEW` tabs per store/week
 - `weekly_store_ordering_sheets.py` - Google Sheets helper/upsert layer for weekly ordering tabs
+- `store_discount_roundup_sheet.py` - Google Sheets discount round-up pricing planner with store tabs, cost price reference, margins, kickbacks, and an `All Pricing` shared-price rollup
 - `dutchie_today_dashboard.py` - live same-day Dutchie API HTML dashboard with store pace, hourly flow, top products, and low-stock flags
 - `dutchie_live_dashboard_gui.py` - native Tkinter live dashboard with same-day KPIs, store focus, sales mix tables, and inventory alerts
 - `getClosingReport.py` - closing report by day/store (GUI)
@@ -59,6 +60,10 @@ This repository is a Python automation stack (not a web backend) that:
 
 - Setup guide: `docs/weekly_store_ordering_setup.md`
 - Training video: https://youtu.be/ri9VkqPGAUQ
+
+## Discount Round-Up Pricing Resources
+
+- Training video: https://youtu.be/La_JT4Pir0I
 
 ## Prerequisites
 
