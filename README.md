@@ -162,14 +162,16 @@ Force the legacy browser export path if needed:
 .venv/bin/python dutchie_api_reports.py --verify-only --stores mv lg lm wp sv nc
 ```
 
+Dutchie API scripts fetch stores concurrently by default. Tune that with `--workers`; use `--workers 1` if you need serial requests because of rate limits.
+
 ### 2b) Inventory order reports (7d / 14d / 30d)
 ```bash
-.venv/bin/python getInventoryOrderReport.py
+.venv/bin/python getInventoryOrderReport_api.py --workers 6
 ```
 
 ### 2c) Pull API sales, catalog, and inventory exports
 ```bash
-.venv/bin/python dutchie_api_reports.py --stores mv lg --reports sales catalog inventory --from-date 2026-03-01 --to-date 2026-03-24
+.venv/bin/python dutchie_api_reports.py --stores mv lg --reports sales catalog inventory --from-date 2026-03-01 --to-date 2026-03-24 --workers 2
 ```
 
 Optional inventory detail flags:

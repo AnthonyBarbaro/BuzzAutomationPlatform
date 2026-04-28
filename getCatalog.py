@@ -16,21 +16,27 @@ It now writes one CSV per store in the familiar filename format:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import pandas as pd
 
 from dutchie_api_reports import (
+    DEFAULT_API_WORKERS,
     DutchieAPIError,
     STORE_CODES,
     canonical_env_map,
     create_session,
     discover_configured_store_codes,
+    positive_int,
+    print_threadsafe,
     request_json,
     resolve_integrator_key,
     resolve_store_keys,
+    resolve_worker_count,
 )
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "files"
@@ -160,6 +166,30 @@ def _build_output_path(output_dir: Path, store_code: str) -> Path:
     return output_dir / f"{today_str}_{store_code}.csv"
 
 
+def _fetch_inventory_csv_for_store(
+    store_code: str,
+    location_key: str,
+    integrator_key: str,
+    output_dir: Path,
+    print_lock: Lock | None = None,
+) -> Path:
+    location_label = STORE_CODES.get(store_code, store_code)
+    session = create_session(location_key, integrator_key)
+
+    try:
+        print_threadsafe(f"[FETCH] {store_code} ({location_label}) -> /reporting/inventory", print_lock)
+        payload = request_json(session, "/reporting/inventory")
+        frame = _normalize_inventory_rows(payload)
+
+        output_path = _build_output_path(output_dir, store_code)
+        frame.to_csv(output_path, index=False)
+
+        print_threadsafe(f"[SAVED] {store_code}: {len(frame)} row(s) -> {output_path}", print_lock)
+        return output_path
+    finally:
+        session.close()
+
+
 def fetch_inventory_csvs(args: argparse.Namespace) -> list[Path]:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -173,19 +203,44 @@ def fetch_inventory_csvs(args: argparse.Namespace) -> list[Path]:
     print(f"[INFO] Output directory: {output_dir}")
     print(f"[INFO] Stores requested: {', '.join(store_codes)}")
 
-    for store_code in store_codes:
-        location_label = STORE_CODES.get(store_code, store_code)
-        session = create_session(store_keys[store_code], integrator_key)
+    worker_count = resolve_worker_count(args.workers, len(store_codes))
+    worker_label = "serial mode" if worker_count == 1 else f"{worker_count} store worker threads"
+    print(f"[INFO] Running Dutchie API catalog refresh with {worker_label}.")
+    print_lock = Lock()
 
-        print(f"[FETCH] {store_code} ({location_label}) -> /reporting/inventory")
-        payload = request_json(session, "/reporting/inventory")
-        frame = _normalize_inventory_rows(payload)
-
-        output_path = _build_output_path(output_dir, store_code)
-        frame.to_csv(output_path, index=False)
-        written_paths.append(output_path)
-
-        print(f"[SAVED] {store_code}: {len(frame)} row(s) -> {output_path}")
+    if worker_count == 1:
+        for store_code in store_codes:
+            written_paths.append(
+                _fetch_inventory_csv_for_store(
+                    store_code=store_code,
+                    location_key=store_keys[store_code],
+                    integrator_key=integrator_key,
+                    output_dir=output_dir,
+                    print_lock=print_lock,
+                )
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _fetch_inventory_csv_for_store,
+                    store_code,
+                    store_keys[store_code],
+                    integrator_key,
+                    output_dir,
+                    print_lock,
+                ): store_code
+                for store_code in store_codes
+            }
+            failures = []
+            for future in as_completed(futures):
+                store_code = futures[future]
+                try:
+                    written_paths.append(future.result())
+                except Exception as exc:
+                    failures.append(f"{store_code}: {exc}")
+            if failures:
+                raise DutchieAPIError("Dutchie API catalog refresh failed for: " + "; ".join(failures))
 
     return written_paths
 
@@ -209,6 +264,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--stores",
         nargs="*",
         help="Optional store codes to fetch, for example: MV LG LM WP SV NC",
+    )
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=DEFAULT_API_WORKERS,
+        help=(
+            "Number of stores to fetch concurrently. "
+            f"Default: {DEFAULT_API_WORKERS}. Use 1 for serial API calls."
+        ),
     )
     return parser
 

@@ -21,9 +21,11 @@ import json
 import os
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -37,6 +39,7 @@ DEFAULT_OUTPUT_DIR = Path("reports/api_exports")
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_FORMATS = ("json", "csv")
 DEFAULT_REPORTS = ("sales", "catalog", "inventory")
+DEFAULT_API_WORKERS = 4
 
 STORE_CODES = OrderedDict(
     [
@@ -112,6 +115,23 @@ def parse_multi_values(values: list[str] | None) -> list[str]:
             if clean_piece:
                 parsed.append(clean_piece)
     return parsed
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("Expected a whole number greater than zero.") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("Expected a whole number greater than zero.")
+    return parsed
+
+
+def resolve_worker_count(requested_workers: int | None, job_count: int) -> int:
+    if job_count <= 0:
+        return 1
+    requested = requested_workers or DEFAULT_API_WORKERS
+    return max(1, min(int(requested), int(job_count)))
 
 
 def normalize_store_code(raw_value: str) -> str:
@@ -378,6 +398,60 @@ def print_discovered_store_summary(configured: list[str], integrator_key: str) -
     print(f"Integrator key present: {'yes' if integrator_key else 'no'}")
 
 
+def print_threadsafe(message: str, print_lock: Lock | None = None) -> None:
+    if print_lock is None:
+        print(message)
+        return
+    with print_lock:
+        print(message)
+
+
+def export_store_reports(
+    store_code: str,
+    location_key: str,
+    integrator_key: str,
+    report_names: list[str],
+    formats: list[str],
+    output_root: Path,
+    args: argparse.Namespace,
+    print_lock: Lock | None = None,
+) -> None:
+    session = create_session(location_key, integrator_key)
+    location_label = STORE_CODES.get(store_code, store_code)
+
+    try:
+        if not args.skip_verify:
+            identity = request_json(session, "/whoami")
+            location_name = (
+                identity.get("locationName")
+                or identity.get("name")
+                or identity.get("LocationName")
+                or location_label
+            )
+            print_threadsafe(f"[VERIFY] {store_code}: {location_name}", print_lock)
+
+        if args.verify_only:
+            return
+
+        for report_name in report_names:
+            spec = REPORT_SPECS[report_name]
+            params = build_params(report_name, args)
+            report_dir = ensure_output_dir(output_root / report_name)
+            output_stem = build_output_stem(report_name, store_code, args)
+            output_base = report_dir / output_stem
+
+            print_threadsafe(f"[FETCH] {store_code} {report_name} -> {spec.endpoint}", print_lock)
+            payload = request_json(session, spec.endpoint, params=params)
+            written_files = write_payload_files(payload, output_base, formats)
+            file_list = ", ".join(str(path) for path in written_files)
+            print_threadsafe(
+                f"[SAVED] {store_code} {report_name}: {payload_row_count(payload)} row(s) -> {file_list}",
+                print_lock,
+            )
+    finally:
+        session.close()
+
+
 def export_reports(args: argparse.Namespace) -> int:
     env_map = canonical_env_map(args.env_file)
     configured_store_codes = discover_configured_store_codes(env_map)
@@ -403,35 +477,53 @@ def export_reports(args: argparse.Namespace) -> int:
     output_root = ensure_output_dir(args.output_dir)
     print_discovered_store_summary(requested_store_codes, integrator_key)
 
-    for store_code in requested_store_codes:
-        session = create_session(store_keys[store_code], integrator_key)
-        location_label = STORE_CODES.get(store_code, store_code)
+    worker_count = resolve_worker_count(args.workers, len(requested_store_codes))
+    worker_label = "serial mode" if worker_count == 1 else f"{worker_count} store worker threads"
+    print(f"[INFO] Running Dutchie API exports with {worker_label}.")
 
-        if not args.skip_verify:
-            identity = request_json(session, "/whoami")
-            location_name = (
-                identity.get("locationName")
-                or identity.get("name")
-                or identity.get("LocationName")
-                or location_label
-            )
-            print(f"[VERIFY] {store_code}: {location_name}")
+    failures: list[str] = []
+    print_lock = Lock()
 
-        if args.verify_only:
-            continue
+    if worker_count == 1:
+        for store_code in requested_store_codes:
+            try:
+                export_store_reports(
+                    store_code=store_code,
+                    location_key=store_keys[store_code],
+                    integrator_key=integrator_key,
+                    report_names=report_names,
+                    formats=formats,
+                    output_root=output_root,
+                    args=args,
+                    print_lock=print_lock,
+                )
+            except Exception as exc:
+                failures.append(f"{store_code}: {exc}")
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    export_store_reports,
+                    store_code,
+                    store_keys[store_code],
+                    integrator_key,
+                    report_names,
+                    formats,
+                    output_root,
+                    args,
+                    print_lock,
+                ): store_code
+                for store_code in requested_store_codes
+            }
+            for future in as_completed(futures):
+                store_code = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    failures.append(f"{store_code}: {exc}")
 
-        for report_name in report_names:
-            spec = REPORT_SPECS[report_name]
-            params = build_params(report_name, args)
-            report_dir = ensure_output_dir(output_root / report_name)
-            output_stem = build_output_stem(report_name, store_code, args)
-            output_base = report_dir / output_stem
-
-            print(f"[FETCH] {store_code} {report_name} -> {spec.endpoint}")
-            payload = request_json(session, spec.endpoint, params=params)
-            written_files = write_payload_files(payload, output_base, formats)
-            file_list = ", ".join(str(path) for path in written_files)
-            print(f"[SAVED] {store_code} {report_name}: {payload_row_count(payload)} row(s) -> {file_list}")
+    if failures:
+        raise DutchieAPIError("Dutchie API export failed for: " + "; ".join(failures))
 
     return 0
 
@@ -465,6 +557,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
         help=f"Directory for exported files. Default: {DEFAULT_OUTPUT_DIR}",
+    )
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=DEFAULT_API_WORKERS,
+        help=(
+            "Number of stores to fetch concurrently. "
+            f"Default: {DEFAULT_API_WORKERS}. Use 1 for serial API calls."
+        ),
     )
     parser.add_argument(
         "--list-stores",

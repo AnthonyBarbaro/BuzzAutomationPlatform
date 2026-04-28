@@ -76,6 +76,10 @@ ORDER_REPORT_BROWSER_SCRIPT = "getInventoryOrderReport.py"
 CATALOG_API_SCRIPT = "getCatalog.py"
 CATALOG_BROWSER_SCRIPT = "getCatalog_browser.py"
 DEFAULT_API_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+DUTCHIE_API_WORKERS = 6
+DEFAULT_WINDOW_WIDTH = 1180
+DEFAULT_WINDOW_HEIGHT = 760
+WINDOW_EDGE_PADDING = 24
 
 # Required CSV columns + optional
 REQUIRED_COLUMNS = ["Available", "Product", "Brand"]
@@ -188,8 +192,9 @@ def load_config():
 
 def clear_old_input_exports(directory, clear_order_reports=True):
     if not directory or not os.path.isdir(directory):
-        return
+        return []
 
+    deleted_paths = []
     for filename in os.listdir(directory):
         file_path = os.path.join(directory, filename)
         if not os.path.isfile(file_path):
@@ -200,7 +205,9 @@ def clear_old_input_exports(directory, clear_order_reports=True):
             should_delete = True
         if should_delete:
             os.remove(file_path)
+            deleted_paths.append(file_path)
             print(f"[INFO] Deleted old source export: {file_path}")
+    return deleted_paths
 
 
 def fetch_inventory_order_reports(output_directory):
@@ -723,7 +730,7 @@ class BrandInventoryGUI:
         cfg = load_config()
 
         self.master.title("Buzz Brand Inventory Studio")
-        self.master.geometry("980x620")
+        self.master.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
         self.master.minsize(900, 520)
         self.master.configure(bg=self.colors["bg"])
 
@@ -773,6 +780,7 @@ class BrandInventoryGUI:
         self._update_brand_summary()
         self.append_log("Workspace ready.")
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.master.after(0, self._show_full_program_on_launch)
         self.master.after(150, self._autoload_saved_workspace)
 
     def _configure_styles(self):
@@ -818,6 +826,14 @@ class BrandInventoryGUI:
         self.style.map(
             "Quiet.TButton",
             background=[("active", "#D6EEE7"), ("pressed", "#C8E8DE")],
+        )
+        self.style.configure(
+            "Loading.Horizontal.TProgressbar",
+            troughcolor="#DCE7E2",
+            background=self.colors["accent"],
+            lightcolor=self.colors["accent"],
+            darkcolor=self.colors["accent"],
+            bordercolor=self.colors["border"],
         )
 
         self.style.configure(
@@ -909,6 +925,29 @@ class BrandInventoryGUI:
 
         self._build_header()
         self._build_tabs()
+
+    def _show_full_program_on_launch(self):
+        self.master.update_idletasks()
+
+        try:
+            self.master.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+
+        try:
+            self.master.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+
+        screen_width = max(self.master.winfo_screenwidth(), self.master.winfo_reqwidth())
+        screen_height = max(self.master.winfo_screenheight(), self.master.winfo_reqheight())
+        width = min(DEFAULT_WINDOW_WIDTH, max(900, screen_width - WINDOW_EDGE_PADDING * 2))
+        height = min(DEFAULT_WINDOW_HEIGHT, max(520, screen_height - WINDOW_EDGE_PADDING * 2))
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        self.master.geometry(f"{width}x{height}+{x}+{y}")
 
     def _build_header(self):
         header = tk.Frame(
@@ -1966,40 +2005,106 @@ class BrandInventoryGUI:
         if hasattr(self, "loading_window") and self.loading_window.winfo_exists():
             self.hide_loading()
 
-        self.loading_window = tk.Toplevel(self.master)
-        self.loading_window.title("Working")
-        self.loading_window.transient(self.master)
-        self.loading_window.configure(bg=self.colors["card"])
-        self.loading_window.resizable(False, False)
+        self.loading_message_var = tk.StringVar(value=message)
+        self.loading_detail_var = tk.StringVar(value=detail)
+        self.loading_step_var = tk.StringVar(value="Starting...")
 
-        frame = tk.Frame(self.loading_window, bg=self.colors["card"], padx=20, pady=18)
+        self.loading_window = tk.Toplevel(self.master)
+        self.loading_window.title(message)
+        self.loading_window.transient(self.master)
+        self.loading_window.configure(bg=self.colors["border"])
+        self.loading_window.resizable(False, False)
+        self.loading_window.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        outer = tk.Frame(self.loading_window, bg=self.colors["card"], padx=0, pady=0)
+        outer.pack(fill="both", expand=True, padx=1, pady=1)
+
+        tk.Frame(outer, bg=self.colors["accent"], height=5).pack(fill="x")
+
+        frame = tk.Frame(outer, bg=self.colors["card"], padx=22, pady=20)
         frame.pack(fill="both", expand=True)
 
+        header = tk.Frame(frame, bg=self.colors["card"])
+        header.pack(fill="x")
+
+        badge = tk.Frame(header, bg=self.colors["accent_soft"], width=42, height=42)
+        badge.pack(side="left", padx=(0, 12))
+        badge.pack_propagate(False)
         tk.Label(
-            frame,
-            text=message,
+            badge,
+            text="BZ",
+            bg=self.colors["accent_soft"],
+            fg=self.colors["accent_dark"],
+            font=("Segoe UI", 14, "bold"),
+        ).pack(expand=True)
+
+        tk.Label(
+            header,
+            textvariable=self.loading_message_var,
             bg=self.colors["card"],
             fg=self.colors["text"],
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 13, "bold"),
         ).pack(anchor="w")
         tk.Label(
-            frame,
-            text=detail,
+            header,
+            textvariable=self.loading_detail_var,
             bg=self.colors["card"],
             fg=self.colors["muted"],
             font=("Segoe UI", 9),
-            wraplength=320,
+            wraplength=390,
             justify="left",
-        ).pack(anchor="w", pady=(6, 12))
+        ).pack(anchor="w", pady=(4, 0))
 
-        self.loading_progress = ttk.Progressbar(frame, mode="indeterminate", length=320)
+        step_box = tk.Frame(frame, bg="#F7FAF8", padx=12, pady=10)
+        step_box.pack(fill="x", pady=(16, 12))
+        tk.Label(
+            step_box,
+            text="Current step",
+            bg="#F7FAF8",
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            step_box,
+            textvariable=self.loading_step_var,
+            bg="#F7FAF8",
+            fg=self.colors["text"],
+            font=("Segoe UI", 9),
+            wraplength=410,
+            justify="left",
+        ).pack(anchor="w", pady=(3, 0))
+
+        self.loading_progress = ttk.Progressbar(
+            frame,
+            mode="indeterminate",
+            length=420,
+            style="Loading.Horizontal.TProgressbar",
+        )
         self.loading_progress.pack(fill="x")
         self.loading_progress.start(10)
 
         self.loading_window.update_idletasks()
-        x = self.master.winfo_rootx() + (self.master.winfo_width() // 2) - 190
-        y = self.master.winfo_rooty() + (self.master.winfo_height() // 2) - 70
-        self.loading_window.geometry(f"380x140+{max(40, x)}+{max(40, y)}")
+        self._center_loading_window()
+        self.loading_window.update()
+
+    def _center_loading_window(self):
+        width = 500
+        height = 230
+        x = self.master.winfo_rootx() + (self.master.winfo_width() // 2) - (width // 2)
+        y = self.master.winfo_rooty() + (self.master.winfo_height() // 2) - (height // 2)
+        self.loading_window.geometry(f"{width}x{height}+{max(40, x)}+{max(40, y)}")
+
+    def update_loading(self, message=None, detail=None, step=None):
+        if not hasattr(self, "loading_window") or not self.loading_window.winfo_exists():
+            return
+        if message is not None and hasattr(self, "loading_message_var"):
+            self.loading_message_var.set(message)
+            self.loading_window.title(message)
+        if detail is not None and hasattr(self, "loading_detail_var"):
+            self.loading_detail_var.set(detail)
+        if step is not None and hasattr(self, "loading_step_var"):
+            self.loading_step_var.set(step)
+        self.loading_window.update_idletasks()
         self.loading_window.update()
 
     def hide_loading(self):
@@ -2275,7 +2380,9 @@ class BrandInventoryGUI:
             raise FileNotFoundError(f"{script_name} was not found at {script_path}.")
 
         cmd = [sys.executable, str(script_path), *[str(arg) for arg in args]]
+        started_at = time.perf_counter()
         self.append_log(f"Running: {' '.join(str(part) for part in cmd)}")
+        self.update_loading(step=f"Started {script_name}. Waiting for Dutchie response...")
 
         process = subprocess.Popen(
             cmd,
@@ -2293,11 +2400,15 @@ class BrandInventoryGUI:
                 if line:
                     print(line, flush=True)
                     self.append_log(line)
+                    if line.startswith(("[FETCH]", "[SAVED]", "[INFO]", "[VERIFY]", "[WARN]")):
+                        self.update_loading(step=line)
 
         return_code = process.wait()
         combined_output = "".join(output_lines)
+        elapsed = time.perf_counter() - started_at
 
         if return_code != 0:
+            self.append_log(f"{script_name} exited with code {return_code} after {elapsed:.1f}s.")
             raise subprocess.CalledProcessError(
                 return_code,
                 cmd,
@@ -2305,6 +2416,7 @@ class BrandInventoryGUI:
                 stderr=combined_output,
             )
 
+        self.append_log(f"{script_name} finished successfully in {elapsed:.1f}s.")
         return subprocess.CompletedProcess(
             cmd,
             return_code,
@@ -2315,26 +2427,41 @@ class BrandInventoryGUI:
     def _refresh_catalog_exports(self, input_dir):
         prefer_api = self.prefer_catalog_api_var.get()
         api_ready, available_codes, missing_codes, error_text = dutchie_api_readiness(DEFAULT_API_ENV_FILE)
+        available_text = ", ".join(available_codes) if available_codes else "none"
+        missing_text = ", ".join(missing_codes) if missing_codes else "none"
+        self.append_log(
+            f"Catalog refresh readiness: prefer_api={prefer_api}, api_ready={api_ready}, "
+            f"available stores={available_text}, missing stores={missing_text}."
+        )
 
         if prefer_api and api_ready:
             self.append_log(
-                "Dutchie API catalog refresh is configured for all stores. Trying the API exporter first."
+                f"Dutchie API catalog refresh is configured for all stores. Trying the API exporter first with {DUTCHIE_API_WORKERS} workers."
+            )
+            self.update_loading(
+                message="Downloading catalog data...",
+                detail=f"Fetching live inventory CSVs from Dutchie with {DUTCHIE_API_WORKERS} worker threads.",
+                step=f"Catalog API stores queued: {available_text}",
             )
             try:
-                self._run_script(CATALOG_API_SCRIPT, input_dir)
+                self._run_script(CATALOG_API_SCRIPT, input_dir, "--workers", DUTCHIE_API_WORKERS)
                 return "api"
             except subprocess.CalledProcessError:
                 self.append_log(
                     "Dutchie API catalog refresh failed. Falling back to the browser catalog export script."
                 )
+                self.update_loading(
+                    message="Switching catalog method...",
+                    detail="The API catalog refresh failed, so the browser exporter is taking over.",
+                    step="Starting browser catalog fallback.",
+                )
 
         elif prefer_api:
             if error_text:
                 self.append_log(
-                    "Dutchie API readiness could not be confirmed. Falling back to the browser catalog export script."
+                    f"Dutchie API readiness could not be confirmed: {error_text}. Falling back to the browser catalog export script."
                 )
             else:
-                missing_text = ", ".join(missing_codes)
                 self.append_log(
                     f"Dutchie API is missing store credentials for: {missing_text}. "
                     "Falling back to the browser catalog export script."
@@ -2342,31 +2469,51 @@ class BrandInventoryGUI:
         else:
             self.append_log("Catalog refresh is set to browser mode. Skipping the Dutchie API path.")
 
+        self.update_loading(
+            message="Downloading catalog data...",
+            detail="Using the browser catalog exporter.",
+            step="Starting browser catalog export.",
+        )
         self._run_script(CATALOG_BROWSER_SCRIPT, input_dir)
         return "browser"
 
     def _refresh_order_report_exports(self, input_dir):
         prefer_api = self.prefer_catalog_api_var.get()
         api_ready, available_codes, missing_codes, error_text = dutchie_api_readiness(DEFAULT_API_ENV_FILE)
+        available_text = ", ".join(available_codes) if available_codes else "none"
+        missing_text = ", ".join(missing_codes) if missing_codes else "none"
+        self.append_log(
+            f"Order-report refresh readiness: prefer_api={prefer_api}, api_ready={api_ready}, "
+            f"available stores={available_text}, missing stores={missing_text}."
+        )
 
         if prefer_api and api_ready:
             self.append_log(
-                "Dutchie API order-report refresh is configured for all stores. Trying the API exporter first."
+                f"Dutchie API order-report refresh is configured for all stores. Trying the API exporter first with {DUTCHIE_API_WORKERS} workers."
+            )
+            self.update_loading(
+                message="Downloading order reports...",
+                detail="Fetching Dutchie inventory/order source files and building 7d, 14d, and 30d windows.",
+                step=f"Order-report API stores queued: {available_text}",
             )
             try:
-                self._run_script(ORDER_REPORT_API_SCRIPT, input_dir)
+                self._run_script(ORDER_REPORT_API_SCRIPT, input_dir, "--workers", DUTCHIE_API_WORKERS)
                 return "api"
             except subprocess.CalledProcessError:
                 self.append_log(
                     "Dutchie API order-report refresh failed. Falling back to the browser order-report export script."
                 )
+                self.update_loading(
+                    message="Switching order-report method...",
+                    detail="The API order-report refresh failed, so the browser exporter is taking over.",
+                    step="Starting browser order-report fallback.",
+                )
         elif prefer_api:
             if error_text:
                 self.append_log(
-                    "Dutchie API readiness could not be confirmed for order reports. Falling back to the browser order-report export script."
+                    f"Dutchie API readiness could not be confirmed for order reports: {error_text}. Falling back to the browser order-report export script."
                 )
             else:
-                missing_text = ", ".join(missing_codes)
                 self.append_log(
                     f"Dutchie API is missing store credentials for: {missing_text}. "
                     "Falling back to the browser order-report export script."
@@ -2374,6 +2521,11 @@ class BrandInventoryGUI:
         else:
             self.append_log("Order-report refresh is set to browser mode. Skipping the Dutchie API path.")
 
+        self.update_loading(
+            message="Downloading order reports...",
+            detail="Using the browser order-report exporter.",
+            step="Starting browser order-report export.",
+        )
         self._run_script(ORDER_REPORT_BROWSER_SCRIPT, input_dir)
         return "browser"
 
@@ -2387,6 +2539,11 @@ class BrandInventoryGUI:
             return
 
         self.append_log("Starting source refresh.")
+        self.append_log(f"Input folder: {in_dir}")
+        self.append_log(
+            f"Refresh options: prefer_api={prefer_api}, refresh_order_reports={fetch_order_reports}, "
+            f"api_workers={DUTCHIE_API_WORKERS}."
+        )
         self._set_status(
             "Refreshing source files...",
             "Catalog CSVs are being refreshed, and Dutchie order reports will follow if the toggle is enabled.",
@@ -2401,15 +2558,54 @@ class BrandInventoryGUI:
         )
 
         try:
-            clear_old_input_exports(in_dir, clear_order_reports=fetch_order_reports)
+            existing_catalog_count = len(list_catalog_csv_files(in_dir))
+            existing_order_count = len(list_order_report_files(in_dir))
+            self.append_log(
+                f"Before refresh: {existing_catalog_count} catalog CSV(s), "
+                f"{existing_order_count} order-report file(s) in the input folder."
+            )
+            self.update_loading(
+                message="Preparing source refresh...",
+                detail="Clearing old source exports so the next reports use fresh data.",
+                step="Removing stale catalog CSVs and selected order-report files.",
+            )
+            deleted_paths = clear_old_input_exports(in_dir, clear_order_reports=fetch_order_reports)
+            deleted_catalog_count = sum(
+                1 for path in deleted_paths if str(path).lower().endswith(".csv") and not is_order_report_filename(os.path.basename(path))
+            )
+            deleted_order_count = sum(1 for path in deleted_paths if is_order_report_filename(os.path.basename(path)))
+            self.append_log(
+                f"Cleared {deleted_catalog_count} old catalog CSV(s) and {deleted_order_count} old order-report file(s)."
+            )
+
+            self.update_loading(
+                message="Downloading catalog data...",
+                detail="Refreshing store catalog/inventory CSVs now.",
+                step="Starting catalog refresh.",
+            )
             catalog_mode_used = self._refresh_catalog_exports(in_dir)
+            refreshed_catalog_count = len(list_catalog_csv_files(in_dir))
+            self.append_log(
+                f"Catalog refresh complete via {catalog_mode_used}; "
+                f"{refreshed_catalog_count} catalog CSV(s) are now available."
+            )
 
             order_reports_ok = True
             order_report_mode_used = None
             order_report_error = None
             if fetch_order_reports:
+                self.update_loading(
+                    message="Downloading order reports...",
+                    detail="Refreshing Dutchie 7d, 14d, and 30d order-report source files.",
+                    step="Starting order-report refresh.",
+                )
                 try:
                     order_report_mode_used = self._refresh_order_report_exports(in_dir)
+                    refreshed_order_count = len(list_order_report_files(in_dir))
+                    self.append_log(
+                        f"Order-report refresh complete via {order_report_mode_used}; "
+                        f"{refreshed_order_count} order-report file(s) are now available."
+                    )
                 except subprocess.CalledProcessError as exc:
                     order_reports_ok = False
                     order_report_error = exc
@@ -2420,7 +2616,14 @@ class BrandInventoryGUI:
                     order_reports_ok = False
                     order_report_error = exc
                     self.append_log(f"Order-report refresh failed: {exc}")
+            else:
+                self.append_log("Order-report refresh skipped by toggle; existing order-report files were left untouched.")
 
+            self.update_loading(
+                message="Finishing source refresh...",
+                detail="Updating the source snapshot and reloading the brand library.",
+                step="Scanning refreshed files.",
+            )
             self.hide_loading()
             self._persist_settings(add_log=False, update_status=False)
             self._refresh_source_snapshot()
@@ -2597,6 +2800,11 @@ class BrandInventoryGUI:
         try:
             for fname in list_catalog_csv_files(in_dir):
                 path = os.path.join(in_dir, fname)
+                self.update_loading(
+                    message="Generating reports...",
+                    detail="Building brand workbooks from refreshed catalog CSVs.",
+                    step=f"Processing {fname}",
+                )
                 brand_map = generate_brand_reports(
                     path,
                     out_dir,
@@ -2619,6 +2827,11 @@ class BrandInventoryGUI:
                 messagebox.showinfo("Done", "No XLSX files generated (possibly no matching data).")
                 return
 
+            self.update_loading(
+                message="Uploading reports...",
+                detail="Creating Drive folders and uploading the finished workbooks.",
+                step=f"Uploading {sum(len(v) for v in all_brand_map.values())} workbook(s).",
+            )
             brand_links = upload_brand_reports_to_drive(all_brand_map)
             if not brand_links:
                 self.hide_loading()
@@ -2657,6 +2870,11 @@ class BrandInventoryGUI:
             </html>
             """
             subject = "Brand Inventory Drive Links"
+            self.update_loading(
+                message="Sending email...",
+                detail="Sending Drive folder links to the saved recipients.",
+                step=f"Emailing {len(self._parse_recipients())} recipient(s).",
+            )
             send_email_with_gmail_html(subject, body_html, emails)
 
             self._persist_settings(add_log=False, update_status=False)

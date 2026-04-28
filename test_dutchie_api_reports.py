@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from argparse import ArgumentTypeError
 
 from dutchie_api_reports import (
     canonical_env_map,
@@ -7,7 +8,9 @@ from dutchie_api_reports import (
     parse_format_names,
     parse_report_names,
     parse_store_codes,
+    positive_int,
     resolve_store_keys,
+    resolve_worker_count,
 )
 
 
@@ -60,6 +63,18 @@ class DutchieApiReportsTests(unittest.TestCase):
             handle.flush()
             env_map = canonical_env_map(handle.name)
         self.assertEqual(env_map["DUTCHIE_API_KEY_MV"], "mv-key")
+
+    def test_positive_int_rejects_invalid_worker_counts(self):
+        self.assertEqual(positive_int("4"), 4)
+        with self.assertRaises(ArgumentTypeError):
+            positive_int("0")
+        with self.assertRaises(ArgumentTypeError):
+            positive_int("fast")
+
+    def test_resolve_worker_count_caps_to_job_count(self):
+        self.assertEqual(resolve_worker_count(8, 3), 3)
+        self.assertEqual(resolve_worker_count(1, 3), 1)
+        self.assertEqual(resolve_worker_count(None, 0), 1)
 
 
 if __name__ == "__main__":

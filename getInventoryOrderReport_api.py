@@ -3,24 +3,30 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import math
 import re
+from threading import Lock
 from typing import Any
 
 import pandas as pd
 
 from dutchie_api_reports import (
+    DEFAULT_API_WORKERS,
     DEFAULT_ENV_FILE,
     STORE_CODES,
     canonical_env_map,
     create_session,
     local_date_range_to_utc_strings,
     parse_store_codes,
+    positive_int,
+    print_threadsafe,
     request_json,
     resolve_integrator_key,
     resolve_store_keys,
+    resolve_worker_count,
 )
 from inventory_order_reports import ORDER_REPORT_WINDOWS, order_report_filename
 
@@ -498,7 +504,99 @@ def clear_existing_order_reports(output_dir):
             print(f"[INFO] Deleted old order report: {existing}")
 
 
-def run_inventory_order_report_api(output_dir="files", anchor_day=None, stores=None, env_file=DEFAULT_ENV_FILE):
+def _sales_params_for_window(start_day, end_day):
+    from_utc, to_utc = local_date_range_to_utc_strings(
+        start_day.isoformat(),
+        end_day.isoformat(),
+    )
+    return {
+        "FromDateUTC": from_utc,
+        "ToDateUTC": to_utc,
+        "IncludeDetail": True,
+        "IncludeTaxes": True,
+        "IncludeOrderIds": True,
+        "IncludeFeesAndDonations": True,
+    }
+
+
+def _run_inventory_order_report_store(
+    store_code,
+    location_key,
+    integrator_key,
+    windows,
+    output_path,
+    print_lock=None,
+):
+    store_label = STORE_CODES.get(store_code, store_code)
+    failures = []
+    session = create_session(location_key, integrator_key)
+
+    try:
+        print_threadsafe(
+            f"[INFO] Preparing Dutchie API order-report exports for {store_code} ({store_label})",
+            print_lock,
+        )
+        try:
+            print_threadsafe(f"[FETCH] {store_code} ({store_label}) -> /reporting/inventory", print_lock)
+            inventory_payload = request_json(session, "/reporting/inventory")
+            print_threadsafe(f"[FETCH] {store_code} ({store_label}) -> /reporting/products", print_lock)
+            products_payload = request_json(session, "/reporting/products")
+            print_threadsafe(
+                f"[INFO] Loaded inventory/products for {store_code}: "
+                f"{len(inventory_payload or [])} inventory row(s), {len(products_payload or [])} product row(s).",
+                print_lock,
+            )
+        except Exception as exc:
+            failures.append(f"{store_code}: inventory/products fetch failed ({exc})")
+            return failures
+
+        largest_window_days, largest_start_day, largest_end_day = max(windows, key=lambda window: window[0])
+        try:
+            sales_params = _sales_params_for_window(largest_start_day, largest_end_day)
+            print_threadsafe(
+                f"[FETCH] {store_code} inventory order {largest_window_days}d transaction cache: "
+                f"/reporting/transactions {largest_start_day.isoformat()} -> {largest_end_day.isoformat()}",
+                print_lock,
+            )
+            transactions_payload = request_json(session, "/reporting/transactions", params=sales_params)
+            print_threadsafe(
+                f"[INFO] Loaded {len(transactions_payload or [])} transaction row(s) for {store_code}; "
+                "reusing that cache for all order windows.",
+                print_lock,
+            )
+        except Exception as exc:
+            failures.append(f"{store_code}: transactions fetch failed ({exc})")
+            return failures
+
+        for window_days, start_day, end_day in windows:
+            try:
+                report_df = build_inventory_order_report_frame(
+                    inventory_payload=inventory_payload,
+                    products_payload=products_payload,
+                    transactions_payload=transactions_payload,
+                    store_code=store_code,
+                    window_days=window_days,
+                    start_day=start_day,
+                    end_day=end_day,
+                )
+                destination = output_path / order_report_filename(store_code, window_days, extension=".csv")
+                report_df.to_csv(destination, index=False)
+                print_threadsafe(f"[INFO] Saved {destination.name} with {len(report_df)} row(s).", print_lock)
+            except Exception as exc:
+                failures.append(f"{store_code}: {window_days}d ({exc})")
+    finally:
+        session.close()
+
+    return failures
+
+
+def run_inventory_order_report_api(
+    output_dir="files",
+    anchor_day=None,
+    stores=None,
+    env_file=DEFAULT_ENV_FILE,
+    workers=DEFAULT_API_WORKERS,
+):
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
     clear_existing_order_reports(output_path)
@@ -517,58 +615,44 @@ def run_inventory_order_report_api(output_dir="files", anchor_day=None, stores=N
     integrator_key = resolve_integrator_key(env_map)
     windows = compute_windows(anchor_day=anchor_day)
     failures = []
+    worker_count = resolve_worker_count(workers, len(requested_stores))
+    worker_label = "serial mode" if worker_count == 1 else f"{worker_count} store worker threads"
+    print(f"[INFO] Running Dutchie API order reports with {worker_label}.")
+    print("[INFO] Transaction pulls use the largest configured order window once per store, then reuse it.")
+    print_lock = Lock()
 
-    for store_code in requested_stores:
-        store_label = STORE_CODES.get(store_code, store_code)
-        print(f"[INFO] Preparing Dutchie API order-report exports for {store_code} ({store_label})")
-        session = create_session(store_keys[store_code], integrator_key)
-
-        try:
-            print(f"[FETCH] {store_code} ({store_label}) -> /reporting/inventory")
-            inventory_payload = request_json(session, "/reporting/inventory")
-            print(f"[FETCH] {store_code} ({store_label}) -> /reporting/products")
-            products_payload = request_json(session, "/reporting/products")
-            print(
-                f"[INFO] Loaded inventory/products for {store_code}: "
-                f"{len(inventory_payload or [])} inventory row(s), {len(products_payload or [])} product row(s)."
-            )
-        except Exception as exc:
-            failures.append(f"{store_code}: inventory/products fetch failed ({exc})")
-            continue
-
-        for window_days, start_day, end_day in windows:
-            try:
-                from_utc, to_utc = local_date_range_to_utc_strings(
-                    start_day.isoformat(),
-                    end_day.isoformat(),
-                )
-                sales_params = {
-                    "FromDateUTC": from_utc,
-                    "ToDateUTC": to_utc,
-                    "IncludeDetail": True,
-                    "IncludeTaxes": True,
-                    "IncludeOrderIds": True,
-                    "IncludeFeesAndDonations": True,
-                }
-                print(
-                    f"[FETCH] {store_code} inventory order {window_days}d: "
-                    f"/reporting/transactions {start_day.isoformat()} -> {end_day.isoformat()}"
-                )
-                transactions_payload = request_json(session, "/reporting/transactions", params=sales_params)
-                report_df = build_inventory_order_report_frame(
-                    inventory_payload=inventory_payload,
-                    products_payload=products_payload,
-                    transactions_payload=transactions_payload,
+    if worker_count == 1:
+        for store_code in requested_stores:
+            failures.extend(
+                _run_inventory_order_report_store(
                     store_code=store_code,
-                    window_days=window_days,
-                    start_day=start_day,
-                    end_day=end_day,
+                    location_key=store_keys[store_code],
+                    integrator_key=integrator_key,
+                    windows=windows,
+                    output_path=output_path,
+                    print_lock=print_lock,
                 )
-                destination = output_path / order_report_filename(store_code, window_days, extension=".csv")
-                report_df.to_csv(destination, index=False)
-                print(f"[INFO] Saved {destination.name} with {len(report_df)} row(s).")
-            except Exception as exc:
-                failures.append(f"{store_code}: {window_days}d ({exc})")
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _run_inventory_order_report_store,
+                    store_code,
+                    store_keys[store_code],
+                    integrator_key,
+                    windows,
+                    output_path,
+                    print_lock,
+                ): store_code
+                for store_code in requested_stores
+            }
+            for future in as_completed(futures):
+                store_code = futures[future]
+                try:
+                    failures.extend(future.result())
+                except Exception as exc:
+                    failures.append(f"{store_code}: {exc}")
 
     if failures:
         raise RuntimeError("Dutchie API inventory order export failed for: " + ", ".join(failures))
@@ -595,6 +679,15 @@ def parse_args():
         help="Optional list of store codes like MV LG LM.",
     )
     parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=DEFAULT_API_WORKERS,
+        help=(
+            "Number of stores to build concurrently. "
+            f"Default: {DEFAULT_API_WORKERS}. Use 1 for serial API calls."
+        ),
+    )
+    parser.add_argument(
         "--end-date",
         help="Anchor end date in YYYY-MM-DD format. Defaults to today.",
     )
@@ -609,6 +702,7 @@ def main():
         anchor_day=anchor_day,
         stores=args.stores,
         env_file=args.env_file,
+        workers=args.workers,
     )
 
 
