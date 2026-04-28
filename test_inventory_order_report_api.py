@@ -66,14 +66,16 @@ class InventoryOrderReportAPITests(unittest.TestCase):
 
             sections = build_brand_order_sections(tmp, ["Brand A"], store_code="MV")
 
-        self.assertIn("Order_14d", sections)
-        detail_df = sections["Order_14d"]["detail"]
+        self.assertIn("Order", sections)
+        detail_df = sections["Order"]["table"]
         self.assertGreater(len(detail_df), 0)
-        self.assertIn("Suggested Order Qty (14d)", detail_df.columns)
-        self.assertIn("Reorder Priority", detail_df.columns)
+        self.assertIn("Par Level", detail_df.columns)
+        self.assertIn("Units Sold 14d", detail_df.columns)
 
-        tropical_row = detail_df.loc[detail_df["Product Name"] == "Brand A | Gummies 10pk | Tropical"].iloc[0]
-        self.assertEqual(int(tropical_row["Suggested Order Qty (14d)"]), 2)
+        tropical_row = detail_df.loc[detail_df["Product"] == "Brand A | Gummies 10pk | Tropical"].iloc[0]
+        self.assertEqual(int(tropical_row["Available"]), 0)
+        self.assertEqual(int(tropical_row["Par Level"]), 1)
+        self.assertEqual(int(tropical_row["Units Sold 14d"]), 2)
 
 
 if __name__ == "__main__":

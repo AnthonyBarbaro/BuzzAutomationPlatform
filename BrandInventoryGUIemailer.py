@@ -3013,8 +3013,7 @@ class LegacyBrandInventoryGUI:
             if order_summary:
                 order_note = (
                     "<p>Matching Dutchie order-report rows were added to the "
-                    "<strong>Order_7d</strong>, <strong>Order_14d</strong>, and "
-                    f"<strong>Order_30d</strong> tabs when available. Source windows found: {order_summary}.</p>"
+                    f"<strong>Order</strong> tab when available. Source windows found: {order_summary}.</p>"
                 )
             body_html = f"""
             <html>
@@ -4104,8 +4103,7 @@ class BrandInventoryGUI:
         if order_summary:
             order_note = (
                 "<p>Matching Dutchie order-report rows were added to the "
-                "<strong>Order_7d</strong>, <strong>Order_14d</strong>, and "
-                f"<strong>Order_30d</strong> tabs when available. Source windows found: {order_summary}.</p>"
+                f"<strong>Order</strong> tab when available. Source windows found: {order_summary}.</p>"
             )
         body_html = f"""
         <html>

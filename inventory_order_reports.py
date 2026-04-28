@@ -5,7 +5,7 @@ from functools import lru_cache
 import math
 
 import pandas as pd
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 ORDER_REPORT_WINDOWS = (7, 14, 30)
@@ -53,9 +53,48 @@ CONCENTRATE_TYPE_COLUMN_CANDIDATES = ("concentrate type",)
 UPC_COLUMN_CANDIDATES = ("upc/gtin", "upc", "gtin")
 PROVINCIAL_SKU_COLUMN_CANDIDATES = ("provincial sku",)
 
+ORDER_SHEET_NAME = "Order"
 ORDER_SHEET_PREFIX = "Order_"
 ORDER_SUMMARY_TITLE = "Ordering Summary"
 ORDER_DETAIL_TITLE = "Product Detail"
+SIMPLE_ORDER_COLUMNS = [
+    "Brand",
+    "Category",
+    "Product",
+    "Available",
+    "Par Level",
+    "Cost",
+    "Price",
+    "Units Sold 7d",
+    "Units Sold 14d",
+    "Units Sold 30d",
+]
+SIMPLE_ORDER_TARGET_COVER_DAYS = 14
+SIMPLE_ORDER_PAR_WEIGHTS = {
+    7: 0.5,
+    14: 0.3,
+    30: 0.2,
+}
+SIMPLE_ORDER_HEADER_FILL = PatternFill(
+    start_color="1F4E78",
+    end_color="1F4E78",
+    fill_type="solid",
+)
+SIMPLE_ORDER_OK_FILL = PatternFill(
+    start_color="EEF5EC",
+    end_color="EEF5EC",
+    fill_type="solid",
+)
+SIMPLE_ORDER_LOW_FILL = PatternFill(
+    start_color="FFF2CC",
+    end_color="FFF2CC",
+    fill_type="solid",
+)
+SIMPLE_ORDER_OUT_FILL = PatternFill(
+    start_color="F4CCCC",
+    end_color="F4CCCC",
+    fill_type="solid",
+)
 ORDER_SUMMARY_HEADER_FILL = PatternFill(
     start_color="D3D3D3",
     end_color="D3D3D3",
@@ -294,6 +333,26 @@ def _ceil_non_negative(value):
     return max(0, int(math.ceil(float(value))))
 
 
+def _safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _rounded_display_number(value):
+    numeric = _safe_float(value, 0.0)
+    rounded = round(numeric)
+    if abs(numeric - rounded) < 0.0001:
+        return int(rounded)
+    return round(numeric, 2)
+
+
 def _priority_from_metrics(suggested_qty, days_remaining, sold_per_day, qty_sold, days_since_received):
     sold_per_day = 0.0 if pd.isna(sold_per_day) else float(sold_per_day)
     qty_sold = 0.0 if pd.isna(qty_sold) else float(qty_sold)
@@ -397,7 +456,151 @@ def _find_exact_or_matching_column(df, names):
 
 
 def is_order_sheet_name(name):
-    return str(name or "").startswith(ORDER_SHEET_PREFIX)
+    sheet_name = str(name or "")
+    return sheet_name == ORDER_SHEET_NAME or sheet_name.startswith(ORDER_SHEET_PREFIX)
+
+
+def _order_join_key(row, sku_col=None, product_col=None):
+    sku_text = _safe_display_text(row.get(sku_col)) if sku_col else ""
+    if sku_text:
+        return f"sku:{sku_text.upper()}"
+    product_text = _safe_display_text(row.get(product_col)) if product_col else ""
+    return f"name:{normalize_text(product_text)}"
+
+
+def _with_order_join_key(df):
+    work = df.copy()
+    sku_col = find_matching_column(work, SKU_COLUMN_CANDIDATES)
+    product_col = find_matching_column(work, PRODUCT_COLUMN_CANDIDATES)
+    if work.empty:
+        work["_order_join_key"] = pd.Series(dtype="object")
+        return work
+    work["_order_join_key"] = work.apply(
+        lambda row: _order_join_key(row, sku_col=sku_col, product_col=product_col),
+        axis=1,
+    )
+    work = work[work["_order_join_key"].str.len() > len("name:")].copy()
+    return work
+
+
+def _simple_sell_through(units_sold, available):
+    units_sold = max(0.0, _safe_float(units_sold, 0.0))
+    available = max(0.0, _safe_float(available, 0.0))
+    denominator = units_sold + available
+    return units_sold / denominator if denominator > 0 else 0.0
+
+
+def _estimate_simple_par_level(available, units_sold_7d, units_sold_14d, units_sold_30d):
+    units_sold_7d = max(0.0, _safe_float(units_sold_7d, 0.0))
+    units_sold_14d = max(0.0, _safe_float(units_sold_14d, 0.0))
+    units_sold_30d = max(0.0, _safe_float(units_sold_30d, 0.0))
+    available = max(0.0, _safe_float(available, 0.0))
+
+    if units_sold_7d <= 0 and units_sold_14d <= 0 and units_sold_30d <= 0:
+        return 0
+
+    target_days = SIMPLE_ORDER_TARGET_COVER_DAYS
+    projected = {
+        7: units_sold_7d * (target_days / 7.0),
+        14: units_sold_14d * (target_days / 14.0),
+        30: units_sold_30d * (target_days / 30.0),
+    }
+    weight_total = sum(SIMPLE_ORDER_PAR_WEIGHTS.values()) or 1.0
+    projected_target = sum(
+        projected[days] * SIMPLE_ORDER_PAR_WEIGHTS.get(days, 0.0)
+        for days in SIMPLE_ORDER_PAR_WEIGHTS
+    ) / weight_total
+
+    if units_sold_7d <= 0 and units_sold_14d <= 0 and units_sold_30d > 0:
+        projected_target *= 0.6
+
+    projected_floor = max(projected_target, projected[14])
+    if projected_floor > 0:
+        max_sell_through = max(
+            _simple_sell_through(units_sold_7d, available),
+            _simple_sell_through(units_sold_14d, available),
+            _simple_sell_through(units_sold_30d, available),
+        )
+        coverage_ratio = min(1.0, available / projected_floor)
+        sell_pressure = max(0.0, (max_sell_through - 0.55) / 0.45)
+        uplift = min(0.25, max(0.0, (1.0 - coverage_ratio) * sell_pressure * 0.25))
+        projected_target *= 1.0 + uplift
+
+    return _ceil_non_negative(projected_target)
+
+
+def _quantity_sold_by_key(df):
+    if df.empty:
+        return {}
+    work = _with_order_join_key(df)
+    qty_col = find_matching_column(work, QTY_SOLD_COLUMN_CANDIDATES)
+    if not qty_col:
+        return {}
+    work["_quantity_sold"] = pd.to_numeric(work[qty_col], errors="coerce").fillna(0.0)
+    return work.groupby("_order_join_key")["_quantity_sold"].sum().to_dict()
+
+
+def build_simple_order_table(window_frames, include_store_column=False, store_code=""):
+    prepared_frames = []
+    for days in sorted(window_frames, reverse=True):
+        frame = window_frames.get(days)
+        if frame is None or frame.empty:
+            continue
+        work = _with_order_join_key(frame)
+        if work.empty:
+            continue
+        work["_source_window_rank"] = -int(days)
+        prepared_frames.append(work)
+
+    columns = (["Store"] if include_store_column else []) + SIMPLE_ORDER_COLUMNS
+    if not prepared_frames:
+        return pd.DataFrame(columns=columns)
+
+    base = pd.concat(prepared_frames, ignore_index=True)
+    base = base.sort_values("_source_window_rank").drop_duplicates("_order_join_key", keep="first")
+
+    brand_col = find_matching_column(base, BRAND_COLUMN_CANDIDATES)
+    category_col = find_matching_column(base, ("category",))
+    product_col = find_matching_column(base, PRODUCT_COLUMN_CANDIDATES)
+    qoh_col = find_matching_column(base, QOH_COLUMN_CANDIDATES)
+    cost_col = find_matching_column(base, LAST_WHOLESALE_COST_COLUMN_CANDIDATES)
+    price_col = find_matching_column(base, PRICE_COLUMN_CANDIDATES)
+
+    sold_by_window = {
+        days: _quantity_sold_by_key(window_frames.get(days, pd.DataFrame()))
+        for days in ORDER_REPORT_WINDOWS
+    }
+
+    rows = []
+    for _, row in base.iterrows():
+        key = row.get("_order_join_key", "")
+        units_7d = _safe_float(sold_by_window.get(7, {}).get(key, 0.0), 0.0)
+        units_14d = _safe_float(sold_by_window.get(14, {}).get(key, 0.0), 0.0)
+        units_30d = _safe_float(sold_by_window.get(30, {}).get(key, 0.0), 0.0)
+        available = _safe_float(row.get(qoh_col), 0.0) if qoh_col else 0.0
+        result_row = {
+            "Brand": _safe_display_text(row.get(brand_col)) if brand_col else "",
+            "Category": _safe_display_text(row.get(category_col)) if category_col else "",
+            "Product": _safe_display_text(row.get(product_col)) if product_col else "",
+            "Available": _rounded_display_number(available),
+            "Par Level": _estimate_simple_par_level(available, units_7d, units_14d, units_30d),
+            "Cost": round(_safe_float(row.get(cost_col), 0.0), 2) if cost_col else 0.0,
+            "Price": round(_safe_float(row.get(price_col), 0.0), 2) if price_col else 0.0,
+            "Units Sold 7d": _rounded_display_number(units_7d),
+            "Units Sold 14d": _rounded_display_number(units_14d),
+            "Units Sold 30d": _rounded_display_number(units_30d),
+        }
+        if include_store_column:
+            result_row = {"Store": store_code, **result_row}
+        rows.append(result_row)
+
+    result = pd.DataFrame(rows, columns=columns)
+    if result.empty:
+        return result
+
+    sort_columns = [col for col in ["Store", "Brand", "Category", "Product"] if col in result.columns]
+    result = result.sort_values(sort_columns, na_position="last").reset_index(drop=True)
+    return result
 
 
 def _is_sample_or_promo(value):
@@ -748,6 +951,11 @@ def build_grouped_order_summary(detail_df, window_days):
 
 
 def write_order_section_sheet(writer, sheet_name, section_payload):
+    table_df = (section_payload or {}).get("table")
+    if table_df is not None:
+        table_df.to_excel(writer, index=False, sheet_name=sheet_name)
+        return
+
     summary_df = (section_payload or {}).get("summary")
     detail_df = (section_payload or {}).get("detail")
     if summary_df is None:
@@ -837,9 +1045,105 @@ def _group_detail_rows_by_category(ws, detail_header_row):
         c.alignment = Alignment(horizontal="center", vertical="center")
 
 
+def format_simple_order_sheet(ws):
+    if ws.title != ORDER_SHEET_NAME:
+        return False
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    thin_border = Side(style="thin", color="D9E2E3")
+    group_border = Side(style="medium", color="3C4043")
+    header_border = Border(bottom=Side(style="medium", color="9AA0A6"))
+
+    for cell in ws[1]:
+        cell.fill = SIMPLE_ORDER_HEADER_FILL
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = header_border
+
+    header_map = {
+        normalize_text(cell.value): idx
+        for idx, cell in enumerate(ws[1], start=1)
+        if cell.value
+    }
+    category_idx = header_map.get("category")
+    available_idx = header_map.get("available")
+    par_idx = header_map.get("par level")
+    product_idx = header_map.get("product")
+    currency_columns = {
+        header_map.get("cost"),
+        header_map.get("price"),
+    }
+    integer_columns = {
+        header_map.get("available"),
+        header_map.get("par level"),
+        header_map.get("units sold 7d"),
+        header_map.get("units sold 14d"),
+        header_map.get("units sold 30d"),
+    }
+
+    previous_category = None
+    for row_idx in range(2, ws.max_row + 1):
+        available = _safe_float(ws.cell(row=row_idx, column=available_idx).value, 0.0) if available_idx else 0.0
+        par_level = _safe_float(ws.cell(row=row_idx, column=par_idx).value, 0.0) if par_idx else 0.0
+        if available <= 0:
+            row_fill = SIMPLE_ORDER_OUT_FILL
+            row_font = Font(bold=True)
+        elif par_level > 0 and available < par_level:
+            row_fill = SIMPLE_ORDER_LOW_FILL
+            row_font = Font()
+        else:
+            row_fill = SIMPLE_ORDER_OK_FILL
+            row_font = Font()
+
+        category = ws.cell(row=row_idx, column=category_idx).value if category_idx else None
+        top_side = group_border if row_idx == 2 or category != previous_category else thin_border
+        previous_category = category
+
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.fill = row_fill
+            cell.font = row_font
+            cell.border = Border(top=top_side, bottom=thin_border, left=thin_border, right=thin_border)
+            cell.alignment = Alignment(
+                horizontal="left" if col_idx in {category_idx, product_idx, header_map.get("brand")} else "center",
+                vertical="center",
+                wrap_text=(col_idx == product_idx),
+            )
+            if col_idx in currency_columns:
+                cell.number_format = "$#,##0.00"
+            elif col_idx in integer_columns:
+                cell.number_format = "0"
+
+    widths = {
+        "store": 10,
+        "brand": 18,
+        "category": 16,
+        "product": 58,
+        "available": 12,
+        "par level": 12,
+        "cost": 12,
+        "price": 12,
+        "units sold 7d": 14,
+        "units sold 14d": 14,
+        "units sold 30d": 14,
+    }
+    for header, col_idx in header_map.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(header, 12)
+
+    ws.row_dimensions[1].height = 24
+    for row_idx in range(2, ws.max_row + 1):
+        ws.row_dimensions[row_idx].height = 22
+
+    return True
+
+
 def format_order_sheet(ws):
     if not is_order_sheet_name(ws.title):
         return False
+    if format_simple_order_sheet(ws):
+        return True
 
     detail_title_row = None
     for row_idx in range(1, ws.max_row + 1):
@@ -968,19 +1272,28 @@ def build_brand_order_sections(order_reports_dir, brand_aliases, store_code=None
     discovered = discover_order_report_files(order_reports_dir)
     wanted_store = canonical_store_code(store_code) if store_code else ""
 
+    available_stores = []
     for days in ORDER_REPORT_WINDOWS:
-        store_map = discovered.get(days, {})
-        if wanted_store:
-            store_items = [(wanted_store, store_map[wanted_store])] if wanted_store in store_map else []
-        else:
-            store_items = list(store_map.items())
+        for store in discovered.get(days, {}):
+            if store not in available_stores:
+                available_stores.append(store)
 
-        if not store_items:
-            continue
+    if wanted_store:
+        store_items = [wanted_store] if wanted_store in available_stores else []
+    else:
+        store_items = available_stores
 
-        detail_frames = []
-        include_store_column = len(store_items) > 1 and not wanted_store
-        for store, path in store_items:
+    if not store_items:
+        return sections
+
+    table_frames = []
+    include_store_column = len(store_items) > 1 and not wanted_store
+    for store in store_items:
+        window_frames = {}
+        for days in ORDER_REPORT_WINDOWS:
+            path = discovered.get(days, {}).get(store)
+            if not path:
+                continue
             try:
                 df = load_order_report_table(path)
             except Exception as exc:
@@ -996,23 +1309,24 @@ def build_brand_order_sections(order_reports_dir, brand_aliases, store_code=None
             if brand_rows.empty:
                 continue
 
-            brand_rows = _sort_order_rows(brand_rows)
-            brand_rows = prepare_reorder_sheet(brand_rows, days)
-            if include_store_column:
-                brand_rows.insert(0, "Store", store)
-            detail_frames.append(brand_rows)
+            window_frames[days] = _sort_order_rows(brand_rows)
 
-        if not detail_frames:
-            continue
-
-        detail_df = (
-            pd.concat(detail_frames, ignore_index=True)
-            if len(detail_frames) > 1
-            else detail_frames[0]
+        table = build_simple_order_table(
+            window_frames,
+            include_store_column=include_store_column,
+            store_code=store,
         )
-        sections[f"Order_{days}d"] = {
-            "summary": build_grouped_order_summary(detail_df, days),
-            "detail": detail_df,
-        }
+        if not table.empty:
+            table_frames.append(table)
+
+    if not table_frames:
+        return sections
+
+    order_table = (
+        pd.concat(table_frames, ignore_index=True)
+        if len(table_frames) > 1
+        else table_frames[0]
+    )
+    sections[ORDER_SHEET_NAME] = {"table": order_table}
 
     return sections
