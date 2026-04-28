@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 import math
 import re
+import time
 from threading import Lock
 from typing import Any
 
@@ -65,6 +66,10 @@ ORDER_REPORT_COLUMNS = [
     "Last Audit",
     "Tags",
 ]
+
+
+def _format_elapsed(started_at: float) -> str:
+    return f"{time.perf_counter() - started_at:.1f}s"
 
 
 def _first_nonempty(*values):
@@ -530,6 +535,7 @@ def _run_inventory_order_report_store(
     store_label = STORE_CODES.get(store_code, store_code)
     failures = []
     session = create_session(location_key, integrator_key)
+    store_started_at = time.perf_counter()
 
     try:
         print_threadsafe(
@@ -538,9 +544,20 @@ def _run_inventory_order_report_store(
         )
         try:
             print_threadsafe(f"[FETCH] {store_code} ({store_label}) -> /reporting/inventory", print_lock)
+            fetch_started_at = time.perf_counter()
             inventory_payload = request_json(session, "/reporting/inventory")
+            print_threadsafe(
+                f"[TIMING] {store_code} inventory fetch completed in {_format_elapsed(fetch_started_at)}.",
+                print_lock,
+            )
+
             print_threadsafe(f"[FETCH] {store_code} ({store_label}) -> /reporting/products", print_lock)
+            fetch_started_at = time.perf_counter()
             products_payload = request_json(session, "/reporting/products")
+            print_threadsafe(
+                f"[TIMING] {store_code} products fetch completed in {_format_elapsed(fetch_started_at)}.",
+                print_lock,
+            )
             print_threadsafe(
                 f"[INFO] Loaded inventory/products for {store_code}: "
                 f"{len(inventory_payload or [])} inventory row(s), {len(products_payload or [])} product row(s).",
@@ -558,7 +575,12 @@ def _run_inventory_order_report_store(
                 f"/reporting/transactions {largest_start_day.isoformat()} -> {largest_end_day.isoformat()}",
                 print_lock,
             )
+            fetch_started_at = time.perf_counter()
             transactions_payload = request_json(session, "/reporting/transactions", params=sales_params)
+            print_threadsafe(
+                f"[TIMING] {store_code} transaction cache fetch completed in {_format_elapsed(fetch_started_at)}.",
+                print_lock,
+            )
             print_threadsafe(
                 f"[INFO] Loaded {len(transactions_payload or [])} transaction row(s) for {store_code}; "
                 "reusing that cache for all order windows.",
@@ -570,6 +592,7 @@ def _run_inventory_order_report_store(
 
         for window_days, start_day, end_day in windows:
             try:
+                report_started_at = time.perf_counter()
                 report_df = build_inventory_order_report_frame(
                     inventory_payload=inventory_payload,
                     products_payload=products_payload,
@@ -582,9 +605,18 @@ def _run_inventory_order_report_store(
                 destination = output_path / order_report_filename(store_code, window_days, extension=".csv")
                 report_df.to_csv(destination, index=False)
                 print_threadsafe(f"[INFO] Saved {destination.name} with {len(report_df)} row(s).", print_lock)
+                print_threadsafe(
+                    f"[TIMING] {store_code} {window_days}d report build/write completed in "
+                    f"{_format_elapsed(report_started_at)}.",
+                    print_lock,
+                )
             except Exception as exc:
                 failures.append(f"{store_code}: {window_days}d ({exc})")
     finally:
+        print_threadsafe(
+            f"[TIMING] {store_code} worker finished in {_format_elapsed(store_started_at)}.",
+            print_lock,
+        )
         session.close()
 
     return failures

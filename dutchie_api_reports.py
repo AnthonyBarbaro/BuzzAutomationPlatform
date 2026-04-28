@@ -39,7 +39,7 @@ DEFAULT_OUTPUT_DIR = Path("reports/api_exports")
 DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_FORMATS = ("json", "csv")
 DEFAULT_REPORTS = ("sales", "catalog", "inventory")
-DEFAULT_API_WORKERS = 4
+DEFAULT_API_WORKERS = 6
 
 STORE_CODES = OrderedDict(
     [
