@@ -9,12 +9,14 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from xml.sax.saxutils import escape as xml_escape
 from zoneinfo import ZoneInfo
@@ -45,12 +47,14 @@ from reportlab.platypus import (
 
 import owner_snapshot as osnap
 from dutchie_api_reports import (
+    DEFAULT_API_WORKERS,
     canonical_env_map as dutchie_canonical_env_map,
     create_session as dutchie_create_session,
     local_date_range_to_utc_strings as dutchie_local_date_range_to_utc_strings,
     request_json as dutchie_request_json,
     resolve_integrator_key as dutchie_resolve_integrator_key,
     resolve_store_keys as dutchie_resolve_store_keys,
+    resolve_worker_count,
 )
 from getSalesReport import run_sales_report, store_abbr_map
 
@@ -62,6 +66,7 @@ REPORT_TZ = "America/Los_Angeles"
 DEFAULT_DAYS = 60
 DEFAULT_OUTPUT_ROOT = Path("reports/brand_packets").resolve()
 DEFAULT_API_ENV_FILE = ".env"
+DEFAULT_PACKET_API_WORKERS = DEFAULT_API_WORKERS
 SALES_API_MAX_WINDOW_DAYS = 30
 MIN_REPORTABLE_INVENTORY_UNITS = 4.0
 ALL_STORE_SLOW_MOVER_REPORT_NAME = "_all_store_slow_movers"
@@ -128,6 +133,7 @@ class PacketOptions:
     generate_xlsx: bool = False
     top_n: int = 20
     force_refresh_data: bool = False
+    api_workers: int = DEFAULT_PACKET_API_WORKERS
 
 
 @dataclass
@@ -626,13 +632,24 @@ def _fetch_sales_exports_via_api(
     end_day: date,
     env_file: str,
     logger: Optional[Callable[[str], None]],
+    api_workers: int = DEFAULT_PACKET_API_WORKERS,
 ) -> Tuple[Dict[str, Path], List[str]]:
     archived: Dict[str, Path] = {}
     missing: List[str] = []
     store_keys, integrator_key = _api_store_keys(env_file, selected_store_codes)
     chunks = _iter_sales_api_chunks(start_day, end_day)
+    worker_count = resolve_worker_count(api_workers, len(selected_store_codes))
+    worker_label = "serial mode" if worker_count == 1 else f"{worker_count} store worker threads"
+    log_lock = Lock()
 
-    for abbr in selected_store_codes:
+    def log_safe(message: str) -> None:
+        with log_lock:
+            _log(message, logger)
+
+    log_safe(f"[SALES] Dutchie API sales fetch using {worker_label}.")
+
+    def fetch_store(abbr: str) -> Tuple[str, Optional[Path], Optional[str]]:
+        session = None
         try:
             session = dutchie_create_session(store_keys[abbr], integrator_key)
             products_payload = dutchie_request_json(session, "/reporting/products")
@@ -651,9 +668,8 @@ def _fetch_sales_exports_via_api(
                     "IncludeOrderIds": True,
                     "IncludeFeesAndDonations": True,
                 }
-                _log(
+                log_safe(
                     f"[SALES] API chunk {abbr} {idx}/{len(chunks)}: {chunk_start.isoformat()} -> {chunk_end.isoformat()}",
-                    logger,
                 )
                 payload = dutchie_request_json(session, "/reporting/transactions", params=sales_params)
                 if isinstance(payload, list) and payload:
@@ -665,11 +681,36 @@ def _fetch_sales_exports_via_api(
             )
             dst = paths.raw_sales_dir / dst_name
             df.to_csv(dst, index=False)
-            archived[abbr] = dst
-            _log(f"[API] Sales {abbr}: {len(df)} row(s) -> {dst}", logger)
+            log_safe(f"[API] Sales {abbr}: {len(df)} row(s) -> {dst}")
+            return abbr, dst, None
         except Exception as exc:
+            return abbr, None, str(exc)
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    if worker_count == 1:
+        results = [fetch_store(abbr) for abbr in selected_store_codes]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {executor.submit(fetch_store, abbr): abbr for abbr in selected_store_codes}
+            results = []
+            for future in as_completed(future_map):
+                abbr = future_map[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append((abbr, None, str(exc)))
+
+    for abbr, path, error in results:
+        if path is not None:
+            archived[abbr] = path
+        else:
             missing.append(abbr)
-            _log(f"[WARN] API sales fetch failed for {abbr}: {exc}", logger)
+            _log(f"[WARN] API sales fetch failed for {abbr}: {error or 'unknown error'}", logger)
 
     return archived, missing
 
@@ -679,12 +720,23 @@ def _fetch_catalog_exports_via_api(
     selected_store_codes: Sequence[str],
     env_file: str,
     logger: Optional[Callable[[str], None]],
+    api_workers: int = DEFAULT_PACKET_API_WORKERS,
 ) -> Tuple[List[Path], List[str]]:
     copied: List[Path] = []
     missing: List[str] = []
     store_keys, integrator_key = _api_store_keys(env_file, selected_store_codes)
+    worker_count = resolve_worker_count(api_workers, len(selected_store_codes))
+    worker_label = "serial mode" if worker_count == 1 else f"{worker_count} store worker threads"
+    log_lock = Lock()
 
-    for abbr in selected_store_codes:
+    def log_safe(message: str) -> None:
+        with log_lock:
+            _log(message, logger)
+
+    log_safe(f"[CATALOG] Dutchie API catalog fetch using {worker_label}.")
+
+    def fetch_store(abbr: str) -> Tuple[str, Optional[Path], Optional[str]]:
+        session = None
         try:
             session = dutchie_create_session(store_keys[abbr], integrator_key)
             inventory_payload = dutchie_request_json(session, "/reporting/inventory")
@@ -692,11 +744,36 @@ def _fetch_catalog_exports_via_api(
             dst_name = safe_filename(f"catalog_{abbr}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
             dst = paths.raw_catalog_dir / dst_name
             df.to_csv(dst, index=False)
-            copied.append(dst)
-            _log(f"[API] Catalog {abbr}: {len(df)} row(s) -> {dst}", logger)
+            log_safe(f"[API] Catalog {abbr}: {len(df)} row(s) -> {dst}")
+            return abbr, dst, None
         except Exception as exc:
+            return abbr, None, str(exc)
+        finally:
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    if worker_count == 1:
+        results = [fetch_store(abbr) for abbr in selected_store_codes]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {executor.submit(fetch_store, abbr): abbr for abbr in selected_store_codes}
+            results = []
+            for future in as_completed(future_map):
+                abbr = future_map[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append((abbr, None, str(exc)))
+
+    for abbr, path, error in results:
+        if path is not None:
+            copied.append(path)
+        else:
             missing.append(abbr)
-            _log(f"[WARN] API catalog fetch failed for {abbr}: {exc}", logger)
+            _log(f"[WARN] API catalog fetch failed for {abbr}: {error or 'unknown error'}", logger)
 
     return copied, missing
 
@@ -944,6 +1021,7 @@ def prepare_sales_exports(
     force_refresh: bool,
     use_api: bool,
     api_env_file: str,
+    api_workers: int,
     logger: Optional[Callable[[str], None]],
 ) -> Tuple[Dict[str, Path], List[str], bool]:
     sales_paths: Dict[str, Path] = {}
@@ -993,6 +1071,7 @@ def prepare_sales_exports(
             end_day=acquisition_end,
             env_file=api_env_file,
             logger=logger,
+            api_workers=api_workers,
         )
     else:
         _log(
@@ -1157,6 +1236,7 @@ def prepare_catalog_exports(
     force_refresh: bool,
     use_api: bool,
     api_env_file: str,
+    api_workers: int,
     logger: Optional[Callable[[str], None]],
 ) -> Tuple[List[Path], List[str], bool]:
     existing = sorted(paths.raw_catalog_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1177,6 +1257,7 @@ def prepare_catalog_exports(
                 selected_store_codes=selected_store_codes,
                 env_file=api_env_file,
                 logger=logger,
+                api_workers=api_workers,
             )
             return copied, missing, True
 
@@ -4351,6 +4432,7 @@ def generate_all_store_slow_mover_report(
         force_refresh=force_refresh_data,
         use_api=False,
         api_env_file=DEFAULT_API_ENV_FILE,
+        api_workers=DEFAULT_PACKET_API_WORKERS,
         logger=logger,
     )
     catalog_paths, missing_catalog_stores, _did_export_catalog = prepare_catalog_exports(
@@ -4360,6 +4442,7 @@ def generate_all_store_slow_mover_report(
         force_refresh=force_refresh_data,
         use_api=False,
         api_env_file=DEFAULT_API_ENV_FILE,
+        api_workers=DEFAULT_PACKET_API_WORKERS,
         logger=logger,
     )
     if not sales_paths:
@@ -7011,6 +7094,9 @@ def generate_brand_meeting_packet(
     _log(f"[START] Building Brand Meeting Packet for '{brand}'", logger)
     _log(f"[WINDOW] {start_day.isoformat()} -> {end_day.isoformat()}", logger)
     _log(f"[STORES] {', '.join(selected_store_codes)}", logger)
+    if options.use_api:
+        effective_workers = resolve_worker_count(options.api_workers, len(selected_store_codes))
+        _log(f"[API] Store workers requested={options.api_workers}, effective={effective_workers}", logger)
 
     paths = build_run_paths(Path(output_root), brand, start_day, end_day)
 
@@ -7048,6 +7134,7 @@ def generate_brand_meeting_packet(
         force_refresh=bool(options.force_refresh_data),
         use_api=bool(options.use_api),
         api_env_file=options.api_env_file,
+        api_workers=options.api_workers,
         logger=logger,
     )
 
@@ -7059,6 +7146,7 @@ def generate_brand_meeting_packet(
         force_refresh=bool(options.force_refresh_data),
         use_api=bool(options.use_api),
         api_env_file=options.api_env_file,
+        api_workers=options.api_workers,
         logger=logger,
     )
 
@@ -7578,6 +7666,7 @@ def parse_cli_args() -> argparse.Namespace:
 
     p.add_argument("--use-api", action="store_true", help="Fetch sales and catalog/inventory data from the Dutchie POS API instead of browser exports.")
     p.add_argument("--env-file", type=str, default=DEFAULT_API_ENV_FILE, help=f"Env file containing Dutchie API keys when --use-api is enabled. Default: {DEFAULT_API_ENV_FILE}")
+    p.add_argument("--workers", type=int, default=DEFAULT_PACKET_API_WORKERS, help=f"Store workers for Dutchie API downloads. Default: {DEFAULT_PACKET_API_WORKERS}.")
     p.add_argument("--run-export", action="store_true", help="Run Dutchie sales export before building packet.")
     p.add_argument("--no-export", action="store_true", help="Reuse latest archived exports instead of running exporter.")
     p.add_argument("--no-catalog-export", action="store_true", help="Skip running getCatalog.py (debug/fast runs).")
@@ -7638,6 +7727,7 @@ def main() -> None:
         generate_xlsx=bool(args.xlsx),
         top_n=max(5, int(args.top_n)),
         force_refresh_data=bool(args.force_refresh),
+        api_workers=max(1, int(args.workers or DEFAULT_PACKET_API_WORKERS)),
     )
 
     generate_brand_meeting_packet(
