@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
+from typing import Iterable
 import locale
 import shutil
 import warnings
@@ -1073,7 +1074,42 @@ def build_rule_summary(rule_df, rule_name, brand, start_date, end_date, days_tex
 
     return summary
 
-def run_deals_reports():
+def _select_brand_criteria(criteria_by_brand, selected_brands: Iterable[str] | None):
+    if not selected_brands:
+        return criteria_by_brand
+
+    selected = {}
+    criteria_lookup = {str(brand).casefold(): brand for brand in criteria_by_brand.keys()}
+    missing = []
+
+    for brand in selected_brands:
+        brand_text = str(brand or "").strip()
+        if not brand_text:
+            continue
+        match = criteria_lookup.get(brand_text.casefold())
+        if match is None:
+            missing.append(brand_text)
+            continue
+        selected[match] = criteria_by_brand[match]
+
+    if missing:
+        available = ", ".join(sorted(criteria_by_brand.keys(), key=str.casefold))
+        raise ValueError(
+            "Selected brand(s) not found in deals criteria: "
+            f"{', '.join(missing)}. Available brands: {available}"
+        )
+
+    return selected
+
+
+def run_deals_reports(
+    selected_brands: Iterable[str] | None = None,
+    output_dir: str | os.PathLike[str] = "brand_reports",
+    old_dir: str | os.PathLike[str] = "old",
+    archive_existing: bool = True,
+    sync_reference: bool = True,
+    sync_sheet: bool = True,
+):
     """
     Multi-rule version:
       - Each brand can have one rule OR many rules (criteria["rules"] list)
@@ -1081,21 +1117,24 @@ def run_deals_reports():
       - Discount/kickback is applied PER ROW using the rule that matched it
       - Prevents double-counting when rules overlap (earlier rule wins)
     """
-    output_dir = "brand_reports"
-    old_dir = "old"
-    criteria_by_brand = refresh_brand_criteria(sync_reference=True, sync_sheet=True)
+    output_dir = str(output_dir)
+    old_dir = str(old_dir)
+    criteria_by_brand = refresh_brand_criteria(sync_reference=sync_reference, sync_sheet=sync_sheet)
+    criteria_by_brand = _select_brand_criteria(criteria_by_brand, selected_brands)
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    Path(old_dir).mkdir(parents=True, exist_ok=True)
+    if archive_existing:
+        Path(old_dir).mkdir(parents=True, exist_ok=True)
 
     # Archive old reports before generating new ones
-    for file in os.listdir(output_dir):
-        full_path = os.path.join(output_dir, file)
-        if file.endswith(".xlsx") and os.path.isfile(full_path):
-            dest_path = os.path.join(old_dir, file)
-            if os.path.exists(dest_path):
-                os.remove(dest_path)
-            shutil.move(full_path, dest_path)
+    if archive_existing:
+        for file in os.listdir(output_dir):
+            full_path = os.path.join(output_dir, file)
+            if file.endswith(".xlsx") and os.path.isfile(full_path):
+                dest_path = os.path.join(old_dir, file)
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+                shutil.move(full_path, dest_path)
 
     # Read store files (process_file already returns empty DF if missing)
     mv_data = process_file("files/salesMV.xlsx")
