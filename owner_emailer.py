@@ -379,14 +379,18 @@ def _build_plain_text_email(
     data_end: date,
     executive_summary: Optional[Dict[str, Any]] = None,
     store_summaries: Optional[List[Dict[str, Any]]] = None,
+    title_override: Optional[str] = None,
+    intro_override: Optional[str] = None,
 ) -> str:
     lines = [
-        "Buzz Cannabis — Owner Snapshot",
+        title_override or "Buzz Cannabis — Owner Snapshot",
         "",
         f"Report Day: {report_day.strftime('%A, %B %d, %Y')} ({report_day.isoformat()})",
         f"Data Window: {data_start.isoformat()} → {data_end.isoformat()}",
         "",
     ]
+    if intro_override:
+        lines += [str(intro_override), ""]
     if executive_summary:
         lines += [
             "Executive Snapshot:",
@@ -428,11 +432,22 @@ def _build_html_email(
     data_end: date,
     executive_summary: Optional[Dict[str, Any]] = None,
     store_summaries: Optional[List[Dict[str, Any]]] = None,
+    title_override: Optional[str] = None,
+    intro_override: Optional[str] = None,
 ) -> str:
     header_date = report_day.strftime("%A, %B %d, %Y")
 
     def _esc(text: Any) -> str:
         return html.escape(str(text or ""))
+
+    intro_block = ""
+    if intro_override:
+        intro_html = "<br>".join(_esc(line) for line in str(intro_override).splitlines())
+        intro_block = (
+            f"<tr><td style=\"padding:14px 20px 10px 20px;\">"
+            f"<div style=\"font-size:13px;line-height:1.6;color:#111827;\">{intro_html}</div>"
+            f"</td></tr>"
+        )
 
     perf_block = ""
     if executive_summary:
@@ -554,12 +569,13 @@ def _build_html_email(
               <tr>
                 <td style="background:{BUZZ['black']};padding:18px 20px;">
                   <div style="color:#FFFFFF;font-size:19px;font-weight:900;letter-spacing:0.5px;">BUZZ CANNABIS</div>
-                  <div style="color:#E5E7EB;font-size:13px;margin-top:4px;">Owner Snapshot • {_esc(header_date)}</div>
+                  <div style="color:#E5E7EB;font-size:13px;margin-top:4px;">{_esc(title_override) if title_override else f"Owner Snapshot • {_esc(header_date)}"}</div>
                 </td>
               </tr>
               <tr>
                 <td style="height:5px;background:linear-gradient(90deg,{BUZZ['yellow']} 0%,{BUZZ['green']} 55%,{BUZZ['yellow']} 100%);"></td>
               </tr>
+              {intro_block}
               {perf_block}
               {store_kpi_block}
 
@@ -590,6 +606,11 @@ def send_owner_snapshot_email(
     to_email: Union[str, List[str]] = "anthony@buzzcannabis.com",
     executive_summary: Optional[Dict[str, Any]] = None,
     store_summaries: Optional[List[Dict[str, Any]]] = None,
+    subject_override: Optional[str] = None,
+    title_override: Optional[str] = None,
+    intro_override: Optional[str] = None,
+    html_override: Optional[str] = None,
+    plain_text_override: Optional[str] = None,
 ):
     """
     Sends Owner Snapshot PDFs via Gmail API using JSON token (cron-safe),
@@ -627,7 +648,7 @@ def send_owner_snapshot_email(
         total_size_bytes += size_bytes
 
     # ---------- Email ----------
-    subject = f"Buzz Cannabis Owner Snapshot — {report_day.isoformat()}"
+    subject = subject_override or f"Buzz Cannabis Owner Snapshot — {report_day.isoformat()}"
     to_header = ", ".join(to_email) if isinstance(to_email, list) else to_email
 
     msg = EmailMessage()
@@ -636,21 +657,25 @@ def send_owner_snapshot_email(
     msg["Subject"] = subject
 
     # Plain text fallback
-    msg.set_content(_build_plain_text_email(
+    msg.set_content(plain_text_override or _build_plain_text_email(
         report_day,
         data_start,
         data_end,
         executive_summary,
         store_summaries,
+        title_override=title_override,
+        intro_override=intro_override,
     ))
 
     # HTML body
-    html_body = _build_html_email(
+    html_body = html_override or _build_html_email(
         report_day=report_day,
         data_start=data_start,
         data_end=data_end,
         executive_summary=executive_summary,
         store_summaries=store_summaries,
+        title_override=title_override,
+        intro_override=intro_override,
     )
     msg.add_alternative(html_body, subtype="html")
 
