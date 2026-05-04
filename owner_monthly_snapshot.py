@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +41,7 @@ from reportlab.platypus import (
 )
 
 import getSalesReport as gsr
+from store_discount_roundup_sheet import STORE_TAXES as ROUNDUP_STORE_TAXES
 from dutchie_api_reports import (
     DEFAULT_ENV_FILE as DUTCHIE_DEFAULT_ENV_FILE,
     STORE_CODES as DUTCHIE_STORE_CODES,
@@ -1171,6 +1173,235 @@ def compute_store_kickback_summary(df: pd.DataFrame, store_scorecards: pd.DataFr
     out["profit_after_kickback"] = out["profit"]
     out["margin_lift_pp"] = out["margin"] - out["margin_real"]
     return out.fillna({"top_deal_brand": "N/A"}).sort_values("kickback", ascending=False)
+
+
+def tax_multiplier_for_store(store_code: Any) -> float:
+    config = ROUNDUP_STORE_TAXES.get(str(store_code or "").upper())
+    if not config:
+        return 1.0
+    return 1.0 + as_float(config.city_tax) + as_float(config.excise_tax) + as_float(config.state_tax)
+
+
+def decimal_money(value: Any) -> Decimal:
+    try:
+        return Decimal(str(as_float(value)))
+    except Exception:
+        return Decimal("0")
+
+
+def spreadsheet_round(value: Decimal, places: str = "0.01") -> Decimal:
+    return value.quantize(Decimal(places), rounding=ROUND_HALF_UP)
+
+
+def spreadsheet_rounddown(value: Decimal, places: str = "0.01") -> Decimal:
+    return value.quantize(Decimal(places), rounding=ROUND_DOWN)
+
+
+def spreadsheet_roundup(value: Decimal, places: str = "0.01") -> Decimal:
+    return value.quantize(Decimal(places), rounding=ROUND_CEILING)
+
+
+def spreadsheet_round_array(values: Any, decimals: int = 2) -> np.ndarray:
+    factor = float(10 ** decimals)
+    arr = np.asarray(values, dtype=float)
+    return np.floor((arr * factor) + 0.5 + 1e-9) / factor
+
+
+def spreadsheet_rounddown_array(values: Any, decimals: int = 2) -> np.ndarray:
+    factor = float(10 ** decimals)
+    arr = np.asarray(values, dtype=float)
+    return np.floor((arr * factor) + 1e-9) / factor
+
+
+def spreadsheet_roundup_array(values: Any, decimals: int = 2) -> np.ndarray:
+    factor = float(10 ** decimals)
+    arr = np.asarray(values, dtype=float)
+    return np.ceil((arr * factor) - 1e-9) / factor
+
+
+def tax_rounding_loss_for_net(net_revenue: Any, tax_multiplier: Any) -> Tuple[float, float, float, float, float, float, float]:
+    """Mirror the roundup sheet's OTD tax math at the transaction level."""
+    net = decimal_money(net_revenue)
+    multiplier = decimal_money(tax_multiplier)
+    if net <= 0 or multiplier <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    current_otd = spreadsheet_round(net * multiplier)
+    rounded_otd_target = spreadsheet_roundup(current_otd, "1")
+    backed_out_revenue = spreadsheet_rounddown(current_otd / multiplier)
+    rounded_target_revenue = spreadsheet_roundup(rounded_otd_target / multiplier)
+    tax_backout_rounddown_loss = max(net - backed_out_revenue, Decimal("0"))
+    tax_included_roundup_opportunity = max(rounded_otd_target - current_otd, Decimal("0"))
+    tax_rounding_loss = max(rounded_target_revenue - backed_out_revenue, Decimal("0"))
+    return (
+        float(tax_rounding_loss),
+        float(tax_included_roundup_opportunity),
+        float(tax_backout_rounddown_loss),
+        float(current_otd),
+        float(rounded_otd_target),
+        float(backed_out_revenue),
+        float(rounded_target_revenue),
+    )
+
+
+def compute_tax_rounding_loss(df: pd.DataFrame, start_day: date, end_day: date) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    summary_columns = [
+        "store",
+        "store_label",
+        "tax_multiplier",
+        "transactions_analyzed",
+        "net_revenue_analyzed",
+        "tax_rounding_loss",
+        "tax_included_roundup_opportunity",
+        "tax_backout_rounddown_loss",
+        "current_otd_total",
+        "rounded_otd_target_total",
+        "tax_backed_revenue_at_current_otd",
+        "tax_backed_revenue_at_rounded_otd",
+        "avg_loss_per_transaction",
+        "loss_rate",
+    ]
+    daily_columns = ["date", *summary_columns]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=summary_columns), pd.DataFrame(columns=daily_columns)
+
+    date_col = find_col(df, COLUMN_CANDIDATES["date"])
+    net_col = find_col(df, COLUMN_CANDIDATES["net_sales"])
+    tx_col = find_col(df, COLUMN_CANDIDATES["transaction_id"])
+    if not date_col or not net_col:
+        return pd.DataFrame(columns=summary_columns), pd.DataFrame(columns=daily_columns)
+
+    tmp = filter_df_date_range(df, start_day, end_day)
+    if tmp.empty:
+        return pd.DataFrame(columns=summary_columns), pd.DataFrame(columns=daily_columns)
+    tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+    tmp = tmp[tmp[date_col].notna()].copy()
+    tmp["_date"] = tmp[date_col].dt.date
+    tmp["_store"] = tmp["_store"].astype(str) if "_store" in tmp.columns else "Unknown"
+    tmp["_store_label"] = tmp["_store_label"].astype(str) if "_store_label" in tmp.columns else tmp["_store"]
+    tmp["_net"] = to_number(tmp[net_col]).fillna(0.0).astype(float)
+    tmp = tmp[tmp["_net"] > 0].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=summary_columns), pd.DataFrame(columns=daily_columns)
+    if tx_col:
+        tmp["_transaction_id"] = tmp[tx_col].astype(str)
+    else:
+        tmp["_transaction_id"] = tmp.index.astype(str)
+
+    tx = tmp.groupby(["_store", "_store_label", "_date", "_transaction_id"], as_index=False).agg(
+        net_revenue=("_net", "sum"),
+    )
+    tx["tax_multiplier"] = tx["_store"].apply(tax_multiplier_for_store)
+    tx = tx[tx["tax_multiplier"] > 1.0].copy()
+    if tx.empty:
+        return pd.DataFrame(columns=summary_columns), pd.DataFrame(columns=daily_columns)
+    net_values = pd.to_numeric(tx["net_revenue"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    multiplier_values = pd.to_numeric(tx["tax_multiplier"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    current_otd = spreadsheet_round_array(net_values * multiplier_values, 2)
+    rounded_otd_target = spreadsheet_roundup_array(current_otd, 0)
+    backed_out_revenue = spreadsheet_rounddown_array(current_otd / multiplier_values, 2)
+    rounded_target_revenue = spreadsheet_roundup_array(rounded_otd_target / multiplier_values, 2)
+    tx["current_otd"] = current_otd
+    tx["rounded_otd_target"] = rounded_otd_target
+    tx["tax_backed_revenue_at_current_otd"] = backed_out_revenue
+    tx["tax_backed_revenue_at_rounded_otd"] = rounded_target_revenue
+    tx["tax_backout_rounddown_loss"] = np.maximum(net_values - backed_out_revenue, 0.0)
+    tx["tax_included_roundup_opportunity"] = np.maximum(rounded_otd_target - current_otd, 0.0)
+    tx["tax_rounding_loss"] = np.maximum(rounded_target_revenue - backed_out_revenue, 0.0)
+
+    daily = tx.groupby(["_date", "_store", "_store_label"], as_index=False).agg(
+        tax_multiplier=("tax_multiplier", "first"),
+        transactions_analyzed=("_transaction_id", "nunique"),
+        net_revenue_analyzed=("net_revenue", "sum"),
+        tax_rounding_loss=("tax_rounding_loss", "sum"),
+        tax_included_roundup_opportunity=("tax_included_roundup_opportunity", "sum"),
+        tax_backout_rounddown_loss=("tax_backout_rounddown_loss", "sum"),
+        current_otd_total=("current_otd", "sum"),
+        rounded_otd_target_total=("rounded_otd_target", "sum"),
+        tax_backed_revenue_at_current_otd=("tax_backed_revenue_at_current_otd", "sum"),
+        tax_backed_revenue_at_rounded_otd=("tax_backed_revenue_at_rounded_otd", "sum"),
+    ).rename(columns={"_date": "date", "_store": "store", "_store_label": "store_label"})
+    daily["avg_loss_per_transaction"] = daily["tax_rounding_loss"] / daily["transactions_analyzed"].replace({0: np.nan})
+    daily["loss_rate"] = daily["tax_rounding_loss"] / daily["net_revenue_analyzed"].replace({0: np.nan})
+    daily = daily.fillna(0.0).sort_values(["date", "store"])
+
+    summary = daily.groupby(["store", "store_label"], as_index=False).agg(
+        tax_multiplier=("tax_multiplier", "first"),
+        transactions_analyzed=("transactions_analyzed", "sum"),
+        net_revenue_analyzed=("net_revenue_analyzed", "sum"),
+        tax_rounding_loss=("tax_rounding_loss", "sum"),
+        tax_included_roundup_opportunity=("tax_included_roundup_opportunity", "sum"),
+        tax_backout_rounddown_loss=("tax_backout_rounddown_loss", "sum"),
+        current_otd_total=("current_otd_total", "sum"),
+        rounded_otd_target_total=("rounded_otd_target_total", "sum"),
+        tax_backed_revenue_at_current_otd=("tax_backed_revenue_at_current_otd", "sum"),
+        tax_backed_revenue_at_rounded_otd=("tax_backed_revenue_at_rounded_otd", "sum"),
+    )
+    summary["avg_loss_per_transaction"] = summary["tax_rounding_loss"] / summary["transactions_analyzed"].replace({0: np.nan})
+    summary["loss_rate"] = summary["tax_rounding_loss"] / summary["net_revenue_analyzed"].replace({0: np.nan})
+    summary = summary.fillna(0.0).sort_values("tax_rounding_loss", ascending=False)
+    return summary[summary_columns], daily[daily_columns]
+
+
+def apply_tax_rounding_metrics(
+    all_metrics: Dict[str, Any],
+    store_scorecards: pd.DataFrame,
+    tax_rounding_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    total_loss = as_float(tax_rounding_summary["tax_rounding_loss"].sum()) if tax_rounding_summary is not None and not tax_rounding_summary.empty else 0.0
+    total_otd_gap = as_float(tax_rounding_summary["tax_included_roundup_opportunity"].sum()) if tax_rounding_summary is not None and not tax_rounding_summary.empty and "tax_included_roundup_opportunity" in tax_rounding_summary.columns else 0.0
+    total_backout_loss = as_float(tax_rounding_summary["tax_backout_rounddown_loss"].sum()) if tax_rounding_summary is not None and not tax_rounding_summary.empty and "tax_backout_rounddown_loss" in tax_rounding_summary.columns else 0.0
+    total_net = as_float(tax_rounding_summary["net_revenue_analyzed"].sum()) if tax_rounding_summary is not None and not tax_rounding_summary.empty else 0.0
+    total_transactions = as_float(tax_rounding_summary["transactions_analyzed"].sum()) if tax_rounding_summary is not None and not tax_rounding_summary.empty else 0.0
+    all_metrics["tax_rounding_loss"] = total_loss
+    all_metrics["tax_included_roundup_opportunity"] = total_otd_gap
+    all_metrics["tax_backout_rounddown_loss"] = total_backout_loss
+    all_metrics["tax_rounding_net_revenue_analyzed"] = total_net
+    all_metrics["tax_rounding_transactions"] = total_transactions
+    all_metrics["tax_rounding_avg_loss_per_transaction"] = total_loss / total_transactions if total_transactions else 0.0
+    all_metrics["tax_rounding_loss_rate"] = total_loss / total_net if total_net else 0.0
+
+    if store_scorecards is None or store_scorecards.empty:
+        return store_scorecards
+    out = store_scorecards.copy()
+    if tax_rounding_summary is None or tax_rounding_summary.empty:
+        for col in [
+            "tax_rounding_loss",
+            "tax_included_roundup_opportunity",
+            "tax_backout_rounddown_loss",
+            "tax_rounding_loss_rate",
+            "tax_rounding_avg_loss_per_transaction",
+            "tax_rounding_transactions",
+        ]:
+            out[col] = 0.0
+        return out
+    cols = [
+        "store",
+        "tax_rounding_loss",
+        "tax_included_roundup_opportunity",
+        "tax_backout_rounddown_loss",
+        "loss_rate",
+        "avg_loss_per_transaction",
+        "transactions_analyzed",
+        "net_revenue_analyzed",
+    ]
+    out = out.merge(tax_rounding_summary[cols], on="store", how="left")
+    out = out.rename(columns={
+        "loss_rate": "tax_rounding_loss_rate",
+        "avg_loss_per_transaction": "tax_rounding_avg_loss_per_transaction",
+        "transactions_analyzed": "tax_rounding_transactions",
+        "net_revenue_analyzed": "tax_rounding_net_revenue_analyzed",
+    })
+    for col in [
+        "tax_rounding_loss",
+        "tax_included_roundup_opportunity",
+        "tax_backout_rounddown_loss",
+        "tax_rounding_loss_rate",
+        "tax_rounding_avg_loss_per_transaction",
+        "tax_rounding_transactions",
+        "tax_rounding_net_revenue_analyzed",
+    ]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    return out
 
 
 def is_excluded_product_name(value: Any) -> bool:
@@ -4064,6 +4295,7 @@ def build_executive_metric_cards(all_metrics: Dict[str, Any], styles: Dict[str, 
         ("New Customers", "closing_new_customers", "int"),
         ("Ending Inventory", "inventory_end_value", "money"),
         ("Discount Rate", "discount_rate", "pct"),
+        ("OTD Round-Up Loss", "tax_rounding_loss", "money"),
         ("Kickback Amount", "kickback", "money"),
         ("Inventory Gain/Loss", "inventory_value_change", "signed_money"),
     ]
@@ -4344,6 +4576,10 @@ def generate_discount_margin_insights(all_metrics: Dict[str, Any], store_scoreca
     insights = [
         f"Total discounts were {money(all_metrics.get('discount'))}, equal to {pct1(all_metrics.get('discount_rate'))} of gross sales."
     ]
+    if as_float(all_metrics.get("tax_rounding_loss")) > 0:
+        insights.append(
+            f"Whole-dollar OTD rounding opportunity is an estimated {money(all_metrics.get('tax_rounding_loss'))} in tax-backed revenue across {int(as_float(all_metrics.get('tax_rounding_transactions'))):,} transactions."
+        )
     if store_scorecards is not None and not store_scorecards.empty:
         row = store_scorecards.sort_values("discount_rate", ascending=False).iloc[0]
         insights.append(f"{row['store']} had the highest discount rate at {pct1(row['discount_rate'])}.")
@@ -4681,6 +4917,10 @@ def build_all_stores_pdf(
     kickback_total = as_float(kickback_summary["kickback"].sum()) if kickback_summary is not None and not kickback_summary.empty else 0.0
     impact_rows = [
         ["Total Discounts", money(all_metrics.get("discount"))],
+        ["OTD Round-Up Revenue Opportunity", money(all_metrics.get("tax_rounding_loss"))],
+        ["Tax-Included OTD Gap", money(all_metrics.get("tax_included_roundup_opportunity"))],
+        ["Tax Backout Rounddown Loss", money(all_metrics.get("tax_backout_rounddown_loss"))],
+        ["Rounding Loss / Revenue", pct1(all_metrics.get("tax_rounding_loss_rate"))],
         ["Total Kickback", money(kickback_total)],
         ["Profit Before Kickback", money(all_metrics.get("profit_real"))],
         ["Profit After Kickback", money(all_metrics.get("profit"))],
@@ -4703,6 +4943,21 @@ def build_all_stores_pdf(
         max_rows=min(top_n, 10),
         col_widths=[0.55 * inch, 0.88 * inch, 1.0 * inch, 1.0 * inch, 0.78 * inch, 1.45 * inch],
     )
+    if store_scorecards is not None and not store_scorecards.empty and "tax_rounding_loss" in store_scorecards.columns:
+        add_df_table(
+            story,
+            styles,
+            store_scorecards.sort_values("tax_rounding_loss", ascending=False),
+            [
+                ("store", "Store", "text"),
+                ("tax_rounding_loss", "OTD Round-Up Loss", "money"),
+                ("tax_rounding_transactions", "Transactions", "int"),
+                ("tax_rounding_avg_loss_per_transaction", "Avg / Txn", "money2"),
+                ("tax_included_roundup_opportunity", "OTD Gap", "money"),
+            ],
+            max_rows=min(top_n, 10),
+            col_widths=[0.55 * inch, 1.15 * inch, 0.95 * inch, 0.85 * inch, 0.75 * inch],
+        )
 
     story.append(PageBreak())
 
@@ -4953,6 +5208,7 @@ def build_store_pdf(
     company_new_customers = as_float(all_metrics.get("closing_new_customers")) / store_count if all_metrics.get("closing_summary_has_data") else None
     company_inventory_change = as_float(all_metrics.get("inventory_value_change")) / store_count if all_metrics.get("inventory_has_data") else None
     company_kickback = as_float(all_metrics.get("kickback")) / store_count
+    company_tax_rounding_loss = as_float(all_metrics.get("tax_rounding_loss")) / store_count
     comparison_rows = [
         {"metric": "Revenue", "store": money(m.get("net_revenue")), "company": money(company_revenue), "rank": rank_context.get("net_revenue", ""), "status": company_average_signal("net_revenue", m.get("net_revenue"), company_revenue)},
         {"metric": "Profit", "store": money(m.get("profit")), "company": money(company_profit), "rank": rank_context.get("profit", ""), "status": company_average_signal("profit", m.get("profit"), company_profit)},
@@ -4980,6 +5236,13 @@ def build_store_pdf(
             "company": money(company_kickback),
             "rank": "Not ranked",
             "status": "Deal impact tracked",
+        },
+        {
+            "metric": "OTD Round-Up Loss",
+            "store": money(store_metrics.get("tax_rounding_loss")),
+            "company": money(company_tax_rounding_loss),
+            "rank": "Not ranked",
+            "status": "Rounding-down impact",
         },
     ]
     story.append(build_store_company_comparison_panel(styles, comparison_rows))
@@ -5038,6 +5301,8 @@ def build_store_pdf(
     store_health_rows = [
         ["Total Discounts", money(m.get("discount"))],
         ["Discount Rate", pct1(m.get("discount_rate"))],
+        ["OTD Round-Up Revenue Opportunity", money(store_metrics.get("tax_rounding_loss"))],
+        ["Tax-Included OTD Gap", money(store_metrics.get("tax_included_roundup_opportunity"))],
         ["New Customers", f"{int(as_float(store_metrics.get('closing_new_customers'))):,}" if closing_summary_row else "N/A"],
         ["Ending Inventory", optional_money(store_metrics.get("inventory_end_value"))],
         ["Inventory Gain/Loss", optional_signed_money(store_metrics.get("inventory_value_change"))],
@@ -5412,6 +5677,8 @@ def write_data_exports(
     kickback_summary: pd.DataFrame,
     all_kickback_detail: pd.DataFrame,
     store_kickback_summary: pd.DataFrame,
+    tax_rounding_summary: pd.DataFrame,
+    tax_rounding_daily: pd.DataFrame,
     action_items: List[Dict[str, str]],
     warnings: List[Dict[str, Any]],
     files_used: List[str],
@@ -5460,6 +5727,8 @@ def write_data_exports(
         "monthly_kickback_detail.csv": kickback_summary,
         "monthly_store_kickback_detail.csv": all_kickback_detail,
         "monthly_store_kickback_summary.csv": store_kickback_summary,
+        "monthly_tax_rounding_loss_summary.csv": tax_rounding_summary,
+        "monthly_tax_rounding_loss_daily.csv": tax_rounding_daily,
     }
     for filename, df in csv_map.items():
         path = data_dir / filename
@@ -5502,6 +5771,8 @@ def write_data_exports(
             inventory_end.to_excel(writer, sheet_name="Inventory End", index=False)
             all_kickback_detail.to_excel(writer, sheet_name="Store Kickback Detail", index=False)
             store_kickback_summary.to_excel(writer, sheet_name="Store Kickbacks", index=False)
+            tax_rounding_summary.to_excel(writer, sheet_name="Tax Rounding Summary", index=False)
+            tax_rounding_daily.to_excel(writer, sheet_name="Tax Rounding Daily", index=False)
             pd.DataFrame(warnings).to_excel(writer, sheet_name="Warnings", index=False)
         outputs.append(book_path)
 
@@ -5566,6 +5837,7 @@ def build_monthly_email_intro(
         f"Real margin: {pct1(all_metrics.get('margin_real'))}",
         f"Tickets: {int(as_float(all_metrics.get('tickets'))):,}",
         f"Basket: {money(all_metrics.get('basket'))}",
+        f"OTD round-up opportunity: {money(all_metrics.get('tax_rounding_loss'))}",
         f"New customers: {int(as_float(all_metrics.get('closing_new_customers'))):,}" if all_metrics.get("closing_summary_has_data") else "New customers: N/A",
         f"Ending inventory: {optional_money(all_metrics.get('inventory_end_value'))}" if all_metrics.get("inventory_has_data") else "Ending inventory: N/A",
         f"Best store: {best_store}",
@@ -5688,8 +5960,10 @@ def build_monthly_email_html(
         email_metric_card("Profit", money(all_metrics.get("profit")), f"Real profit {money(all_metrics.get('profit_real'))}", HEX_GREEN),
         email_metric_card("Real Margin", pct1(all_metrics.get("margin_real")), f"KB margin {pct1(all_metrics.get('margin'))}", HEX_YELLOW),
         email_metric_card("New Customers", f"{int(as_float(all_metrics.get('closing_new_customers'))):,}", "Official closing report total", HEX_GREEN),
-        email_metric_card("Tickets", f"{int(as_float(all_metrics.get('tickets'))):,}", f"Basket {money(all_metrics.get('basket'))}", HEX_GREEN),
+        email_metric_card("Tickets", f"{int(as_float(all_metrics.get('tickets'))):,}", f"{as_float(all_metrics.get('items_per_ticket')):.2f} items / ticket", HEX_GREEN),
+        email_metric_card("Basket", money(all_metrics.get("basket")), f"Net/item {money(all_metrics.get('net_price_per_item'))}", HEX_GREEN),
         email_metric_card("Discount Rate", pct1(all_metrics.get("discount_rate")), discount_detail, "#F59E0B"),
+        email_metric_card("OTD Round-Up Loss", money(all_metrics.get("tax_rounding_loss")), f"{money2(all_metrics.get('tax_rounding_avg_loss_per_transaction'))} avg / transaction", "#F59E0B"),
         email_metric_card("Ending Inventory", optional_money(all_metrics.get("inventory_end_value")), inventory_detail, "#111827"),
         email_metric_card("Attachments", f"{attachment_count}", f"PDF packet + data book where included, {size_label}", HEX_YELLOW),
     ]
@@ -5998,6 +6272,8 @@ def main() -> None:
     all_metrics = enrich_monthly_metrics(base_all_metrics, all_daily, category_summary, brand_summary, product_summary)
     all_metrics["kickback"] = as_float(kickback_summary["kickback"].sum()) if kickback_summary is not None and not kickback_summary.empty and "kickback" in kickback_summary.columns else 0.0
     store_scorecards = build_store_scorecards(bundles, all_metrics)
+    tax_rounding_summary, tax_rounding_daily = compute_tax_rounding_loss(all_raw, start_day, end_day)
+    store_scorecards = apply_tax_rounding_metrics(all_metrics, store_scorecards, tax_rounding_summary)
     store_kickback_summary = compute_store_kickback_summary(all_raw, store_scorecards)
     if args.fetch_inventory_api:
         inventory_start, inventory_end = fetch_monthly_inventory_snapshots_from_api(
@@ -6164,6 +6440,8 @@ def main() -> None:
         kickback_summary=kickback_summary,
         all_kickback_detail=all_kickback_detail,
         store_kickback_summary=store_kickback_summary,
+        tax_rounding_summary=tax_rounding_summary,
+        tax_rounding_daily=tax_rounding_daily,
         action_items=action_items,
         warnings=warnings,
         files_used=files_used,
@@ -6212,6 +6490,10 @@ def main() -> None:
             "closing_new_customers": all_metrics.get("closing_new_customers", "N/A"),
             "ending_inventory": all_metrics.get("inventory_end_value", "N/A"),
             "discount_rate": all_metrics.get("discount_rate"),
+            "tax_rounding_loss": all_metrics.get("tax_rounding_loss"),
+            "tax_included_roundup_opportunity": all_metrics.get("tax_included_roundup_opportunity"),
+            "tax_backout_rounddown_loss": all_metrics.get("tax_backout_rounddown_loss"),
+            "tax_rounding_avg_loss_per_transaction": all_metrics.get("tax_rounding_avg_loss_per_transaction"),
             "inventory_gain_loss": all_metrics.get("inventory_value_change", "N/A"),
         },
         "comparison_summary_csv": str(comparison_path),
