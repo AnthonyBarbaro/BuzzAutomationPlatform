@@ -53,6 +53,16 @@ from dutchie_api_reports import (
     resolve_integrator_key,
     resolve_store_keys,
 )
+from monthly_brand_resolver import (
+    apply_brand_resolution_to_inventory,
+    apply_brand_resolution_to_sales,
+    build_brand_master,
+    canonical_product_key,
+    clean_brand_display,
+    infer_brand_from_product_name,
+    load_brand_aliases,
+    normalize_brand_text,
+)
 import owner_snapshot as _owner_snapshot
 from owner_emailer import send_owner_snapshot_email
 from owner_snapshot import (
@@ -98,6 +108,7 @@ MONTHLY_PDF_ROOT = MONTHLY_ROOT / "pdf"
 MONTHLY_DATA_ROOT = MONTHLY_ROOT / "data"
 MONTHLY_CLOSING_ROOT = MONTHLY_ROOT / "closing"
 DAILY_RAW_ROOT = REPORTS_ROOT / "raw_sales"
+MONTHLY_BRAND_ALIAS_PATH = Path("brand_aliases_monthly.json").resolve()
 FILES_DIR = Path(gsr.__file__).resolve().parent / "files"
 
 BUZZ = {
@@ -2674,6 +2685,539 @@ def add_inventory_metrics(all_metrics: Dict[str, Any], inventory_summary: pd.Dat
     all_metrics["inventory_store_count"] = int((inventory_summary["ending_inventory_value"] > 0).sum())
 
 
+def normalize_join_key(value: Any) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def inventory_risk_rank(value: Any) -> int:
+    return {"High": 0, "Medium": 1, "Low": 2}.get(str(value), 3)
+
+
+def no_sales_days_on_hand(units_sold: float, ending_quantity: float) -> float:
+    return 999.0 if units_sold <= 0 and ending_quantity > 0 else 0.0
+
+
+def format_inventory_to_sales_ratio(revenue: Any, inventory_value: Any) -> str:
+    revenue_value = as_float(revenue)
+    inventory = as_float(inventory_value)
+    if revenue_value <= 0 and inventory > 0:
+        return "No sales"
+    if revenue_value <= 0:
+        return "N/A"
+    ratio = inventory / revenue_value
+    if ratio > 10:
+        return ">10x"
+    return f"{ratio:.2f}x"
+
+
+def product_inventory_risk_level(
+    revenue: float,
+    inventory_to_sales_ratio: float,
+    days_on_hand_proxy: float,
+    sell_through_proxy: float,
+    ending_inventory_value: float,
+) -> str:
+    if ending_inventory_value >= 1000 and revenue <= 0:
+        return "High"
+    if sell_through_proxy < 0.10 and ending_inventory_value >= 1000:
+        return "High"
+    if days_on_hand_proxy > 90 and ending_inventory_value >= 1000:
+        return "High"
+    if sell_through_proxy < 0.25 or inventory_to_sales_ratio > 2.0 or days_on_hand_proxy > 60:
+        return "Medium"
+    return "Low"
+
+
+def brand_inventory_risk_level(
+    revenue: float,
+    inventory_to_sales_ratio: float,
+    sell_through_proxy: float,
+    ending_inventory_value: float,
+) -> str:
+    if ending_inventory_value >= 5000 and revenue <= 0:
+        return "High"
+    if inventory_to_sales_ratio > 3.0 or sell_through_proxy < 0.15:
+        return "High"
+    if inventory_to_sales_ratio > 1.5 or sell_through_proxy < 0.25:
+        return "Medium"
+    return "Low"
+
+
+def inventory_recommended_action(
+    risk_level: str,
+    revenue: float,
+    units_sold: float,
+    inventory_to_sales_ratio: float,
+    days_on_hand_proxy: float,
+    discount_rate: float = 0.0,
+    margin_real: float = 0.0,
+    ending_quantity: float = 0.0,
+) -> str:
+    if revenue <= 0 and ending_quantity > 0:
+        return "Review reorder"
+    if risk_level == "High":
+        if units_sold <= 0:
+            return "Feature in promo"
+        if days_on_hand_proxy > 90:
+            return "Bundle"
+        if discount_rate > 0.30 and revenue < 1000:
+            return "Markdown"
+        if margin_real < 0.20 and revenue > 0:
+            return "Review COGS"
+        return "Transfer"
+    if risk_level == "Medium":
+        if inventory_to_sales_ratio > 2.0:
+            return "Watch depth"
+        if discount_rate > 0.30:
+            return "Markdown"
+        return "Feature in promo"
+    return "Watch only"
+
+
+def compute_brand_review_score(row: pd.Series) -> float:
+    score = 0.0
+    risk = str(row.get("risk_level", ""))
+    if risk == "High":
+        score += 100
+    elif risk == "Medium":
+        score += 40
+    score += as_float(row.get("ending_inventory_value")) / 1000.0
+    if as_float(row.get("net_revenue")) <= 0 and as_float(row.get("ending_inventory_value")) > 0:
+        score += 50
+    if as_float(row.get("sell_through_proxy")) < 0.10:
+        score += 30
+    if as_float(row.get("inventory_to_sales_ratio")) > 3:
+        score += 25
+    return score
+
+
+def compute_inventory_watchlist_summary(brand_watchlist: pd.DataFrame, product_watchlist: pd.DataFrame) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "available": bool(
+            product_watchlist is not None
+            and not product_watchlist.empty
+            and as_float(product_watchlist.get("ending_inventory_value", pd.Series(dtype=float)).sum()) > 0
+        ),
+        "high_risk_products": 0,
+        "high_risk_brands": 0,
+        "inventory_value_at_risk": 0.0,
+        "largest_inventory_to_sales_brand": "N/A",
+        "largest_inventory_to_sales_ratio": None,
+        "lowest_sell_through_product": "N/A",
+        "lowest_sell_through_proxy": None,
+        "recommended_action": "N/A",
+    }
+    if product_watchlist is None or product_watchlist.empty:
+        return summary
+    product = product_watchlist.copy()
+    brand = brand_watchlist.copy() if brand_watchlist is not None else pd.DataFrame()
+    high_products = product[product["risk_level"].astype(str) == "High"] if "risk_level" in product.columns else pd.DataFrame()
+    high_brands = brand[brand["risk_level"].astype(str) == "High"] if "risk_level" in brand.columns else pd.DataFrame()
+    summary["high_risk_products"] = int(len(high_products))
+    summary["high_risk_brands"] = int(len(high_brands))
+    summary["inventory_value_at_risk"] = as_float(high_products.get("ending_inventory_value", pd.Series(dtype=float)).sum())
+    if not brand.empty:
+        brand_rank = brand.copy()
+        if "brand_review_score" not in brand_rank.columns:
+            brand_rank["brand_review_score"] = brand_rank.apply(compute_brand_review_score, axis=1)
+        if not brand_rank.empty:
+            row = brand_rank.sort_values("brand_review_score", ascending=False).iloc[0]
+            summary["largest_inventory_to_sales_brand"] = row.get("brand", "N/A")
+            summary["largest_inventory_to_sales_ratio"] = as_float(row.get("inventory_to_sales_ratio"))
+    if "sell_through_proxy" in product.columns:
+        product_rank = product.replace([np.inf, -np.inf], np.nan).dropna(subset=["sell_through_proxy"])
+        if not product_rank.empty:
+            row = product_rank.sort_values(["risk_sort", "sell_through_proxy", "ending_inventory_value"], ascending=[True, True, False]).iloc[0]
+            summary["lowest_sell_through_product"] = row.get("product", "N/A")
+            summary["lowest_sell_through_proxy"] = as_float(row.get("sell_through_proxy"))
+            summary["recommended_action"] = row.get("recommended_action", "N/A")
+    return summary
+
+
+def compute_inventory_watchlist(
+    ending_inventory: pd.DataFrame,
+    product_summary: pd.DataFrame,
+    start_day: date,
+    end_day: date,
+    store: Optional[str] = None,
+    warnings: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    product_columns = [
+        "store",
+        "product",
+        "brand",
+        "canonical_brand_key",
+        "canonical_product_key",
+        "category",
+        "units_sold",
+        "net_revenue",
+        "margin_real",
+        "discount_rate",
+        "ending_quantity",
+        "ending_inventory_value",
+        "inventory_to_sales_ratio",
+        "inventory_to_sales_display",
+        "sell_through_proxy",
+        "days_on_hand_proxy",
+        "risk_level",
+        "recommended_action",
+        "risk_sort",
+    ]
+    brand_columns = [
+        "store",
+        "brand",
+        "canonical_brand_key",
+        "category_mix",
+        "units_sold",
+        "net_revenue",
+        "ending_quantity",
+        "ending_inventory_value",
+        "inventory_to_sales_ratio",
+        "inventory_to_sales_display",
+        "sell_through_proxy",
+        "days_on_hand_proxy",
+        "risk_level",
+        "recommended_action",
+        "brand_review_score",
+        "risk_sort",
+    ]
+    brand_audit_columns = [
+        "source",
+        "store",
+        "raw_brand",
+        "inferred_brand",
+        "canonical_brand",
+        "canonical_brand_key",
+        "match_method",
+        "match_score",
+        "row_count",
+        "revenue",
+        "inventory_value",
+        "suggested_alias",
+    ]
+    product_audit_columns = [
+        "store",
+        "raw_product",
+        "canonical_brand",
+        "canonical_brand_key",
+        "canonical_product_key",
+        "match_method",
+        "match_score",
+        "revenue",
+        "ending_quantity",
+        "inventory_value",
+    ]
+
+    def empty_outputs() -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        empty_brand = pd.DataFrame(columns=brand_columns)
+        empty_product = pd.DataFrame(columns=product_columns)
+        empty_audit = pd.DataFrame(columns=brand_audit_columns)
+        empty_product_audit = pd.DataFrame(columns=product_audit_columns)
+        return (
+            empty_brand,
+            empty_product,
+            compute_inventory_watchlist_summary(empty_brand, empty_product),
+            empty_audit,
+            empty_audit.copy(),
+            empty_audit.copy(),
+            empty_product_audit,
+        )
+
+    if ending_inventory is None or ending_inventory.empty:
+        return empty_outputs()
+
+    inv = ending_inventory.copy()
+    if store and "store" in inv.columns:
+        inv = inv[inv["store"].astype(str).str.upper() == store.upper()].copy()
+    required = {"product", "quantity"}
+    if inv.empty or not required.issubset(set(inv.columns)):
+        if warnings is not None:
+            warnings.append({
+                "severity": "Low",
+                "message": "Product-level inventory watchlist unavailable because inventory quantity/product columns were not found.",
+            })
+        return empty_outputs()
+
+    inv["quantity"] = pd.to_numeric(inv.get("quantity"), errors="coerce").fillna(0.0)
+    inv["total_cost"] = pd.to_numeric(inv.get("total_cost"), errors="coerce").fillna(0.0)
+    inv["unit_cost"] = pd.to_numeric(inv.get("unit_cost"), errors="coerce").fillna(0.0)
+    inv = inv[inv["quantity"] > 0].copy()
+    if inv.empty:
+        return empty_outputs()
+    inv["product"] = inv["product"].fillna("Unknown").astype(str)
+    if "brand" not in inv.columns:
+        inv["brand"] = inv["product"].apply(parse_brand_from_product)
+    else:
+        inv["brand"] = inv["brand"].fillna("").astype(str)
+    inv.loc[inv["brand"].str.strip() == "", "brand"] = inv["product"].apply(parse_brand_from_product)
+    inv["product_key"] = inv["product"].apply(normalize_join_key)
+    if "store" not in inv.columns:
+        inv["store"] = store or "ALL"
+    else:
+        inv["store"] = inv["store"].fillna(store or "ALL").astype(str)
+    inv["ending_inventory_value"] = inv["total_cost"]
+    missing_value = inv["ending_inventory_value"] <= 0
+    inv.loc[missing_value, "ending_inventory_value"] = inv.loc[missing_value, "quantity"] * inv.loc[missing_value, "unit_cost"]
+
+    sales = product_summary.copy() if product_summary is not None else pd.DataFrame()
+    if sales.empty:
+        sales = pd.DataFrame(columns=["product", "brand", "category", "items", "net_revenue", "margin_real", "discount_rate"])
+    for col in ["product", "brand", "category"]:
+        if col not in sales.columns:
+            sales[col] = "Unknown"
+    for col in ["items", "net_revenue", "margin_real", "discount_rate"]:
+        if col not in sales.columns:
+            sales[col] = 0.0
+        sales[col] = pd.to_numeric(sales[col], errors="coerce").fillna(0.0)
+
+    aliases = load_brand_aliases(MONTHLY_BRAND_ALIAS_PATH)
+    master = build_brand_master(
+        sales_brands=sales.get("brand", pd.Series(dtype=object)),
+        sales_products=sales.get("product", pd.Series(dtype=object)),
+        inventory_brands=inv.get("brand", pd.Series(dtype=object)),
+        inventory_products=inv.get("product", pd.Series(dtype=object)),
+        aliases=aliases,
+    )
+    if store is None:
+        print(f"[BRAND] resolver loaded: {MONTHLY_BRAND_ALIAS_PATH}")
+        print(f"[BRAND] canonical brands: {len(set(master.get('canonical_by_key', {}).values())):,}")
+        if not master.get("rapidfuzz_available") and warnings is not None:
+            warnings.append({
+                "severity": "Low",
+                "message": "RapidFuzz is not installed; monthly brand resolver used exact, alias, and product-prefix matching only.",
+            })
+
+    sales = apply_brand_resolution_to_sales(sales, aliases, master)
+    inv = apply_brand_resolution_to_inventory(inv, aliases, master)
+    sales["canonical_product_key"] = sales.apply(
+        lambda row: canonical_product_key(row.get("product"), row.get("canonical_brand_key"), row.get("canonical_brand"), aliases=aliases),
+        axis=1,
+    )
+    inv["canonical_product_key"] = inv.apply(
+        lambda row: canonical_product_key(row.get("product"), row.get("canonical_brand_key"), row.get("canonical_brand"), aliases=aliases),
+        axis=1,
+    )
+
+    sales_audit = sales.groupby(
+        ["canonical_brand_key", "canonical_brand", "raw_brand", "inferred_brand", "match_method", "match_score", "suggested_alias"],
+        as_index=False,
+        dropna=False,
+    ).agg(row_count=("product", "count"), revenue=("net_revenue", "sum"))
+    sales_audit["source"] = "sales"
+    sales_audit["store"] = store or "ALL"
+    sales_audit["inventory_value"] = 0.0
+    sales_audit = sales_audit[brand_audit_columns]
+
+    inv_audit = inv.groupby(
+        ["store", "canonical_brand_key", "canonical_brand", "raw_brand", "inferred_brand", "match_method", "match_score", "suggested_alias"],
+        as_index=False,
+        dropna=False,
+    ).agg(row_count=("product", "count"), inventory_value=("ending_inventory_value", "sum"))
+    inv_audit["source"] = "inventory"
+    inv_audit["revenue"] = 0.0
+    inv_audit = inv_audit[brand_audit_columns]
+    brand_pairing_audit = pd.concat([sales_audit, inv_audit], ignore_index=True)
+    unmatched_sales = sales_audit[sales_audit["match_method"].astype(str) == "unmatched"].copy()
+    unmatched_inventory = inv_audit[inv_audit["match_method"].astype(str) == "unmatched"].copy()
+
+    sales_group = sales.groupby(["canonical_brand_key", "canonical_product_key"], as_index=False).agg(
+        sales_product=("product", "first"),
+        brand=("canonical_brand", "first"),
+        category=("category", "first"),
+        units_sold=("items", "sum"),
+        net_revenue=("net_revenue", "sum"),
+        margin_real=("margin_real", "mean"),
+        discount_rate=("discount_rate", "mean"),
+        sales_match_score=("match_score", "max"),
+    )
+
+    inv_group_keys = ["store", "canonical_brand_key", "canonical_product_key"] if store else ["canonical_brand_key", "canonical_product_key"]
+    inv_group = inv.groupby(inv_group_keys, as_index=False).agg(
+        inventory_product=("product", "first"),
+        brand=("canonical_brand", "first"),
+        ending_quantity=("quantity", "sum"),
+        ending_inventory_value=("ending_inventory_value", "sum"),
+        inventory_match_score=("match_score", "max"),
+    )
+    if "store" not in inv_group.columns:
+        inv_group.insert(0, "store", "ALL")
+
+    out = inv_group.merge(sales_group, on=["canonical_brand_key", "canonical_product_key"], how="left", suffixes=("", "_sales"))
+    out["product"] = out["sales_product"].where(out["sales_product"].fillna("").astype(str).str.strip() != "", out["inventory_product"])
+    if "brand_sales" in out.columns:
+        out["brand"] = out["brand_sales"].where(out["brand_sales"].fillna("").astype(str).str.strip() != "", out["brand"])
+    if "category" not in out.columns:
+        out["category"] = "Unknown"
+    else:
+        out["category"] = out["category"].fillna("Unknown").astype(str)
+    for col in ["units_sold", "net_revenue", "margin_real", "discount_rate"]:
+        out[col] = pd.to_numeric(out.get(col), errors="coerce").fillna(0.0)
+    days = max(1, len(date_range_days(start_day, end_day)))
+    out["inventory_to_sales_ratio"] = out["ending_inventory_value"] / out["net_revenue"].replace({0: np.nan})
+    out["inventory_to_sales_ratio"] = out["inventory_to_sales_ratio"].replace([np.inf, -np.inf], np.nan)
+    missing_ratio = out["inventory_to_sales_ratio"].isna()
+    out.loc[missing_ratio, "inventory_to_sales_ratio"] = np.where(out.loc[missing_ratio, "ending_inventory_value"] > 0, 999.0, 0.0)
+    out["sell_through_proxy"] = out["units_sold"] / (out["units_sold"] + out["ending_quantity"]).replace({0: np.nan})
+    out["sell_through_proxy"] = out["sell_through_proxy"].fillna(0.0)
+    daily_units = out["units_sold"] / days
+    out["days_on_hand_proxy"] = out["ending_quantity"] / daily_units.replace({0: np.nan})
+    out["days_on_hand_proxy"] = out["days_on_hand_proxy"].replace([np.inf, -np.inf], np.nan)
+    missing_days = out["days_on_hand_proxy"].isna()
+    out.loc[missing_days, "days_on_hand_proxy"] = out.loc[missing_days].apply(
+        lambda row: no_sales_days_on_hand(as_float(row.get("units_sold")), as_float(row.get("ending_quantity"))),
+        axis=1,
+    )
+    out["risk_level"] = out.apply(
+        lambda row: product_inventory_risk_level(
+            as_float(row.get("net_revenue")),
+            as_float(row.get("inventory_to_sales_ratio")),
+            as_float(row.get("days_on_hand_proxy")),
+            as_float(row.get("sell_through_proxy")),
+            as_float(row.get("ending_inventory_value")),
+        ),
+        axis=1,
+    )
+    out["recommended_action"] = out.apply(
+        lambda row: inventory_recommended_action(
+            str(row.get("risk_level")),
+            as_float(row.get("net_revenue")),
+            as_float(row.get("units_sold")),
+            as_float(row.get("inventory_to_sales_ratio")),
+            as_float(row.get("days_on_hand_proxy")),
+            as_float(row.get("discount_rate")),
+            as_float(row.get("margin_real")),
+            as_float(row.get("ending_quantity")),
+        ),
+        axis=1,
+    )
+    out["inventory_to_sales_display"] = out.apply(
+        lambda row: format_inventory_to_sales_ratio(row.get("net_revenue"), row.get("ending_inventory_value")),
+        axis=1,
+    )
+    out["risk_sort"] = out["risk_level"].apply(inventory_risk_rank)
+    product_pairing_source = out.copy()
+    product_watchlist = out[product_columns].sort_values(
+        ["risk_sort", "ending_inventory_value", "days_on_hand_proxy"],
+        ascending=[True, False, False],
+    )
+
+    sales["store"] = store or "ALL"
+    sales_brand_group = sales.groupby(["store", "canonical_brand_key"], as_index=False).agg(
+        brand_sales=("canonical_brand", "first"),
+        units_sold=("items", "sum"),
+        net_revenue=("net_revenue", "sum"),
+        category_mix=("category", lambda s: ", ".join([x for x in pd.Series(s).dropna().astype(str).value_counts().head(2).index])),
+        discount_rate=("discount_rate", "mean"),
+    )
+    inv_brand_keys = ["store", "canonical_brand_key"] if store else ["canonical_brand_key"]
+    inv_brand_group = inv.groupby(inv_brand_keys, as_index=False).agg(
+        brand=("canonical_brand", "first"),
+        ending_quantity=("quantity", "sum"),
+        ending_inventory_value=("ending_inventory_value", "sum"),
+    )
+    if "store" not in inv_brand_group.columns:
+        inv_brand_group.insert(0, "store", "ALL")
+    brand_watchlist = inv_brand_group.merge(sales_brand_group, on=["store", "canonical_brand_key"], how="left")
+    brand_watchlist["brand"] = brand_watchlist["brand_sales"].where(
+        brand_watchlist.get("brand_sales", pd.Series("", index=brand_watchlist.index)).fillna("").astype(str).str.strip() != "",
+        brand_watchlist["brand"],
+    )
+    brand_watchlist["category_mix"] = brand_watchlist.get("category_mix", "Unknown")
+    brand_watchlist["category_mix"] = brand_watchlist["category_mix"].fillna("Unknown").astype(str)
+    for col in ["units_sold", "net_revenue", "discount_rate"]:
+        brand_watchlist[col] = pd.to_numeric(brand_watchlist.get(col), errors="coerce").fillna(0.0)
+    brand_watchlist["inventory_to_sales_ratio"] = brand_watchlist["ending_inventory_value"] / brand_watchlist["net_revenue"].replace({0: np.nan})
+    brand_watchlist["inventory_to_sales_ratio"] = brand_watchlist["inventory_to_sales_ratio"].replace([np.inf, -np.inf], np.nan)
+    missing_brand_ratio = brand_watchlist["inventory_to_sales_ratio"].isna()
+    brand_watchlist.loc[missing_brand_ratio, "inventory_to_sales_ratio"] = np.where(
+        brand_watchlist.loc[missing_brand_ratio, "ending_inventory_value"] > 0,
+        999.0,
+        0.0,
+    )
+    brand_watchlist["sell_through_proxy"] = brand_watchlist["units_sold"] / (brand_watchlist["units_sold"] + brand_watchlist["ending_quantity"]).replace({0: np.nan})
+    brand_watchlist["sell_through_proxy"] = brand_watchlist["sell_through_proxy"].fillna(0.0)
+    brand_daily_units = brand_watchlist["units_sold"] / days
+    brand_watchlist["days_on_hand_proxy"] = brand_watchlist["ending_quantity"] / brand_daily_units.replace({0: np.nan})
+    brand_watchlist["days_on_hand_proxy"] = brand_watchlist["days_on_hand_proxy"].replace([np.inf, -np.inf], np.nan)
+    missing_brand_days = brand_watchlist["days_on_hand_proxy"].isna()
+    brand_watchlist.loc[missing_brand_days, "days_on_hand_proxy"] = brand_watchlist.loc[missing_brand_days].apply(
+        lambda row: no_sales_days_on_hand(as_float(row.get("units_sold")), as_float(row.get("ending_quantity"))),
+        axis=1,
+    )
+    brand_watchlist["risk_level"] = brand_watchlist.apply(
+        lambda row: brand_inventory_risk_level(
+            as_float(row.get("net_revenue")),
+            as_float(row.get("inventory_to_sales_ratio")),
+            as_float(row.get("sell_through_proxy")),
+            as_float(row.get("ending_inventory_value")),
+        ),
+        axis=1,
+    )
+    brand_watchlist["recommended_action"] = brand_watchlist.apply(
+        lambda row: inventory_recommended_action(
+            str(row.get("risk_level")),
+            as_float(row.get("net_revenue")),
+            as_float(row.get("units_sold")),
+            as_float(row.get("inventory_to_sales_ratio")),
+            as_float(row.get("days_on_hand_proxy")),
+            as_float(row.get("discount_rate")),
+            ending_quantity=as_float(row.get("ending_quantity")),
+        ),
+        axis=1,
+    )
+    brand_watchlist["inventory_to_sales_display"] = brand_watchlist.apply(
+        lambda row: format_inventory_to_sales_ratio(row.get("net_revenue"), row.get("ending_inventory_value")),
+        axis=1,
+    )
+    brand_watchlist["brand_review_score"] = brand_watchlist.apply(compute_brand_review_score, axis=1)
+    brand_watchlist["risk_sort"] = brand_watchlist["risk_level"].apply(inventory_risk_rank)
+    brand_watchlist = brand_watchlist[brand_columns].sort_values(
+        ["risk_sort", "brand_review_score", "ending_inventory_value"],
+        ascending=[True, False, False],
+    )
+
+    product_pairing_audit = product_pairing_source.rename(columns={
+        "product": "raw_product",
+        "brand": "canonical_brand",
+        "ending_inventory_value": "inventory_value",
+    }).copy()
+    product_pairing_audit["match_method"] = "canonical_brand_product_core"
+    product_pairing_audit["match_score"] = pd.to_numeric(product_pairing_audit.get("inventory_match_score"), errors="coerce").fillna(0.0)
+    product_pairing_audit = product_pairing_audit.rename(columns={"net_revenue": "revenue"})
+    product_pairing_audit = product_pairing_audit[product_audit_columns]
+
+    if warnings is not None:
+        if product_watchlist["canonical_brand_key"].isna().any() or (product_watchlist["canonical_brand_key"].astype(str).str.strip() == "").any():
+            warnings.append({"severity": "High", "message": "Inventory watchlist produced rows without canonical brand keys."})
+        if brand_watchlist["canonical_brand_key"].isna().any() or (brand_watchlist["canonical_brand_key"].astype(str).str.strip() == "").any():
+            warnings.append({"severity": "High", "message": "Brand inventory watchlist produced rows without canonical brand keys."})
+    if store is None:
+        counts = brand_pairing_audit["match_method"].value_counts().to_dict()
+        print(f"[BRAND] exact matches: {int(counts.get('exact', 0)):,}")
+        print(f"[BRAND] alias matches: {int(counts.get('alias', 0)):,}")
+        print(f"[BRAND] product-prefix matches: {int(counts.get('product_prefix', 0)):,}")
+        print(f"[BRAND] fuzzy matches: {int(counts.get('fuzzy_high', 0)):,}")
+        print(f"[BRAND] unmatched sales brands: {len(unmatched_sales):,}")
+        print(f"[BRAND] unmatched inventory brands: {len(unmatched_inventory):,}")
+        print(f"[BRAND] watchlist rows computed: brands {len(brand_watchlist):,}, products {len(product_watchlist):,}")
+
+    summary = compute_inventory_watchlist_summary(brand_watchlist, product_watchlist)
+    summary["unmatched_sales_brands"] = int(len(unmatched_sales))
+    summary["unmatched_inventory_brands"] = int(len(unmatched_inventory))
+    summary["brand_pairing_audit_rows"] = int(len(brand_pairing_audit))
+    return (
+        brand_watchlist.reset_index(drop=True),
+        product_watchlist.reset_index(drop=True),
+        summary,
+        brand_pairing_audit.reset_index(drop=True),
+        unmatched_sales.reset_index(drop=True),
+        unmatched_inventory.reset_index(drop=True),
+        product_pairing_audit.reset_index(drop=True),
+    )
+
+
 def load_monthly_closing_reports(
     closing_dir: Path,
     start_day: date,
@@ -3657,20 +4201,18 @@ def build_long_table(
     if source.empty:
         rendered_rows = 0
     flowables: List[Any] = [
-        CondPageBreak(1.45 * inch),
+        CondPageBreak(1.25 * inch),
         Paragraph(escape_html(title), styles["Section"]),
     ]
     if row_limit is None:
         note = f"Rows shown: {rendered_rows} of {expected_rows}"
     else:
-        note = f"Rows shown: {rendered_rows} of {expected_rows}. Full detail in CSV/XLSX data book."
-    if continuation_label and rendered_rows > 18:
-        note += " Headers repeat if the table continues on the next page."
+        note = f"Top {rendered_rows} of {expected_rows} shown. Full detail in data export."
     flowables.append(Paragraph(escape_html(note), styles["Tiny"]))
     flowables.append(Spacer(1, 0.04 * inch))
 
     table = LongTable([headers] + rows, colWidths=col_widths, repeatRows=1 if repeat_header else 0, splitByRow=1)
-    table.setStyle(TableStyle([
+    style_commands = [
         ("BACKGROUND", (0, 0), (-1, 0), BUZZ["black"]),
         ("TEXTCOLOR", (0, 0), (-1, 0), BUZZ["yellow"]),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
@@ -3685,7 +4227,14 @@ def build_long_table(
         ("TOPPADDING", (0, 0), (-1, -1), 2.2),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2.2),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
+    ]
+    numeric_kinds = {"money", "money_optional", "signed_money", "money2", "money1", "pct", "pct_optional", "pp", "int", "float1", "float2"}
+    for idx, (_, _, kind) in enumerate(columns):
+        if kind in numeric_kinds:
+            style_commands.append(("ALIGN", (idx, 1), (idx, -1), "RIGHT"))
+        if idx == 0:
+            style_commands.append(("ALIGN", (idx, 1), (idx, -1), "LEFT"))
+    table.setStyle(TableStyle(style_commands))
     flowables.append(table)
     return flowables, expected_rows, rendered_rows
 
@@ -3861,6 +4410,26 @@ def add_full_daily_detail_section(
         ("margin", "KB Margin", "pct"),
     ]
     widths = [0.72 * inch, 0.78 * inch, 0.72 * inch, 0.72 * inch, 0.50 * inch, 0.55 * inch, 0.72 * inch, 0.60 * inch, 0.62 * inch, 0.62 * inch]
+    total_net = as_float(detail["net_revenue"].sum())
+    total_profit = as_float(detail["profit"].sum())
+    avg_daily = total_net / expected_days if expected_days else 0.0
+    best = detail.sort_values("net_revenue", ascending=False).iloc[0] if not detail.empty else {}
+    worst = detail.sort_values("net_revenue", ascending=True).iloc[0] if not detail.empty else {}
+    gross_total = as_float(detail["gross_sales"].sum()) if "gross_sales" in detail.columns else 0.0
+    avg_discount_rate = as_float(detail["discount"].sum()) / gross_total if gross_total else as_float(detail["discount_rate"].mean())
+    avg_real_margin = as_float(detail["profit_real"].sum()) / total_net if total_net else 0.0
+    avg_kb_margin = total_profit / total_net if total_net else 0.0
+    story.append(build_summary_strip(styles, [
+        ("Total Net Revenue", money(total_net)),
+        ("Total Profit", money(total_profit)),
+        ("Avg Daily Revenue", money(avg_daily)),
+        ("Best Day", f"{best.get('date_label', 'N/A')} {money(best.get('net_revenue', 0))}" if isinstance(best, pd.Series) else "N/A"),
+        ("Worst Day", f"{worst.get('date_label', 'N/A')} {money(worst.get('net_revenue', 0))}" if isinstance(worst, pd.Series) else "N/A"),
+        ("Avg Discount Rate", pct1(avg_discount_rate)),
+        ("Avg Real Margin", pct1(avg_real_margin)),
+        ("Avg KB Margin", pct1(avg_kb_margin)),
+    ], cols=4))
+    story.append(Spacer(1, 0.06 * inch))
     append_long_table(story, title, detail, columns, widths, styles, row_limit=None)
     story.append(Paragraph(f"Days shown: {len(detail)} of {expected_days}", styles["Tiny"]))
     return {"expected": expected_days, "rendered": len(detail)}
@@ -3893,9 +4462,28 @@ def add_full_new_customer_daily_section(
     if "source_file" in detail.columns and detail["source_file"].astype(str).str.strip().any():
         columns.append(("source_file", "Source", "textwrap"))
         widths.append(2.7 * inch)
-    append_long_table(story, title, detail, columns, widths, styles, row_limit=None)
     total_new_customers = int(round(as_float(detail["new_customers"].sum()))) if "new_customers" in detail.columns else 0
     total_customers = int(round(as_float(detail["total_customers"].sum()))) if "total_customers" in detail.columns else 0
+    weighted_rate = total_new_customers / total_customers if total_customers else 0.0
+    active = detail.copy()
+    best_new = active.sort_values("new_customers", ascending=False).iloc[0] if not active.empty else {}
+    worst_new = active.sort_values("new_customers", ascending=True).iloc[0] if not active.empty else {}
+    best_rate = active.sort_values("new_customer_rate", ascending=False).iloc[0] if total_customers and not active.empty else {}
+    closing_diff = ""
+    if authoritative_total is not None and not is_missing_display(authoritative_total):
+        diff = int(round(as_float(authoritative_total))) - total_new_customers
+        closing_diff = f"{diff:+,}"
+    story.append(build_summary_strip(styles, [
+        ("Total New Customers", f"{int(round(as_float(authoritative_total))) if authoritative_total is not None and not is_missing_display(authoritative_total) else total_new_customers:,}"),
+        ("Avg Daily New Customers", f"{(total_new_customers / expected_days if expected_days else 0.0):,.1f}"),
+        ("Weighted New Customer Rate", pct1(weighted_rate) if total_customers else "N/A"),
+        ("Best New Customer Day", f"{best_new.get('date_label', 'N/A')} ({int(as_float(best_new.get('new_customers', 0))):,})" if isinstance(best_new, pd.Series) else "N/A"),
+        ("Worst New Customer Day", f"{worst_new.get('date_label', 'N/A')} ({int(as_float(worst_new.get('new_customers', 0))):,})" if isinstance(worst_new, pd.Series) else "N/A"),
+        ("Best New Customer Rate", f"{best_rate.get('date_label', 'N/A')} {pct1(best_rate.get('new_customer_rate', 0))}" if isinstance(best_rate, pd.Series) else "N/A"),
+        ("Closing Report Difference", closing_diff or "N/A"),
+    ], cols=4))
+    story.append(Spacer(1, 0.06 * inch))
+    append_long_table(story, title, detail, columns, widths, styles, row_limit=None)
     story.append(Paragraph(f"Days shown: {len(detail)} of {expected_days}", styles["Tiny"]))
     if authoritative_total is not None and not is_missing_display(authoritative_total):
         official_total = int(round(as_float(authoritative_total)))
@@ -3959,21 +4547,18 @@ def add_full_kickback_detail_section(
     if include_store:
         columns.append(("store", "Store", "text"))
         widths.append(0.42 * inch)
-    elif "stores" in detail.columns:
-        columns.append(("stores", "Stores", "textwrap"))
-        widths.append(0.58 * inch)
     columns.extend([
         ("brand", "Brand", "textwrap"),
-        ("rule", "Rules Combined", "textwrap"),
+        ("rule", "Rule", "textwrap"),
         ("net_revenue", "Revenue", "money"),
-        ("generated_profit", "Gen Profit", "money"),
-        ("profit_real", "Real Profit", "money"),
         ("kickback", "Kickback", "money"),
-        ("margin_real", "Real M", "pct"),
-        ("margin", "KB M", "pct"),
-        ("deal_signal", "Signal", "textwrap"),
+        ("profit_real", "Profit Before", "money"),
+        ("profit", "Profit After", "money"),
+        ("margin_real", "Real Margin", "pct"),
+        ("margin", "KB Margin", "pct"),
+        ("margin_lift", "Lift", "pp"),
     ])
-    widths.extend([1.0 * inch, 1.1 * inch, 0.78 * inch, 0.78 * inch, 0.78 * inch, 0.65 * inch, 0.48 * inch, 0.48 * inch, 0.8 * inch])
+    widths.extend([1.05 * inch, 1.18 * inch, 0.78 * inch, 0.68 * inch, 0.78 * inch, 0.78 * inch, 0.58 * inch, 0.58 * inch, 0.45 * inch])
     append_long_table(story, f"{title} Rows", detail, columns, widths, styles, row_limit=None)
     story.append(Paragraph(f"Kickback rows shown: {len(detail)} of {len(detail)}", styles["Tiny"]))
     return {"expected": len(detail), "rendered": len(detail)}
@@ -3990,7 +4575,7 @@ def add_detail_appendix_index(story: List[Any], styles: Dict[str, Any], include_
         ["Appendix G", "Product Detail"],
     ]
     story.append(PageBreak())
-    add_section_title(story, styles, "Detail Appendix Index", "Complete operational detail follows the visual executive pages.")
+    add_section_title(story, styles, "Detail Appendix Index", "Detailed tables follow.")
     story.append(build_table(["Section", "Contents"], rows, [1.2 * inch, 4.8 * inch]))
 
 
@@ -4446,7 +5031,7 @@ def build_metric_card(
     value: str,
     lines: List[str],
     status: str = "N/A",
-    width: float = 1.74 * inch,
+    width: float = 1.36 * inch,
 ) -> Table:
     status_color = {
         "Up": HEX_GOOD,
@@ -4457,7 +5042,7 @@ def build_metric_card(
     data = [
         [Paragraph(escape_html(label), styles["CardLabel"])],
         [Paragraph(escape_html(value), styles["CardValue"])],
-        [Paragraph("<br/>".join(lines or ["Comparison unavailable"]), styles["CardDelta"])],
+        [Paragraph("<br/>".join(lines) if lines else "&nbsp;", styles["CardDelta"])],
     ]
     if not is_missing_display(status):
         data.append([Paragraph(f"<font color=\"{status_color}\">{escape_html(status)}</font>", styles["CardDelta"])])
@@ -4553,6 +5138,121 @@ def build_two_column_layout(left: List[Any], right: List[Any], widths: Optional[
     return table
 
 
+def build_summary_strip(styles: Dict[str, Any], items: List[Tuple[str, str]], cols: int = 4) -> Table:
+    cells: List[Any] = []
+    width = 7.25 * inch / max(1, cols)
+    for label, value in items:
+        cells.append([
+            Paragraph(escape_html(label), styles["CardLabel"]),
+            Paragraph(escape_html(value), styles["CardValue"]),
+        ])
+    rows: List[List[Any]] = []
+    for idx in range(0, len(cells), cols):
+        row = cells[idx:idx + cols]
+        while len(row) < cols:
+            row.append("")
+        rows.append(row)
+    table = Table(rows, colWidths=[width] * cols, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F9FAFB")),
+        ("BOX", (0, 0), (-1, -1), 0.45, BUZZ["border"]),
+        ("LINEABOVE", (0, 0), (-1, 0), 2.0, BUZZ["green"]),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, BUZZ["border"]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return table
+
+
+def build_rank_strip(styles: Dict[str, Any], rows: List[Tuple[str, str]]) -> Table:
+    return build_summary_strip(styles, rows, cols=max(1, min(4, len(rows) or 1)))
+
+
+def append_table_without_orphans(
+    story: List[Any],
+    table_title: str,
+    table: Table,
+    estimated_height: float,
+    min_rows_on_split: int = 4,
+    preferred_cond_pagebreak_height: Optional[float] = None,
+    styles: Optional[Dict[str, Any]] = None,
+) -> None:
+    story.append(CondPageBreak(preferred_cond_pagebreak_height or estimated_height))
+    if table_title and styles is not None:
+        story.append(Paragraph(escape_html(table_title), styles["InsightTitle"]))
+    story.append(table)
+
+
+def build_inventory_watchlist_section(
+    story: List[Any],
+    styles: Dict[str, Any],
+    title: str,
+    brand_watchlist: pd.DataFrame,
+    product_watchlist: pd.DataFrame,
+    summary: Dict[str, Any],
+    top_brand_rows: int = 10,
+    top_product_rows: int = 15,
+) -> None:
+    story.append(PageBreak())
+    add_section_title(story, styles, title, "Slow-moving and overstock risk based on ending inventory vs monthly sales.")
+    if not summary.get("available"):
+        add_insights(story, styles, ["Product-level inventory watchlist unavailable because inventory quantity/value data was not found."])
+        return
+    story.append(build_summary_strip(styles, [
+        ("High-Risk Products", f"{int(as_float(summary.get('high_risk_products'))):,}"),
+        ("High-Risk Brands", f"{int(as_float(summary.get('high_risk_brands'))):,}"),
+        ("Inventory Value At Risk", money(summary.get("inventory_value_at_risk"))),
+        ("Biggest Brand To Review", str(summary.get("largest_inventory_to_sales_brand") or "N/A")),
+    ], cols=4))
+    story.append(Paragraph("Brands normalized using alias + exact matching. Pairing audit included in data export.", styles["Tiny"]))
+    unmatched_count = int(as_float(summary.get("unmatched_inventory_brands"))) + int(as_float(summary.get("unmatched_sales_brands")))
+    if unmatched_count:
+        story.append(Paragraph(
+            f"{unmatched_count:,} brand pairing group(s) could not be confidently paired. See pairing audit.",
+            styles["Tiny"],
+        ))
+    story.append(Spacer(1, 0.07 * inch))
+
+    brand_cols = [
+        ("brand", "Brand", "textwrap"),
+        ("net_revenue", "Revenue", "money"),
+        ("units_sold", "Units", "int"),
+        ("ending_inventory_value", "Inv Value", "money"),
+        ("inventory_to_sales_display", "Inv/Sales", "text"),
+        ("sell_through_proxy", "Sell-Thru", "pct"),
+        ("risk_level", "Risk", "text"),
+        ("recommended_action", "Action", "textwrap"),
+    ]
+    product_cols = [
+        ("product", "Product", "textwrap"),
+        ("brand", "Brand", "textwrap"),
+        ("net_revenue", "Revenue", "money"),
+        ("units_sold", "Units", "int"),
+        ("ending_quantity", "End Qty", "float1"),
+        ("ending_inventory_value", "Inv Value", "money"),
+        ("sell_through_proxy", "Sell-Thru", "pct"),
+        ("risk_level", "Risk", "text"),
+        ("recommended_action", "Action", "textwrap"),
+    ]
+    brand_df = brand_watchlist.sort_values(["risk_sort", "ending_inventory_value"], ascending=[True, False]) if brand_watchlist is not None and not brand_watchlist.empty else pd.DataFrame()
+    product_df = product_watchlist.sort_values(["risk_sort", "ending_inventory_value"], ascending=[True, False]) if product_watchlist is not None and not product_watchlist.empty else pd.DataFrame()
+    story.append(Paragraph("<b>Brand Inventory Watchlist</b>", styles["InsightTitle"]))
+    story.append(build_table(
+        *df_rows(brand_df, brand_cols, top_brand_rows, styles),
+        col_widths=[1.25 * inch, 0.78 * inch, 0.52 * inch, 0.78 * inch, 0.55 * inch, 0.58 * inch, 0.55 * inch, 1.42 * inch],
+    ))
+    story.append(Spacer(1, 0.06 * inch))
+    story.append(Paragraph("<b>Product Inventory Watchlist</b>", styles["InsightTitle"]))
+    story.append(build_table(
+        *df_rows(product_df, product_cols, top_product_rows, styles),
+        col_widths=[1.45 * inch, 0.85 * inch, 0.68 * inch, 0.48 * inch, 0.48 * inch, 0.68 * inch, 0.52 * inch, 0.48 * inch, 1.18 * inch],
+    ))
+    story.append(Paragraph("Top risk rows shown. Full inventory watchlist is in the data export.", styles["Tiny"]))
+
+
 def add_compact_header(
     story: List[Any],
     styles: Dict[str, Any],
@@ -4606,13 +5306,9 @@ def build_executive_metric_cards(all_metrics: Dict[str, Any], styles: Dict[str, 
         ("Real Margin", "margin_real", "pct"),
         ("Tickets", "tickets", "int"),
         ("Avg Cart >$1", "basket", "money1"),
-        ("Customers", "closing_customers", "int"),
         ("New Customers", "closing_new_customers", "int"),
-        ("New Cust %", "closing_new_customer_rate", "pct"),
-        ("Ending Inventory", "inventory_end_value", "money"),
         ("Discount Rate", "discount_rate", "pct"),
-        ("OTD Round-Up Loss", "tax_rounding_loss", "money"),
-        ("Kickback Amount", "kickback", "money"),
+        ("Ending Inventory", "inventory_end_value", "money"),
         ("Inventory Gain/Loss", "inventory_value_change", "signed_money"),
     ]
     cards: List[Table] = []
@@ -4630,8 +5326,6 @@ def build_executive_metric_cards(all_metrics: Dict[str, Any], styles: Dict[str, 
                 break
         if store_context and key in store_context:
             lines.append(escape_html(store_context[key]))
-        if not lines:
-            lines = ["Comparison unavailable"]
         status = build_metric_status(key, current, prev, metric_direction(key)) if prev != "N/A" else "N/A"
         cards.append(build_metric_card(styles, label, value, lines, status=status))
     return cards
@@ -4987,6 +5681,9 @@ def build_all_stores_pdf(
     new_customer_daily: pd.DataFrame,
     closing_summary: pd.DataFrame,
     inventory_summary: pd.DataFrame,
+    inventory_watchlist_brands: pd.DataFrame,
+    inventory_watchlist_products: pd.DataFrame,
+    inventory_watchlist_summary: Dict[str, Any],
     kickback_summary: pd.DataFrame,
     store_kickback_summary: pd.DataFrame,
     action_items: List[Dict[str, str]],
@@ -5025,7 +5722,7 @@ def build_all_stores_pdf(
         "Monthly Owner Review - All Stores",
         f"{month_key} | {start_day.isoformat()} to {end_day.isoformat()} | Generated {generated_at}",
     )
-    story.append(build_scorecard_grid(styles, build_executive_metric_cards(all_metrics, styles), cols=4))
+    story.append(build_scorecard_grid(styles, build_executive_metric_cards(all_metrics, styles), cols=5))
     story.append(Spacer(1, 0.08 * inch))
     story.append(build_two_column_layout(
         [
@@ -5039,9 +5736,6 @@ def build_all_stores_pdf(
     ))
     story.append(Spacer(1, 0.07 * inch))
     build_insight_cards(story, styles, "3 Action Items", actions, max_items=3, color=BUZZ["yellow"])
-    if not summary_only:
-        add_report_sections_card(story, styles, is_store=False)
-
     if summary_only:
         doc.build(story, onFirstPage=footer, onLaterPages=footer)
         print(f"[PDF] All stores complete: {out_pdf}")
@@ -5363,6 +6057,17 @@ def build_all_stores_pdf(
         col_widths=[2.2 * inch, 0.78 * inch, 0.7 * inch, 0.95 * inch],
     )
 
+    build_inventory_watchlist_section(
+        story,
+        styles,
+        "Company-Wide Inventory Watchlist",
+        inventory_watchlist_brands,
+        inventory_watchlist_products,
+        inventory_watchlist_summary,
+        top_brand_rows=min(10, top_n),
+        top_product_rows=min(15, max(top_n, 10)),
+    )
+
     days = len(date_range_days(start_day, end_day))
     daily_counts = {"expected": days, "rendered": 0}
     new_counts = {"expected": 0, "rendered": 0}
@@ -5483,6 +6188,9 @@ def build_store_pdf(
     new_customer_daily: pd.DataFrame,
     closing_summary_row: Dict[str, Any],
     inventory_row: Dict[str, Any],
+    inventory_watchlist_brands: pd.DataFrame,
+    inventory_watchlist_products: pd.DataFrame,
+    inventory_watchlist_summary: Dict[str, Any],
     kickback_summary: pd.DataFrame,
     action_items: List[Dict[str, str]],
     top_n: int,
@@ -5539,20 +6247,15 @@ def build_store_pdf(
         f"Monthly Owner Review - {bundle.abbr} / {bundle.label}",
         f"Status: {status} | {month_key} | Generated {generated_at}",
     )
-    story.append(build_scorecard_grid(styles, build_executive_metric_cards(store_metrics, styles, rank_context), cols=4))
+    story.append(build_scorecard_grid(styles, build_executive_metric_cards(store_metrics, styles, rank_context), cols=5))
     story.append(Spacer(1, 0.08 * inch))
     build_insight_cards(story, styles, "Top Store Action Items", generate_monthly_action_items(action_items), max_items=3, color=BUZZ["yellow"])
-    add_report_sections_card(story, styles, is_store=True)
-    story.append(build_table(
-        ["Store Rank", "Value"],
-        [
-            ["Revenue Rank", rank_context.get("net_revenue") or "-"],
-            ["Real Margin Rank", rank_context.get("margin_real") or "-"],
-            ["Discount Rate Rank", rank_context.get("discount_rate") or "-"],
-            ["Revenue Share", pct1(as_float(m.get("net_revenue")) / as_float(all_metrics.get("net_revenue")) if all_metrics.get("net_revenue") else 0.0)],
-        ],
-        [1.6 * inch, 3.6 * inch],
-    ))
+    story.append(build_rank_strip(styles, [
+        ("Revenue Rank", rank_context.get("net_revenue") or "-"),
+        ("Margin Rank", rank_context.get("margin_real") or "-"),
+        ("Discount Rank", rank_context.get("discount_rate") or "-"),
+        ("Revenue Share", pct1(as_float(m.get("net_revenue")) / as_float(all_metrics.get("net_revenue")) if all_metrics.get("net_revenue") else 0.0)),
+    ]))
 
     story.append(PageBreak())
 
@@ -5611,7 +6314,14 @@ def build_store_pdf(
     ]
     story.append(build_store_company_comparison_panel(styles, comparison_rows))
     story.append(Spacer(1, 0.08 * inch))
-    build_insight_cards(story, styles, "Comparison Signals", generate_store_comparison_insights({**m, "revenue_share": as_float(m.get("net_revenue")) / as_float(all_metrics.get("net_revenue")) if all_metrics.get("net_revenue") else 0.0}, all_metrics, rank_context), max_items=4)
+    revenue_share = as_float(m.get("net_revenue")) / as_float(all_metrics.get("net_revenue")) if all_metrics.get("net_revenue") else 0.0
+    margin_gap = as_float(m.get("margin_real")) - as_float(all_metrics.get("margin_real"))
+    discount_gap = as_float(m.get("discount_rate")) - as_float(all_metrics.get("discount_rate"))
+    story.append(build_summary_strip(styles, [
+        ("Revenue Share", pct1(revenue_share)),
+        ("Margin Gap vs Co.", pp1(margin_gap)),
+        ("Discount Gap vs Co.", pp1(discount_gap)),
+    ], cols=3))
 
     story.append(PageBreak())
 
@@ -5643,16 +6353,23 @@ def build_store_pdf(
         [chart_or_spacer(chart_category_mix(category_summary, f"{bundle.abbr} Category Revenue Share", top_n=min(top_n, 8)), width=3.45 * inch, height=2.35 * inch)],
         [chart_or_spacer(chart_barh_value(brand_summary.sort_values("net_revenue", ascending=False) if brand_summary is not None and not brand_summary.empty and "net_revenue" in brand_summary.columns else pd.DataFrame(), "brand", "net_revenue", f"{bundle.abbr} Top Brands", money, top_n=min(top_n, 10)), width=3.45 * inch, height=2.35 * inch)],
     ))
-    add_chart(story, chart_product_pareto(product_summary, top_n=min(top_n, 12)), height=2.45 * inch)
+    add_chart(story, chart_product_pareto(product_summary, top_n=min(top_n, 12)), height=2.22 * inch)
     build_insight_cards(story, styles, "Store Mix Insights", generate_mix_shift_insights(category_summary, brand_summary, product_summary, m), max_items=3)
-    add_df_table(
-        story,
-        styles,
+    product_rows = min(top_n, 10 if detail_level == "deep" else 8)
+    headers, rows = df_rows(
         product_summary,
         [("product", "Top Products", "textwrap"), ("brand", "Brand", "textwrap"), ("net_revenue", "Revenue", "money"), ("items", "Units", "int"), ("margin_real", "Margin", "pct")],
-        max_rows=min(top_n, 10),
-        col_widths=[2.25 * inch, 1.2 * inch, 0.9 * inch, 0.58 * inch, 0.76 * inch],
+        product_rows,
+        styles,
     )
+    append_table_without_orphans(
+        story,
+        "",
+        build_table(headers, rows, col_widths=[2.25 * inch, 1.2 * inch, 0.9 * inch, 0.58 * inch, 0.76 * inch]),
+        estimated_height=1.15 * inch,
+        styles=styles,
+    )
+    story.append(Paragraph("Top products shown. Full product detail is in the data export.", styles["Tiny"]))
 
     story.append(PageBreak())
 
@@ -5675,7 +6392,17 @@ def build_store_pdf(
         ["Ending Inventory", optional_money(store_metrics.get("inventory_end_value"))],
         ["Inventory Gain/Loss", optional_signed_money(store_metrics.get("inventory_value_change"))],
     ]
-    story.append(build_table(["Metric", "Value"], store_health_rows, [2.1 * inch, 2.3 * inch]))
+    kickback_total = as_float(kickback_summary["kickback"].sum()) if kickback_summary is not None and not kickback_summary.empty else 0.0
+    kickback_rows = [
+        ["Store Kickback", money(kickback_total)],
+        ["Profit Before KB", money(m.get("profit_real"))],
+        ["Profit After KB", money(m.get("profit"))],
+        ["Margin Lift", pp1(as_float(m.get("margin")) - as_float(m.get("margin_real")))],
+    ]
+    story.append(build_two_column_layout(
+        [build_table(["Metric", "Value"], store_health_rows, [1.75 * inch, 1.25 * inch])],
+        [build_table(["Kickback", "Value"], kickback_rows, [1.55 * inch, 1.25 * inch])],
+    ))
     story.append(Spacer(1, 0.06 * inch))
     if new_customer_daily is not None and not new_customer_daily.empty:
         add_chart(story, chart_new_customer_trend(new_customer_daily, f"{bundle.abbr} New Customer Trend"), height=2.1 * inch)
@@ -5688,18 +6415,16 @@ def build_store_pdf(
         max_rows=min(top_n, 10),
         col_widths=[2.25 * inch, 0.92 * inch, 0.68 * inch, 0.78 * inch, 0.78 * inch],
     )
-    story.append(Spacer(1, 0.05 * inch))
-    kickback_total = as_float(kickback_summary["kickback"].sum()) if kickback_summary is not None and not kickback_summary.empty else 0.0
-    story.append(build_table(
-        ["Kickback Metric", "Value"],
-        [
-            ["Store Kickback", money(kickback_total)],
-            ["Profit Before Kickback", money(m.get("profit_real"))],
-            ["Profit After Kickback", money(m.get("profit"))],
-            ["Margin Lift", pp1(as_float(m.get("margin")) - as_float(m.get("margin_real")))],
-        ],
-        [2.2 * inch, 2.2 * inch],
-    ))
+    build_inventory_watchlist_section(
+        story,
+        styles,
+        f"{bundle.abbr} Inventory Watchlist",
+        inventory_watchlist_brands,
+        inventory_watchlist_products,
+        inventory_watchlist_summary,
+        top_brand_rows=min(10, top_n),
+        top_product_rows=min(15, max(top_n, 10)),
+    )
 
     days = len(date_range_days(start_day, end_day))
     daily_counts = {"expected": days, "rendered": 0}
@@ -6045,6 +6770,12 @@ def write_data_exports(
     inventory_summary: pd.DataFrame,
     inventory_start: pd.DataFrame,
     inventory_end: pd.DataFrame,
+    inventory_watchlist_brands: pd.DataFrame,
+    inventory_watchlist_products: pd.DataFrame,
+    brand_pairing_audit: pd.DataFrame,
+    unmatched_sales_brands: pd.DataFrame,
+    unmatched_inventory_brands: pd.DataFrame,
+    product_pairing_audit: pd.DataFrame,
     daily_metrics: pd.DataFrame,
     store_daily_detail: pd.DataFrame,
     kickback_summary: pd.DataFrame,
@@ -6096,6 +6827,12 @@ def write_data_exports(
         "monthly_inventory_summary.csv": inventory_summary,
         "monthly_inventory_snapshot_start.csv": inventory_start,
         "monthly_inventory_snapshot_end.csv": inventory_end,
+        "monthly_inventory_watchlist_brands.csv": inventory_watchlist_brands,
+        "monthly_inventory_watchlist_products.csv": inventory_watchlist_products,
+        "monthly_brand_pairing_audit.csv": brand_pairing_audit,
+        "monthly_unmatched_sales_brands.csv": unmatched_sales_brands,
+        "monthly_unmatched_inventory_brands.csv": unmatched_inventory_brands,
+        "monthly_product_pairing_audit.csv": product_pairing_audit,
         "monthly_daily_detail.csv": daily_metrics,
         "monthly_store_daily_detail.csv": store_daily_detail,
         "monthly_kickback_detail.csv": kickback_summary,
@@ -6144,6 +6881,12 @@ def write_data_exports(
             inventory_summary.to_excel(writer, sheet_name="Inventory Summary", index=False)
             inventory_start.to_excel(writer, sheet_name="Inventory Start", index=False)
             inventory_end.to_excel(writer, sheet_name="Inventory End", index=False)
+            inventory_watchlist_brands.to_excel(writer, sheet_name="Inventory Watchlist Brands", index=False)
+            inventory_watchlist_products.to_excel(writer, sheet_name="Inventory Watchlist Products", index=False)
+            brand_pairing_audit.to_excel(writer, sheet_name="Brand Pairing Audit", index=False)
+            product_pairing_audit.to_excel(writer, sheet_name="Product Pairing Audit", index=False)
+            unmatched_sales_brands.to_excel(writer, sheet_name="Unmatched Sales Brands", index=False)
+            unmatched_inventory_brands.to_excel(writer, sheet_name="Unmatched Inventory Brands", index=False)
             all_kickback_detail.to_excel(writer, sheet_name="Store Kickback Detail", index=False)
             store_kickback_summary.to_excel(writer, sheet_name="Store Kickbacks", index=False)
             tax_rounding_summary.to_excel(writer, sheet_name="Tax Rounding Summary", index=False)
@@ -6205,6 +6948,7 @@ def build_monthly_email_intro(
         row = store_scorecards.sort_values("net_revenue", ascending=False).iloc[0]
         best_store = f"{row['store']} ({money(row['net_revenue'])})"
     top_action = action_items[0].get("recommended_action") if action_items else "No threshold action required"
+    inventory_watch = all_metrics.get("inventory_watchlist_summary") if isinstance(all_metrics.get("inventory_watchlist_summary"), dict) else {}
     lines = [
         f"Month: {month_key}",
         f"Net revenue: {money(all_metrics.get('net_revenue'))}",
@@ -6216,6 +6960,8 @@ def build_monthly_email_intro(
         f"Customers: {int(as_float(all_metrics.get('closing_customers'))):,}" if all_metrics.get("closing_summary_has_data") else "Customers: N/A",
         f"New customers: {int(as_float(all_metrics.get('closing_new_customers'))):,} ({pct1(all_metrics.get('closing_new_customer_rate'))})" if all_metrics.get("closing_summary_has_data") else "New customers: N/A",
         f"Ending inventory: {optional_money(all_metrics.get('inventory_end_value'))}" if all_metrics.get("inventory_has_data") else "Ending inventory: N/A",
+        f"Inventory watch: {int(as_float(inventory_watch.get('high_risk_brands'))):,} high-risk brands / {int(as_float(inventory_watch.get('high_risk_products'))):,} high-risk products / {money(inventory_watch.get('inventory_value_at_risk'))} at risk" if inventory_watch.get("available") else "Inventory watch: N/A",
+        f"Biggest inventory review: {inventory_watch.get('largest_inventory_to_sales_brand')} | {inventory_watch.get('recommended_action')}" if inventory_watch.get("available") else "Biggest inventory review: N/A",
         f"Best store: {best_store}",
         f"Top win: {(wins or ['N/A'])[0]}",
         f"Top concern: {(concerns or [biggest_concern(action_items)])[0]}",
@@ -6330,6 +7076,14 @@ def build_monthly_email_html(
     inventory_detail = "Inventory API unavailable"
     if all_metrics.get("inventory_has_data"):
         inventory_detail = f"Change {optional_signed_money(all_metrics.get('inventory_value_change'))}"
+    inventory_watch = all_metrics.get("inventory_watchlist_summary") if isinstance(all_metrics.get("inventory_watchlist_summary"), dict) else {}
+    inventory_watch_detail = "Inventory watch unavailable"
+    if inventory_watch.get("available"):
+        inventory_watch_detail = (
+            f"{int(as_float(inventory_watch.get('high_risk_brands'))):,} brands / "
+            f"{int(as_float(inventory_watch.get('high_risk_products'))):,} products | "
+            f"{money(inventory_watch.get('inventory_value_at_risk'))} at risk"
+        )
 
     kpi_rows = [
         email_metric_card("Net Revenue", money(all_metrics.get("net_revenue")), f"Best store {best_store}", HEX_GREEN),
@@ -6342,6 +7096,7 @@ def build_monthly_email_html(
         email_metric_card("Discount Rate", pct1(all_metrics.get("discount_rate")), discount_detail, "#F59E0B"),
         email_metric_card("OTD Round-Up Loss", money(all_metrics.get("tax_rounding_loss")), f"{money2(all_metrics.get('tax_rounding_avg_loss_per_transaction'))} avg / transaction", "#F59E0B"),
         email_metric_card("Ending Inventory", optional_money(all_metrics.get("inventory_end_value")), inventory_detail, "#111827"),
+        email_metric_card("Inventory Watch", str(inventory_watch.get("largest_inventory_to_sales_brand") or "N/A"), inventory_watch_detail, "#111827"),
         email_metric_card("Attachments", f"{attachment_count}", f"PDF packet + data book where included, {size_label}", HEX_YELLOW),
     ]
     kpi_table = ""
@@ -6539,10 +7294,10 @@ def detail_top_n(detail_level: str) -> int:
 
 def appendix_top_n(detail_level: str) -> int:
     if detail_level == "deep":
-        return 100
+        return 50
     if detail_level == "executive":
-        return 0
-    return 30
+        return 15
+    return 25
 
 
 def resolve_main_table_rows(detail_level: str, main_top_n: Optional[int], legacy_override: Optional[int]) -> int:
@@ -6671,6 +7426,25 @@ def main() -> None:
         inventory_start, inventory_end = load_monthly_inventory_snapshots(data_dir)
     inventory_summary = build_inventory_summary(inventory_start, inventory_end, store_scorecards)
     add_inventory_metrics(all_metrics, inventory_summary)
+    (
+        inventory_watchlist_brands,
+        inventory_watchlist_products,
+        inventory_watchlist_summary,
+        brand_pairing_audit,
+        unmatched_sales_brands,
+        unmatched_inventory_brands,
+        product_pairing_audit,
+    ) = compute_inventory_watchlist(
+        inventory_end,
+        product_summary,
+        start_day,
+        end_day,
+        warnings=warnings,
+    )
+    all_metrics["inventory_watchlist_summary"] = inventory_watchlist_summary
+    all_metrics["inventory_high_risk_products"] = inventory_watchlist_summary.get("high_risk_products", 0)
+    all_metrics["inventory_high_risk_brands"] = inventory_watchlist_summary.get("high_risk_brands", 0)
+    all_metrics["inventory_value_at_risk"] = inventory_watchlist_summary.get("inventory_value_at_risk", 0.0)
     if args.fetch_closing_summary_api or args.fetch_new_customers_api or args.fetch_closing_api:
         closing_summary = fetch_monthly_closing_summary_from_api(
             start_day=start_day,
@@ -6826,6 +7600,12 @@ def main() -> None:
         inventory_summary=inventory_summary,
         inventory_start=inventory_start,
         inventory_end=inventory_end,
+        inventory_watchlist_brands=inventory_watchlist_brands,
+        inventory_watchlist_products=inventory_watchlist_products,
+        brand_pairing_audit=brand_pairing_audit,
+        unmatched_sales_brands=unmatched_sales_brands,
+        unmatched_inventory_brands=unmatched_inventory_brands,
+        product_pairing_audit=product_pairing_audit,
         daily_metrics=all_daily,
         store_daily_detail=store_daily_detail,
         kickback_summary=kickback_summary,
@@ -6890,6 +7670,9 @@ def main() -> None:
             "tax_backout_rounddown_loss": all_metrics.get("tax_backout_rounddown_loss"),
             "tax_rounding_avg_loss_per_transaction": all_metrics.get("tax_rounding_avg_loss_per_transaction"),
             "inventory_gain_loss": all_metrics.get("inventory_value_change", "N/A"),
+            "inventory_high_risk_products": all_metrics.get("inventory_high_risk_products", 0),
+            "inventory_high_risk_brands": all_metrics.get("inventory_high_risk_brands", 0),
+            "inventory_value_at_risk": all_metrics.get("inventory_value_at_risk", 0.0),
         },
         "comparison_summary_csv": str(comparison_path),
         "insights_json": str(insights_path),
@@ -6925,6 +7708,9 @@ def main() -> None:
         new_customer_daily=new_customer_daily,
         closing_summary=closing_summary,
         inventory_summary=inventory_summary,
+        inventory_watchlist_brands=inventory_watchlist_brands,
+        inventory_watchlist_products=inventory_watchlist_products,
+        inventory_watchlist_summary=inventory_watchlist_summary,
         kickback_summary=kickback_summary,
         store_kickback_summary=store_kickback_summary,
         action_items=action_items,
@@ -6948,6 +7734,22 @@ def main() -> None:
             store_closing_summary = store_closing_summary_rows.iloc[0].to_dict() if not store_closing_summary_rows.empty else {}
             store_inventory_rows = inventory_summary[inventory_summary["store"].astype(str).str.upper() == abbr] if inventory_summary is not None and not inventory_summary.empty else pd.DataFrame()
             store_inventory = store_inventory_rows.iloc[0].to_dict() if not store_inventory_rows.empty else {}
+            (
+                store_inventory_watchlist_brands,
+                store_inventory_watchlist_products,
+                store_inventory_watchlist_summary,
+                _store_brand_pairing_audit,
+                _store_unmatched_sales_brands,
+                _store_unmatched_inventory_brands,
+                _store_product_pairing_audit,
+            ) = compute_inventory_watchlist(
+                inventory_end,
+                summaries["product"],
+                start_day,
+                end_day,
+                store=abbr,
+                warnings=None,
+            )
             store_kickback_detail = compute_kickback_summary(filter_df_date_range(bundle.raw_df, start_day, end_day))
             store_new_summary, store_new_daily = build_new_customer_summaries(
                 store_closing,
@@ -6983,6 +7785,9 @@ def main() -> None:
                 new_customer_daily=store_new_daily,
                 closing_summary_row=store_closing_summary,
                 inventory_row=store_inventory,
+                inventory_watchlist_brands=store_inventory_watchlist_brands,
+                inventory_watchlist_products=store_inventory_watchlist_products,
+                inventory_watchlist_summary=store_inventory_watchlist_summary,
                 kickback_summary=store_kickback_detail,
                 action_items=store_action_items,
                 top_n=top_n,
