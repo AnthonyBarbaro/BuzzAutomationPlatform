@@ -977,6 +977,10 @@ def optional_money(value: Any) -> str:
     return money(parsed)
 
 
+def money1(value: Any) -> str:
+    return f"${as_float(value):,.1f}"
+
+
 def optional_pct(value: Any) -> str:
     try:
         parsed = float(value)
@@ -1044,6 +1048,127 @@ def add_share_columns(df: pd.DataFrame, value_col: str, share_col: str) -> pd.Da
     out = df.copy()
     total = float(out[value_col].sum()) if value_col in out.columns and not out.empty else 0.0
     out[share_col] = out[value_col] / total if total else 0.0
+    return out
+
+
+def compute_adjusted_cart_metrics(df: pd.DataFrame, start_day: date, end_day: date) -> pd.DataFrame:
+    columns = [
+        "store",
+        "store_label",
+        "adjusted_cart_net",
+        "adjusted_cart_count",
+        "adjusted_basket",
+        "low_value_cart_count",
+        "low_value_cart_net",
+    ]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=columns)
+    date_col = find_col(df, COLUMN_CANDIDATES["date"])
+    net_col = find_col(df, COLUMN_CANDIDATES["net_sales"])
+    tx_col = find_col(df, COLUMN_CANDIDATES["transaction_id"])
+    if not date_col or not net_col:
+        return pd.DataFrame(columns=columns)
+
+    tmp = filter_df_date_range(df, start_day, end_day)
+    if tmp.empty:
+        return pd.DataFrame(columns=columns)
+    tmp["_store"] = tmp["_store"].astype(str) if "_store" in tmp.columns else "ALL"
+    tmp["_store_label"] = tmp["_store_label"].astype(str) if "_store_label" in tmp.columns else tmp["_store"]
+    tmp["_net"] = to_number(tmp[net_col]).fillna(0.0).astype(float)
+    if tx_col:
+        tmp["_cart_key"] = tmp["_store"].astype(str) + "|" + tmp[tx_col].fillna("").astype(str)
+    else:
+        tmp["_cart_key"] = tmp["_store"].astype(str) + "|" + tmp.index.astype(str)
+
+    carts = tmp.groupby(["_store", "_store_label", "_cart_key"], as_index=False).agg(cart_net=("_net", "sum"))
+    carts = carts[carts["cart_net"] >= 0.0].copy()
+    if carts.empty:
+        return pd.DataFrame(columns=columns)
+    carts["valid_for_avg_cart"] = carts["cart_net"] > 1.0
+    carts["low_value_cart"] = (carts["cart_net"] >= 0.0) & (carts["cart_net"] <= 1.0)
+    carts["valid_cart_net"] = np.where(carts["valid_for_avg_cart"], carts["cart_net"], 0.0)
+    carts["low_value_net"] = np.where(carts["low_value_cart"], carts["cart_net"], 0.0)
+
+    out = carts.groupby(["_store", "_store_label"], as_index=False).agg(
+        adjusted_cart_net=("valid_cart_net", "sum"),
+        adjusted_cart_count=("valid_for_avg_cart", "sum"),
+        low_value_cart_count=("low_value_cart", "sum"),
+        low_value_cart_net=("low_value_net", "sum"),
+    ).rename(columns={"_store": "store", "_store_label": "store_label"})
+    out["adjusted_basket"] = out["adjusted_cart_net"] / out["adjusted_cart_count"].replace({0: np.nan})
+    return out[columns].fillna(0.0).sort_values("store")
+
+
+def apply_adjusted_cart_metrics(
+    all_metrics: Dict[str, Any],
+    bundles: Dict[str, StoreBundle],
+    adjusted_cart_metrics: pd.DataFrame,
+) -> None:
+    if adjusted_cart_metrics is None or adjusted_cart_metrics.empty:
+        return
+    total_net = as_float(adjusted_cart_metrics["adjusted_cart_net"].sum())
+    total_count = as_float(adjusted_cart_metrics["adjusted_cart_count"].sum())
+    all_metrics["basket_raw_including_low_value_carts"] = all_metrics.get("basket")
+    all_metrics["basket"] = total_net / total_count if total_count else as_float(all_metrics.get("basket"))
+    all_metrics["adjusted_cart_count"] = total_count
+    all_metrics["low_value_cart_count_excluded_from_basket"] = as_float(adjusted_cart_metrics["low_value_cart_count"].sum())
+    all_metrics["low_value_cart_net_excluded_from_basket"] = as_float(adjusted_cart_metrics["low_value_cart_net"].sum())
+
+    by_store = {str(row["store"]).upper(): row for _, row in adjusted_cart_metrics.iterrows()}
+    for abbr, bundle in bundles.items():
+        row = by_store.get(str(abbr).upper())
+        if row is None:
+            continue
+        bundle.metrics["basket_raw_including_low_value_carts"] = bundle.metrics.get("basket")
+        bundle.metrics["basket"] = as_float(row.get("adjusted_basket"), as_float(bundle.metrics.get("basket")))
+        bundle.metrics["adjusted_cart_count"] = as_float(row.get("adjusted_cart_count"))
+        bundle.metrics["low_value_cart_count_excluded_from_basket"] = as_float(row.get("low_value_cart_count"))
+        bundle.metrics["low_value_cart_net_excluded_from_basket"] = as_float(row.get("low_value_cart_net"))
+
+
+def apply_adjusted_basket_to_budtenders(
+    raw_df: pd.DataFrame,
+    budtender_summary: pd.DataFrame,
+    start_day: date,
+    end_day: date,
+) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty or budtender_summary is None or budtender_summary.empty:
+        return budtender_summary
+    employee_col = find_col(raw_df, COLUMN_CANDIDATES["employee"])
+    tx_col = find_col(raw_df, COLUMN_CANDIDATES["transaction_id"])
+    net_col = find_col(raw_df, COLUMN_CANDIDATES["net_sales"])
+    date_col = find_col(raw_df, COLUMN_CANDIDATES["date"])
+    if not employee_col or not net_col or not date_col:
+        return budtender_summary
+    tmp = filter_df_date_range(raw_df, start_day, end_day)
+    if tmp.empty:
+        return budtender_summary
+    tmp["_budtender"] = tmp[employee_col].fillna("Unknown").astype(str)
+    tmp["_net"] = to_number(tmp[net_col]).fillna(0.0).astype(float)
+    if tx_col:
+        store_part = tmp["_store"].astype(str) if "_store" in tmp.columns else pd.Series("STORE", index=tmp.index)
+        tmp["_cart_key"] = store_part + "|" + tmp[tx_col].fillna("").astype(str)
+    else:
+        tmp["_cart_key"] = tmp.index.astype(str)
+    carts = tmp.groupby(["_budtender", "_cart_key"], as_index=False).agg(cart_net=("_net", "sum"))
+    carts = carts[carts["cart_net"] >= 0.0].copy()
+    if carts.empty:
+        return budtender_summary
+    carts["valid_for_avg_cart"] = carts["cart_net"] > 1.0
+    carts["low_value_cart"] = (carts["cart_net"] >= 0.0) & (carts["cart_net"] <= 1.0)
+    carts["valid_cart_net"] = np.where(carts["valid_for_avg_cart"], carts["cart_net"], 0.0)
+    adjusted = carts.groupby("_budtender", as_index=False).agg(
+        adjusted_cart_net=("valid_cart_net", "sum"),
+        adjusted_cart_count=("valid_for_avg_cart", "sum"),
+        low_value_cart_count=("low_value_cart", "sum"),
+    ).rename(columns={"_budtender": "budtender"})
+    adjusted["adjusted_basket"] = adjusted["adjusted_cart_net"] / adjusted["adjusted_cart_count"].replace({0: np.nan})
+    out = budtender_summary.copy()
+    out = out.merge(adjusted, on="budtender", how="left")
+    out["basket_raw_including_low_value_carts"] = out.get("basket")
+    out["basket"] = pd.to_numeric(out["adjusted_basket"], errors="coerce").fillna(pd.to_numeric(out.get("basket"), errors="coerce").fillna(0.0))
+    for col in ["adjusted_cart_net", "adjusted_cart_count", "low_value_cart_count"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
     return out
 
 
@@ -1359,6 +1484,14 @@ def apply_tax_rounding_metrics(
     all_metrics["tax_rounding_transactions"] = total_transactions
     all_metrics["tax_rounding_avg_loss_per_transaction"] = total_loss / total_transactions if total_transactions else 0.0
     all_metrics["tax_rounding_loss_rate"] = total_loss / total_net if total_net else 0.0
+    all_metrics["profit_real_before_tax_rounding_loss"] = all_metrics.get("profit_real")
+    all_metrics["profit_before_tax_rounding_loss"] = all_metrics.get("profit")
+    if total_loss:
+        all_metrics["profit_real"] = as_float(all_metrics.get("profit_real")) - total_loss
+        all_metrics["profit"] = as_float(all_metrics.get("profit")) - total_loss
+        net_revenue = as_float(all_metrics.get("net_revenue"))
+        all_metrics["margin_real"] = all_metrics["profit_real"] / net_revenue if net_revenue else 0.0
+        all_metrics["margin"] = all_metrics["profit"] / net_revenue if net_revenue else 0.0
 
     if store_scorecards is None or store_scorecards.empty:
         return store_scorecards
@@ -1401,7 +1534,75 @@ def apply_tax_rounding_metrics(
         "tax_rounding_net_revenue_analyzed",
     ]:
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    out["profit_real_before_tax_rounding_loss"] = out.get("profit_real")
+    out["profit_before_tax_rounding_loss"] = out.get("profit")
+    if "profit_real" in out.columns:
+        out["profit_real"] = pd.to_numeric(out["profit_real"], errors="coerce").fillna(0.0) - out["tax_rounding_loss"]
+    if "profit" in out.columns:
+        out["profit"] = pd.to_numeric(out["profit"], errors="coerce").fillna(0.0) - out["tax_rounding_loss"]
+    if "net_revenue" in out.columns:
+        net = pd.to_numeric(out["net_revenue"], errors="coerce").replace({0: np.nan})
+        out["margin_real"] = out["profit_real"] / net if "profit_real" in out.columns else out.get("margin_real", 0.0)
+        out["margin"] = out["profit"] / net if "profit" in out.columns else out.get("margin", 0.0)
+        out[["margin_real", "margin"]] = out[["margin_real", "margin"]].fillna(0.0)
+    total_profit = as_float(all_metrics.get("profit"))
+    if total_profit and "profit" in out.columns:
+        out["profit_share"] = out["profit"] / total_profit
+    out["status"] = out.apply(lambda row: generate_store_status(row.to_dict(), all_metrics), axis=1)
     return out
+
+
+def sync_bundle_metrics_from_scorecards(bundles: Dict[str, StoreBundle], store_scorecards: pd.DataFrame) -> None:
+    if store_scorecards is None or store_scorecards.empty:
+        return
+    for _, row in store_scorecards.iterrows():
+        abbr = str(row.get("store", "")).upper()
+        if abbr not in bundles:
+            continue
+        for key, value in row.to_dict().items():
+            if key in {"store", "store_label"}:
+                continue
+            bundles[abbr].metrics[key] = value
+
+
+def apply_tax_rounding_to_daily_detail(
+    all_daily: pd.DataFrame,
+    bundles: Dict[str, StoreBundle],
+    tax_rounding_daily: pd.DataFrame,
+) -> pd.DataFrame:
+    if tax_rounding_daily is None or tax_rounding_daily.empty or "tax_rounding_loss" not in tax_rounding_daily.columns:
+        return all_daily
+
+    def adjust_daily(daily: pd.DataFrame, losses: pd.DataFrame) -> pd.DataFrame:
+        if daily is None or daily.empty:
+            return daily
+        out = daily.copy()
+        out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
+        loss_by_day = losses.copy()
+        loss_by_day["date"] = pd.to_datetime(loss_by_day["date"], errors="coerce").dt.date
+        loss_by_day = loss_by_day.groupby("date", as_index=False).agg(tax_rounding_loss=("tax_rounding_loss", "sum"))
+        out = out.merge(loss_by_day, on="date", how="left")
+        out["tax_rounding_loss"] = pd.to_numeric(out["tax_rounding_loss"], errors="coerce").fillna(0.0)
+        out["profit_real_before_tax_rounding_loss"] = out.get("profit_real", 0.0)
+        out["profit_before_tax_rounding_loss"] = out.get("profit", 0.0)
+        if "profit_real" in out.columns:
+            out["profit_real"] = pd.to_numeric(out["profit_real"], errors="coerce").fillna(0.0) - out["tax_rounding_loss"]
+        if "profit" in out.columns:
+            out["profit"] = pd.to_numeric(out["profit"], errors="coerce").fillna(0.0) - out["tax_rounding_loss"]
+        net = pd.to_numeric(out.get("net_revenue", 0.0), errors="coerce").replace({0: np.nan})
+        if "profit_real" in out.columns:
+            out["margin_real"] = (out["profit_real"] / net).fillna(0.0)
+        if "profit" in out.columns:
+            out["margin"] = (out["profit"] / net).fillna(0.0)
+        return out
+
+    adjusted_all = adjust_daily(all_daily, tax_rounding_daily)
+    for abbr, bundle in bundles.items():
+        store_losses = tax_rounding_daily[tax_rounding_daily["store"].astype(str).str.upper() == str(abbr).upper()].copy()
+        if store_losses.empty:
+            continue
+        bundle.daily_df = adjust_daily(bundle.daily_df, store_losses)
+    return adjusted_all
 
 
 def is_excluded_product_name(value: Any) -> bool:
@@ -2123,6 +2324,37 @@ def add_closing_summary_metrics(all_metrics: Dict[str, Any], closing_summary: pd
         all_metrics["closing_gross_profit"] / all_metrics["closing_net_sales"]
         if all_metrics.get("closing_net_sales") else 0.0
     )
+    all_metrics["closing_new_customer_rate"] = (
+        all_metrics["closing_new_customers"] / all_metrics["closing_customers"]
+        if all_metrics.get("closing_customers") else 0.0
+    )
+    all_metrics["new_customer_rate"] = all_metrics["closing_new_customer_rate"]
+
+
+def apply_closing_summary_to_scorecards(store_scorecards: pd.DataFrame, closing_summary: pd.DataFrame) -> pd.DataFrame:
+    if store_scorecards is None or store_scorecards.empty or closing_summary is None or closing_summary.empty:
+        return store_scorecards
+    needed = ["store", "customer_count", "new_customer_count", "transaction_count", "average_cart_net_sales"]
+    available = [col for col in needed if col in closing_summary.columns]
+    if "store" not in available:
+        return store_scorecards
+    closing = closing_summary[available].copy()
+    rename_map = {
+        "customer_count": "closing_customers",
+        "new_customer_count": "closing_new_customers",
+        "transaction_count": "closing_transactions",
+        "average_cart_net_sales": "closing_average_cart_net_sales",
+    }
+    closing = closing.rename(columns=rename_map)
+    out = store_scorecards.copy()
+    out = out.merge(closing, on="store", how="left")
+    for col in ["closing_customers", "closing_new_customers", "closing_transactions", "closing_average_cart_net_sales"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    if {"closing_new_customers", "closing_customers"}.issubset(out.columns):
+        out["closing_new_customer_rate"] = out["closing_new_customers"] / out["closing_customers"].replace({0: np.nan})
+        out["closing_new_customer_rate"] = out["closing_new_customer_rate"].fillna(0.0)
+    return out
 
 
 def fetch_new_customer_profiles_from_api(
@@ -2537,14 +2769,68 @@ def build_new_customer_summaries(closing_df: pd.DataFrame, store_scorecards: pd.
     return summary.sort_values("new_customers", ascending=False), daily
 
 
+def combine_unique_text(values: pd.Series, max_items: int = 4) -> str:
+    seen: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text.lower() in {"nan", "none"}:
+            continue
+        if text not in seen:
+            seen.append(text)
+    if not seen:
+        return "N/A"
+    if len(seen) <= max_items:
+        return ", ".join(seen)
+    return ", ".join(seen[:max_items]) + f" +{len(seen) - max_items} more"
+
+
+def combine_unique_money2(values: pd.Series, max_items: int = 4) -> str:
+    cleaned = pd.to_numeric(values, errors="coerce").dropna().round(4).unique().tolist()
+    cleaned = sorted(float(value) for value in cleaned)
+    if not cleaned:
+        return "N/A"
+    labels = [money2(value) for value in cleaned[:max_items]]
+    if len(cleaned) > max_items:
+        labels.append(f"+{len(cleaned) - max_items} more")
+    return ", ".join(labels)
+
+
+def add_deal_performance_signal(out: pd.DataFrame) -> pd.DataFrame:
+    if out is None or out.empty:
+        return out
+    result = out.copy()
+    company_real_margin = (
+        as_float(result["profit_real"].sum()) / as_float(result["net_revenue"].sum())
+        if "profit_real" in result.columns and "net_revenue" in result.columns and as_float(result["net_revenue"].sum())
+        else 0.0
+    )
+
+    def signal(row: pd.Series) -> str:
+        margin_real = as_float(row.get("margin_real"))
+        margin = as_float(row.get("margin"))
+        revenue = as_float(row.get("net_revenue"))
+        if revenue <= 0:
+            return "No revenue"
+        if margin_real < 0:
+            return "Negative real margin"
+        if company_real_margin and margin_real < company_real_margin - 0.05:
+            return "Below deal avg"
+        if margin - margin_real >= 0.10 and margin_real < company_real_margin:
+            return "Kickback-dependent"
+        return "Healthy"
+
+    result["deal_signal"] = result.apply(signal, axis=1)
+    return result
+
+
 def compute_kickback_summary(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "_deal_kickback_amt" not in df.columns:
-        return pd.DataFrame(columns=["brand", "rule", "discount_rule", "net_revenue", "generated_profit", "profit_real", "kickback", "profit", "margin_real", "margin"])
+        return pd.DataFrame(columns=["brand", "rule", "discount_rule", "discount_rule_display", "stores", "store_count", "rule_count", "net_revenue", "generated_profit", "profit_real", "kickback", "profit", "margin_real", "margin", "margin_lift", "deal_signal"])
     tmp = df.copy()
     tmp["_kickback"] = to_number(tmp["_deal_kickback_amt"]).fillna(0).astype(float)
     tmp = tmp[tmp["_kickback"] > 0].copy()
     if tmp.empty:
-        return pd.DataFrame(columns=["brand", "rule", "discount_rule", "net_revenue", "generated_profit", "profit_real", "kickback", "profit", "margin_real", "margin"])
+        return pd.DataFrame(columns=["brand", "rule", "discount_rule", "discount_rule_display", "stores", "store_count", "rule_count", "net_revenue", "generated_profit", "profit_real", "kickback", "profit", "margin_real", "margin", "margin_lift", "deal_signal"])
     net_col = find_col(tmp, COLUMN_CANDIDATES["net_sales"])
     profit_col = find_col(tmp, COLUMN_CANDIDATES["profit"])
     cogs_col = find_col(tmp, COLUMN_CANDIDATES["cogs"])
@@ -2554,17 +2840,26 @@ def compute_kickback_summary(df: pd.DataFrame) -> pd.DataFrame:
     tmp["_deal_brand"] = tmp.get("_deal_brand", "Unknown")
     tmp["_deal_rule"] = tmp.get("_deal_rule", "Unknown")
     tmp["_deal_discount"] = tmp.get("_deal_discount", 0.0)
+    tmp["_store"] = tmp["_store"].astype(str) if "_store" in tmp.columns else "ALL"
 
-    out = tmp.groupby(["_deal_brand", "_deal_rule", "_deal_discount"], as_index=False).agg(
+    out = tmp.groupby("_deal_brand", as_index=False).agg(
         net_revenue=("_net", "sum"),
         profit_real=("_profit_real", "sum"),
         kickback=("_kickback", "sum"),
         profit=("_profit", "sum"),
-    ).rename(columns={"_deal_brand": "brand", "_deal_rule": "rule", "_deal_discount": "discount_rule"})
+        rule=("_deal_rule", combine_unique_text),
+        rule_count=("_deal_rule", lambda s: len({str(v).strip() for v in s if str(v).strip() and str(v).lower() != "nan"})),
+        discount_rule=("_deal_discount", "mean"),
+        discount_rule_display=("_deal_discount", combine_unique_money2),
+        stores=("_store", combine_unique_text),
+        store_count=("_store", lambda s: len({str(v).strip() for v in s if str(v).strip() and str(v).lower() != "nan"})),
+    ).rename(columns={"_deal_brand": "brand"})
     out["margin_real"] = out["profit_real"] / out["net_revenue"].replace({0: np.nan})
     out["margin"] = out["profit"] / out["net_revenue"].replace({0: np.nan})
+    out["margin_lift"] = out["margin"] - out["margin_real"]
     out["generated_profit"] = out["profit"]
-    return out.fillna(0.0).sort_values("generated_profit", ascending=False)
+    out = add_deal_performance_signal(out.fillna(0.0))
+    return out.sort_values("generated_profit", ascending=False)
 
 
 def best_worst_day(daily: pd.DataFrame) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -2689,7 +2984,7 @@ def generate_owner_action_items(
             items.append({
                 "severity": "Medium",
                 "issue": f"{row['store']} basket is below company average",
-                "metric_value": f"{money(row['basket'])} vs {money(company_basket)}",
+                "metric_value": f"{money1(row['basket'])} vs {money1(company_basket)}",
                 "recommended_action": "Consider add-on prompts, bundles, and basket coaching.",
             })
 
@@ -2901,7 +3196,7 @@ def chart_kpi_comparison_strip(all_metrics: Dict[str, Any]) -> BytesIO:
         ("Profit", "profit", "money"),
         ("Real Margin", "margin_real", "pct"),
         ("Tickets", "tickets", "int"),
-        ("Basket", "basket", "money"),
+        ("Avg Cart", "basket", "money1"),
         ("Discount", "discount_rate", "pct"),
     ]
     labels: List[str] = []
@@ -3305,6 +3600,8 @@ def df_rows(
                 rendered.append(optional_signed_money(value))
             elif kind == "money2":
                 rendered.append(money2(as_float(value)))
+            elif kind == "money1":
+                rendered.append(money1(value))
             elif kind == "pct":
                 rendered.append("N/A" if pd.isna(value) else pct1(as_float(value)))
             elif kind == "pct_optional":
@@ -3378,7 +3675,7 @@ def build_long_table(
         ("TEXTCOLOR", (0, 0), (-1, 0), BUZZ["yellow"]),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 0), (-1, 0), 6.9),
+        ("FONTSIZE", (0, 0), (-1, 0), 6.4),
         ("FONTSIZE", (0, 1), (-1, -1), 6.7),
         ("LEADING", (0, 0), (-1, -1), 7.7),
         ("GRID", (0, 0), (-1, -1), 0.25, BUZZ["border"]),
@@ -3485,6 +3782,8 @@ def compute_kickback_detail_by_store(df: pd.DataFrame) -> pd.DataFrame:
         "brand",
         "rule",
         "discount_rule",
+        "discount_rule_display",
+        "rule_count",
         "net_revenue",
         "generated_profit",
         "profit_real",
@@ -3493,6 +3792,7 @@ def compute_kickback_detail_by_store(df: pd.DataFrame) -> pd.DataFrame:
         "margin_real",
         "margin",
         "margin_lift",
+        "deal_signal",
     ]
     if df is None or df.empty or "_deal_kickback_amt" not in df.columns:
         return pd.DataFrame(columns=columns)
@@ -3514,23 +3814,26 @@ def compute_kickback_detail_by_store(df: pd.DataFrame) -> pd.DataFrame:
     tmp["_deal_brand"] = tmp.get("_deal_brand", "Unknown")
     tmp["_deal_rule"] = tmp.get("_deal_rule", "Unknown")
     tmp["_deal_discount"] = tmp.get("_deal_discount", 0.0)
-    out = tmp.groupby(["_store", "_store_label", "_deal_brand", "_deal_rule", "_deal_discount"], as_index=False).agg(
+    out = tmp.groupby(["_store", "_store_label", "_deal_brand"], as_index=False).agg(
         net_revenue=("_net", "sum"),
         profit_real=("_profit_real", "sum"),
         kickback=("_kickback", "sum"),
         profit=("_profit", "sum"),
+        rule=("_deal_rule", combine_unique_text),
+        rule_count=("_deal_rule", lambda s: len({str(v).strip() for v in s if str(v).strip() and str(v).lower() != "nan"})),
+        discount_rule=("_deal_discount", "mean"),
+        discount_rule_display=("_deal_discount", combine_unique_money2),
     ).rename(columns={
         "_store": "store",
         "_store_label": "store_label",
         "_deal_brand": "brand",
-        "_deal_rule": "rule",
-        "_deal_discount": "discount_rule",
     })
     out["generated_profit"] = out["profit"]
     out["margin_real"] = out["profit_real"] / out["net_revenue"].replace({0: np.nan})
     out["margin"] = out["profit"] / out["net_revenue"].replace({0: np.nan})
     out["margin_lift"] = out["margin"] - out["margin_real"]
-    return out.fillna(0.0).sort_values(["store", "generated_profit"], ascending=[True, False])
+    out = add_deal_performance_signal(out.fillna(0.0))
+    return out.sort_values(["store", "generated_profit"], ascending=[True, False])
 
 
 def add_full_daily_detail_section(
@@ -3551,7 +3854,7 @@ def add_full_daily_detail_section(
         ("profit", "Profit", "money"),
         ("profit_real", "Real Profit", "money"),
         ("tickets", "Tickets", "int"),
-        ("basket", "Basket", "money"),
+        ("basket", "Avg Cart", "money1"),
         ("discount", "Discounts", "money"),
         ("discount_rate", "Disc Rate", "pct"),
         ("margin_real", "Real Margin", "pct"),
@@ -3572,6 +3875,7 @@ def add_full_new_customer_daily_section(
     title: str,
     store: Optional[str] = None,
     authoritative_total: Optional[float] = None,
+    authoritative_customers: Optional[float] = None,
 ) -> Dict[str, int]:
     detail = complete_new_customer_daily_df(daily, start_day, end_day, store=store)
     expected_days = len(date_range_days(start_day, end_day)) if detail is not None and not detail.empty else 0
@@ -3591,19 +3895,26 @@ def add_full_new_customer_daily_section(
         widths.append(2.7 * inch)
     append_long_table(story, title, detail, columns, widths, styles, row_limit=None)
     total_new_customers = int(round(as_float(detail["new_customers"].sum()))) if "new_customers" in detail.columns else 0
+    total_customers = int(round(as_float(detail["total_customers"].sum()))) if "total_customers" in detail.columns else 0
     story.append(Paragraph(f"Days shown: {len(detail)} of {expected_days}", styles["Tiny"]))
     if authoritative_total is not None and not is_missing_display(authoritative_total):
         official_total = int(round(as_float(authoritative_total)))
         story.append(Paragraph(f"<b>Total new customers this month: {official_total:,}</b>", styles["Small"]))
+        if authoritative_customers is not None and not is_missing_display(authoritative_customers):
+            official_customers = int(round(as_float(authoritative_customers)))
+            official_rate = official_total / official_customers if official_customers else 0.0
+            story.append(Paragraph(f"<b>Total customers this month: {official_customers:,} | New customer rate: {pct1(official_rate)}</b>", styles["Small"]))
         if abs(official_total - total_new_customers) >= 1:
             diff = official_total - total_new_customers
             sign = "+" if diff > 0 else ""
             story.append(Paragraph(
-                f"Daily row sum: {total_new_customers:,} | Full-window closing report difference: {sign}{diff:,}",
+                f"Daily row sum: {total_new_customers:,} new customers / {total_customers:,} total customers | Full-window closing report difference: {sign}{diff:,}",
                 styles["Tiny"],
             ))
     else:
         story.append(Paragraph(f"<b>Total new customers this month: {total_new_customers:,}</b>", styles["Small"]))
+        if total_customers:
+            story.append(Paragraph(f"<b>Total customers this month: {total_customers:,} | New customer rate: {pct1(total_new_customers / total_customers)}</b>", styles["Small"]))
     return {"expected": expected_days, "rendered": len(detail)}
 
 
@@ -3647,21 +3958,22 @@ def add_full_kickback_detail_section(
     widths: List[float] = []
     if include_store:
         columns.append(("store", "Store", "text"))
-        widths.append(0.38 * inch)
+        widths.append(0.42 * inch)
+    elif "stores" in detail.columns:
+        columns.append(("stores", "Stores", "textwrap"))
+        widths.append(0.58 * inch)
     columns.extend([
         ("brand", "Brand", "textwrap"),
-        ("rule", "Rule", "textwrap"),
-        ("discount_rule", "Discount Rule", "money2"),
+        ("rule", "Rules Combined", "textwrap"),
         ("net_revenue", "Revenue", "money"),
-        ("generated_profit", "Generated Profit", "money"),
-        ("profit_real", "Profit Before", "money"),
+        ("generated_profit", "Gen Profit", "money"),
+        ("profit_real", "Real Profit", "money"),
         ("kickback", "Kickback", "money"),
-        ("profit", "Profit After", "money"),
-        ("margin_real", "Real Margin", "pct"),
-        ("margin", "KB Margin", "pct"),
-        ("margin_lift", "Margin Lift", "pp"),
+        ("margin_real", "Real M", "pct"),
+        ("margin", "KB M", "pct"),
+        ("deal_signal", "Signal", "textwrap"),
     ])
-    widths.extend([0.65 * inch, 0.82 * inch, 0.48 * inch, 0.62 * inch, 0.64 * inch, 0.62 * inch, 0.52 * inch, 0.62 * inch, 0.45 * inch, 0.45 * inch, 0.45 * inch])
+    widths.extend([1.0 * inch, 1.1 * inch, 0.78 * inch, 0.78 * inch, 0.78 * inch, 0.65 * inch, 0.48 * inch, 0.48 * inch, 0.8 * inch])
     append_long_table(story, f"{title} Rows", detail, columns, widths, styles, row_limit=None)
     story.append(Paragraph(f"Kickback rows shown: {len(detail)} of {len(detail)}", styles["Tiny"]))
     return {"expected": len(detail), "rendered": len(detail)}
@@ -3671,7 +3983,7 @@ def add_detail_appendix_index(story: List[Any], styles: Dict[str, Any], include_
     rows = [
         ["Appendix A", "Full Daily Detail"],
         ["Appendix B", "Full New Customer Detail" if include_new_customer else "New Customer Detail: unavailable"],
-        ["Appendix C", "Full Kickback / Deal Detail"],
+        ["Appendix C", "Combined Kickback / Deal Brand Detail"],
         ["Appendix D", "Category Detail"],
         ["Appendix E", "Brand Detail"],
         ["Appendix F", "Budtender Detail"],
@@ -3691,7 +4003,7 @@ def add_report_sections_card(story: List[Any], styles: Dict[str, Any], is_store:
         "5. Store Health" if is_store else "5. Discount / Inventory / Staff Health",
         "6. Appendix A: Daily Detail",
         "7. Appendix B: New Customers",
-        "8. Appendix C: Kickbacks",
+        "8. Appendix C: Combined Deal Brands",
         "9. Appendix D-G: Detail Tables",
     ]
     rows = [[Paragraph(escape_html(item), styles["Small"])] for item in sections]
@@ -4057,6 +4369,8 @@ def format_metric_value(value: Any, kind: str) -> str:
             return optional_signed_money(value)
         if kind == "money2":
             return money2(value)
+        if kind == "money1":
+            return money1(value)
         if kind == "int":
             return f"{int(round(as_float(value))):,}"
         if kind == "pct":
@@ -4291,8 +4605,10 @@ def build_executive_metric_cards(all_metrics: Dict[str, Any], styles: Dict[str, 
         ("Real Profit", "profit_real", "money"),
         ("Real Margin", "margin_real", "pct"),
         ("Tickets", "tickets", "int"),
-        ("Basket", "basket", "money"),
+        ("Avg Cart >$1", "basket", "money1"),
+        ("Customers", "closing_customers", "int"),
         ("New Customers", "closing_new_customers", "int"),
+        ("New Cust %", "closing_new_customer_rate", "pct"),
         ("Ending Inventory", "inventory_end_value", "money"),
         ("Discount Rate", "discount_rate", "pct"),
         ("OTD Round-Up Loss", "tax_rounding_loss", "money"),
@@ -4597,11 +4913,17 @@ def generate_discount_margin_insights(all_metrics: Dict[str, Any], store_scoreca
 def generate_customer_growth_insights(new_customer_summary: pd.DataFrame, new_customer_daily: pd.DataFrame, all_metrics: Dict[str, Any]) -> List[str]:
     if new_customer_summary is None or new_customer_summary.empty:
         if all_metrics.get("closing_summary_has_data"):
-            return [f"Closing reports show {int(as_float(all_metrics.get('closing_new_customers'))):,} new customers this month."]
+            return [
+                f"Closing reports show {int(as_float(all_metrics.get('closing_customers'))):,} customers and {int(as_float(all_metrics.get('closing_new_customers'))):,} new customers ({pct1(all_metrics.get('closing_new_customer_rate'))})."
+            ]
         return ["New-customer data was not available; run with --fetch-closing-summary-api or --fetch-new-customers-api."]
     insights = []
+    if all_metrics.get("closing_summary_has_data"):
+        insights.append(
+            f"Closing reports show {int(as_float(all_metrics.get('closing_customers'))):,} customers and {int(as_float(all_metrics.get('closing_new_customers'))):,} new customers ({pct1(all_metrics.get('closing_new_customer_rate'))})."
+        )
     total_new = as_float(new_customer_summary["new_customers"].sum())
-    insights.append(f"Stores gained {int(total_new):,} new customers in the daily customer-growth data.")
+    insights.append(f"Daily customer-growth rows total {int(total_new):,} new customers.")
     top = new_customer_summary.sort_values("new_customers", ascending=False).iloc[0]
     insights.append(f"{top['store']} led new-customer growth with {int(as_float(top['new_customers'])):,}.")
     if new_customer_daily is not None and not new_customer_daily.empty:
@@ -4633,7 +4955,7 @@ def generate_staff_coaching_insights(budtender_summary: pd.DataFrame) -> List[st
     basket = budtender_summary[budtender_summary["tickets"] >= 25].sort_values("basket", ascending=False) if "tickets" in budtender_summary.columns else pd.DataFrame()
     if not basket.empty:
         row = basket.iloc[0]
-        insights.append(f"Strong basket performance: {money(row['basket'])} average basket across {int(as_float(row['tickets'])):,} tickets.")
+        insights.append(f"Strong basket performance: {money1(row['basket'])} average basket across {int(as_float(row['tickets'])):,} tickets.")
     discount = budtender_summary[budtender_summary["tickets"] >= 25].sort_values("discount_rate", ascending=False) if "discount_rate" in budtender_summary.columns else pd.DataFrame()
     if not discount.empty:
         row = discount.iloc[0]
@@ -4730,7 +5052,7 @@ def build_all_stores_pdf(
             "date_range_days": days,
             "daily_rows_expected": days,
             "daily_rows_rendered": 0,
-            "kickback_rows_expected": len(all_kickback_detail) if all_kickback_detail is not None else 0,
+            "kickback_rows_expected": len(kickback_summary) if kickback_summary is not None else 0,
             "kickback_rows_rendered": 0,
             "new_customer_days_expected": 0,
             "new_customer_days_rendered": 0,
@@ -4747,9 +5069,10 @@ def build_all_stores_pdf(
         ("Profit", all_metrics.get("profit"), all_metrics.get("previous_month_profit", "N/A"), "money", "profit"),
         ("Real Margin", all_metrics.get("margin_real"), all_metrics.get("previous_month_margin_real", "N/A"), "pct", "margin_real"),
         ("Tickets", all_metrics.get("tickets"), all_metrics.get("previous_month_tickets", "N/A"), "int", "tickets"),
-        ("Basket", all_metrics.get("basket"), all_metrics.get("previous_month_basket", "N/A"), "money", "basket"),
+        ("Avg Cart >$1", all_metrics.get("basket"), all_metrics.get("previous_month_basket", "N/A"), "money1", "basket"),
         ("Discount Rate", all_metrics.get("discount_rate"), all_metrics.get("previous_month_discount_rate", "N/A"), "pct", "discount_rate"),
         ("New Customers", first_available_metric(all_metrics, ["closing_new_customers", "new_customers"]), all_metrics.get("previous_month_closing_new_customers", "N/A"), "int", "closing_new_customers"),
+        ("New Customer %", all_metrics.get("closing_new_customer_rate"), all_metrics.get("previous_month_closing_new_customer_rate", "N/A"), "pct", "closing_new_customer_rate"),
         ("Ending Inventory", all_metrics.get("inventory_end_value"), all_metrics.get("previous_month_inventory_end_value", "N/A"), "money", "inventory_end_value"),
     ]
     story.append(build_comparison_panel(styles, comparison_rows))
@@ -4891,6 +5214,15 @@ def build_all_stores_pdf(
 
     add_compact_header(story, styles, "All Stores", month_key, start_day, end_day, generated_at)
     add_section_title(story, styles, "Customer Growth + Cart Behavior", "New customers, cart mix, and low-value cart risk.")
+    customer_rows = [
+        ["Total Customers", f"{int(as_float(all_metrics.get('closing_customers'))):,}" if all_metrics.get("closing_summary_has_data") else "N/A"],
+        ["New Customers", f"{int(as_float(all_metrics.get('closing_new_customers'))):,}" if all_metrics.get("closing_summary_has_data") else "N/A"],
+        ["New Customer %", pct1(all_metrics.get("closing_new_customer_rate")) if all_metrics.get("closing_summary_has_data") else "N/A"],
+        ["Avg Cart > $1", money1(all_metrics.get("basket"))],
+        ["$0-$1 Carts Excluded", f"{int(as_float(all_metrics.get('low_value_cart_count_excluded_from_basket'))):,}"],
+    ]
+    story.append(build_table(["Customer / Cart Metric", "Value"], customer_rows, [2.45 * inch, 2.0 * inch]))
+    story.append(Spacer(1, 0.06 * inch))
     build_insight_cards(story, styles, "Customer Signals", generate_customer_growth_insights(new_customer_summary, new_customer_daily, all_metrics), max_items=3)
     if new_customer_daily is not None and not new_customer_daily.empty:
         add_chart(story, chart_new_customer_trend(new_customer_daily), height=2.25 * inch)
@@ -4931,18 +5263,37 @@ def build_all_stores_pdf(
     add_df_table(
         story,
         styles,
-        store_kickback_summary,
+        kickback_summary.sort_values("generated_profit", ascending=False) if kickback_summary is not None and not kickback_summary.empty and "generated_profit" in kickback_summary.columns else kickback_summary,
         [
-            ("store", "Store", "text"),
+            ("brand", "Deal Brand", "textwrap"),
+            ("stores", "Stores", "textwrap"),
+            ("rule", "Rules", "textwrap"),
+            ("generated_profit", "Gen Profit", "money"),
+            ("margin_real", "Real M", "pct"),
+            ("margin", "KB M", "pct"),
             ("kickback", "Kickback", "money"),
-            ("profit_before_kickback", "Profit Before", "money"),
-            ("profit_after_kickback", "Profit After", "money"),
-            ("margin_lift_pp", "Margin Lift", "pp"),
-            ("top_deal_brand", "Top Deal Brand", "textwrap"),
+            ("deal_signal", "Signal", "textwrap"),
         ],
         max_rows=min(top_n, 10),
-        col_widths=[0.55 * inch, 0.88 * inch, 1.0 * inch, 1.0 * inch, 0.78 * inch, 1.45 * inch],
+        col_widths=[1.2 * inch, 0.62 * inch, 1.2 * inch, 0.82 * inch, 0.5 * inch, 0.5 * inch, 0.72 * inch, 0.95 * inch],
     )
+    if kickback_summary is not None and not kickback_summary.empty and "margin_real" in kickback_summary.columns:
+        review_deals = kickback_summary.sort_values(["margin_real", "net_revenue"], ascending=[True, False])
+        add_df_table(
+            story,
+            styles,
+            review_deals,
+            [
+                ("brand", "Lowest-Margin Deal Brands", "textwrap"),
+                ("net_revenue", "Revenue", "money"),
+                ("profit_real", "Real Profit", "money"),
+                ("kickback", "Kickback", "money"),
+                ("margin_real", "Real M", "pct"),
+                ("deal_signal", "Signal", "textwrap"),
+            ],
+            max_rows=min(top_n, 8),
+            col_widths=[1.55 * inch, 0.9 * inch, 0.9 * inch, 0.78 * inch, 0.56 * inch, 1.15 * inch],
+        )
     if store_scorecards is not None and not store_scorecards.empty and "tax_rounding_loss" in store_scorecards.columns:
         add_df_table(
             story,
@@ -4999,7 +5350,7 @@ def build_all_stores_pdf(
         ],
         [
             Paragraph("<b>Strong Basket Performance</b>", styles["InsightTitle"]),
-            build_table(*df_rows(top_basket, [("budtender", "Budtender", "textwrap"), ("basket", "Basket", "money"), ("tickets", "Tickets", "int")], min(top_n, 10), styles), col_widths=[1.75 * inch, 0.75 * inch, 0.62 * inch]),
+            build_table(*df_rows(top_basket, [("budtender", "Budtender", "textwrap"), ("basket", "Avg Cart", "money1"), ("tickets", "Tickets", "int")], min(top_n, 10), styles), col_widths=[1.75 * inch, 0.75 * inch, 0.62 * inch]),
         ],
     ))
     story.append(Spacer(1, 0.05 * inch))
@@ -5015,7 +5366,8 @@ def build_all_stores_pdf(
     days = len(date_range_days(start_day, end_day))
     daily_counts = {"expected": days, "rendered": 0}
     new_counts = {"expected": 0, "rendered": 0}
-    kick_counts = {"expected": len(all_kickback_detail) if all_kickback_detail is not None else 0, "rendered": 0}
+    all_store_kickback_pdf_detail = kickback_summary if kickback_summary is not None else pd.DataFrame()
+    kick_counts = {"expected": len(all_store_kickback_pdf_detail), "rendered": 0}
     if full_detail_pdf:
         add_detail_appendix_index(story, styles, include_new_customer=new_customer_daily is not None and not new_customer_daily.empty)
         daily_counts = add_full_daily_detail_section(
@@ -5034,13 +5386,14 @@ def build_all_stores_pdf(
             end_day,
             "Appendix B - Full New Customer Detail",
             authoritative_total=all_metrics.get("closing_new_customers") if all_metrics.get("closing_summary_has_data") else None,
+            authoritative_customers=all_metrics.get("closing_customers") if all_metrics.get("closing_summary_has_data") else None,
         )
         kick_counts = add_full_kickback_detail_section(
             story,
             styles,
-            all_kickback_detail,
-            "Appendix C - Full Kickback / Deal Detail",
-            include_store=True,
+            all_store_kickback_pdf_detail,
+            "Appendix C - Combined All-Store Kickback / Deal Brand Detail",
+            include_store=False,
         )
         add_appendix_table_section(
             story,
@@ -5066,7 +5419,7 @@ def build_all_stores_pdf(
             styles,
             "Appendix F - Budtender Detail",
             budtender_summary,
-            [("budtender", "Budtender", "textwrap"), ("net_revenue", "Revenue", "money"), ("tickets", "Tickets", "int"), ("basket", "Basket", "money"), ("discount_rate", "Disc Rate", "pct")],
+            [("budtender", "Budtender", "textwrap"), ("net_revenue", "Revenue", "money"), ("tickets", "Tickets", "int"), ("basket", "Avg Cart", "money1"), ("discount_rate", "Disc Rate", "pct")],
             [2.25 * inch, 0.92 * inch, 0.68 * inch, 0.78 * inch, 0.78 * inch],
             appendix_rows,
         )
@@ -5162,6 +5515,10 @@ def build_store_pdf(
     if closing_summary_row:
         store_metrics["closing_new_customers"] = as_float(closing_summary_row.get("new_customer_count"))
         store_metrics["closing_customers"] = as_float(closing_summary_row.get("customer_count"))
+        store_metrics["closing_new_customer_rate"] = (
+            store_metrics["closing_new_customers"] / store_metrics["closing_customers"]
+            if store_metrics.get("closing_customers") else 0.0
+        )
     if inventory_row:
         for key in [
             "opening_inventory_value",
@@ -5214,7 +5571,7 @@ def build_store_pdf(
         {"metric": "Profit", "store": money(m.get("profit")), "company": money(company_profit), "rank": rank_context.get("profit", ""), "status": company_average_signal("profit", m.get("profit"), company_profit)},
         {"metric": "Real Margin", "store": pct1(m.get("margin_real")), "company": pct1(all_metrics.get("margin_real")), "rank": rank_context.get("margin_real", ""), "status": company_average_signal("margin_real", m.get("margin_real"), all_metrics.get("margin_real"))},
         {"metric": "Tickets", "store": f"{int(as_float(m.get('tickets'))):,}", "company": f"{int(company_tickets):,}", "rank": rank_context.get("tickets", ""), "status": company_average_signal("tickets", m.get("tickets"), company_tickets)},
-        {"metric": "Basket", "store": money(m.get("basket")), "company": money(all_metrics.get("basket")), "rank": rank_context.get("basket", ""), "status": company_average_signal("basket", m.get("basket"), all_metrics.get("basket"))},
+        {"metric": "Avg Cart >$1", "store": money1(m.get("basket")), "company": money1(all_metrics.get("basket")), "rank": rank_context.get("basket", ""), "status": company_average_signal("basket", m.get("basket"), all_metrics.get("basket"))},
         {"metric": "Discount Rate", "store": pct1(m.get("discount_rate")), "company": pct1(all_metrics.get("discount_rate")), "rank": rank_context.get("discount_rate", ""), "status": company_average_signal("discount_rate", m.get("discount_rate"), all_metrics.get("discount_rate"))},
         {
             "metric": "New Customers",
@@ -5222,6 +5579,13 @@ def build_store_pdf(
             "company": f"{int(company_new_customers):,}" if company_new_customers is not None else "Unavailable",
             "rank": "Not ranked",
             "status": company_average_signal("closing_new_customers", store_metrics.get("closing_new_customers"), company_new_customers),
+        },
+        {
+            "metric": "New Customer %",
+            "store": pct1(store_metrics.get("closing_new_customer_rate")) if "closing_new_customer_rate" in store_metrics else "Unavailable",
+            "company": pct1(all_metrics.get("closing_new_customer_rate")) if all_metrics.get("closing_summary_has_data") else "Unavailable",
+            "rank": "Not ranked",
+            "status": "Closing report mix",
         },
         {
             "metric": "Inventory Change",
@@ -5303,7 +5667,11 @@ def build_store_pdf(
         ["Discount Rate", pct1(m.get("discount_rate"))],
         ["OTD Round-Up Revenue Opportunity", money(store_metrics.get("tax_rounding_loss"))],
         ["Tax-Included OTD Gap", money(store_metrics.get("tax_included_roundup_opportunity"))],
+        ["Total Customers", f"{int(as_float(store_metrics.get('closing_customers'))):,}" if closing_summary_row else "N/A"],
         ["New Customers", f"{int(as_float(store_metrics.get('closing_new_customers'))):,}" if closing_summary_row else "N/A"],
+        ["New Customer %", pct1(store_metrics.get("closing_new_customer_rate")) if closing_summary_row else "N/A"],
+        ["Avg Cart > $1", money1(store_metrics.get("basket"))],
+        ["$0-$1 Carts Excluded", f"{int(as_float(store_metrics.get('low_value_cart_count_excluded_from_basket'))):,}"],
         ["Ending Inventory", optional_money(store_metrics.get("inventory_end_value"))],
         ["Inventory Gain/Loss", optional_signed_money(store_metrics.get("inventory_value_change"))],
     ]
@@ -5316,7 +5684,7 @@ def build_store_pdf(
         story,
         styles,
         budtender_summary,
-        [("budtender", "Top Budtenders", "textwrap"), ("net_revenue", "Revenue", "money"), ("tickets", "Tickets", "int"), ("basket", "Basket", "money"), ("discount_rate", "Disc Rate", "pct")],
+        [("budtender", "Top Budtenders", "textwrap"), ("net_revenue", "Revenue", "money"), ("tickets", "Tickets", "int"), ("basket", "Avg Cart", "money1"), ("discount_rate", "Disc Rate", "pct")],
         max_rows=min(top_n, 10),
         col_widths=[2.25 * inch, 0.92 * inch, 0.68 * inch, 0.78 * inch, 0.78 * inch],
     )
@@ -5357,6 +5725,7 @@ def build_store_pdf(
             "Appendix B - Full New Customer Detail",
             store=bundle.abbr,
             authoritative_total=store_metrics.get("closing_new_customers"),
+            authoritative_customers=store_metrics.get("closing_customers"),
         )
         kick_counts = add_full_kickback_detail_section(
             story,
@@ -5389,7 +5758,7 @@ def build_store_pdf(
             styles,
             "Appendix F - Budtender Detail",
             budtender_summary,
-            [("budtender", "Budtender", "textwrap"), ("net_revenue", "Revenue", "money"), ("tickets", "Tickets", "int"), ("basket", "Basket", "money"), ("discount_rate", "Disc Rate", "pct")],
+            [("budtender", "Budtender", "textwrap"), ("net_revenue", "Revenue", "money"), ("tickets", "Tickets", "int"), ("basket", "Avg Cart", "money1"), ("discount_rate", "Disc Rate", "pct")],
             [2.25 * inch, 0.92 * inch, 0.68 * inch, 0.78 * inch, 0.78 * inch],
             appendix_rows,
         )
@@ -5425,6 +5794,7 @@ def summarize_for_store(bundle: StoreBundle, start_day: date, end_day: date, top
     brand = compute_monthly_brand_summary(df, start_day, end_day)
     product = compute_monthly_product_summary(df, start_day, end_day)
     budtender = compute_budtender_summary(df, start_day, end_day)
+    budtender = apply_adjusted_basket_to_budtenders(df, budtender if budtender is not None else pd.DataFrame(), start_day, end_day)
     cart = compute_cart_value_distribution(df, start_day, end_day)
     hourly = compute_monthly_hourly_summary(df, start_day, end_day)
     weekday = compute_weekday_summary(bundle.daily_df, start_day, end_day)
@@ -5517,6 +5887,8 @@ def load_trailing_three_month_average(start_day: date) -> Dict[str, Any]:
         "basket",
         "discount_rate",
         "closing_new_customers",
+        "closing_customers",
+        "closing_new_customer_rate",
         "inventory_end_value",
         "inventory_value_change",
     ]
@@ -5660,6 +6032,7 @@ def write_data_exports(
     product_summary: pd.DataFrame,
     budtender_summary: pd.DataFrame,
     cart_distribution: pd.DataFrame,
+    adjusted_cart_metrics: pd.DataFrame,
     hourly_summary: pd.DataFrame,
     weekday_summary: pd.DataFrame,
     weekday_hour_summary: pd.DataFrame,
@@ -5710,6 +6083,7 @@ def write_data_exports(
         "monthly_product_summary.csv": product_summary,
         "monthly_budtender_summary.csv": budtender_summary,
         "monthly_cart_distribution.csv": cart_distribution,
+        "monthly_adjusted_cart_metrics.csv": adjusted_cart_metrics,
         "monthly_hourly_summary.csv": hourly_summary,
         "monthly_weekday_summary.csv": weekday_summary,
         "monthly_weekday_hour_summary.csv": weekday_hour_summary,
@@ -5755,6 +6129,7 @@ def write_data_exports(
             }).to_excel(writer, sheet_name="Discounts", index=False)
             kickback_summary.to_excel(writer, sheet_name="Kickbacks", index=False)
             cart_distribution.to_excel(writer, sheet_name="Cart Distribution", index=False)
+            adjusted_cart_metrics.to_excel(writer, sheet_name="Adjusted Cart Metrics", index=False)
             daily_metrics.to_excel(writer, sheet_name="Daily Metrics", index=False)
             store_daily_detail.to_excel(writer, sheet_name="Store Daily Detail", index=False)
             hourly_summary.to_excel(writer, sheet_name="Hourly Metrics", index=False)
@@ -5836,9 +6211,10 @@ def build_monthly_email_intro(
         f"Profit: {money(all_metrics.get('profit'))}",
         f"Real margin: {pct1(all_metrics.get('margin_real'))}",
         f"Tickets: {int(as_float(all_metrics.get('tickets'))):,}",
-        f"Basket: {money(all_metrics.get('basket'))}",
+        f"Avg cart > $1: {money1(all_metrics.get('basket'))}",
         f"OTD round-up opportunity: {money(all_metrics.get('tax_rounding_loss'))}",
-        f"New customers: {int(as_float(all_metrics.get('closing_new_customers'))):,}" if all_metrics.get("closing_summary_has_data") else "New customers: N/A",
+        f"Customers: {int(as_float(all_metrics.get('closing_customers'))):,}" if all_metrics.get("closing_summary_has_data") else "Customers: N/A",
+        f"New customers: {int(as_float(all_metrics.get('closing_new_customers'))):,} ({pct1(all_metrics.get('closing_new_customer_rate'))})" if all_metrics.get("closing_summary_has_data") else "New customers: N/A",
         f"Ending inventory: {optional_money(all_metrics.get('inventory_end_value'))}" if all_metrics.get("inventory_has_data") else "Ending inventory: N/A",
         f"Best store: {best_store}",
         f"Top win: {(wins or ['N/A'])[0]}",
@@ -5959,9 +6335,10 @@ def build_monthly_email_html(
         email_metric_card("Net Revenue", money(all_metrics.get("net_revenue")), f"Best store {best_store}", HEX_GREEN),
         email_metric_card("Profit", money(all_metrics.get("profit")), f"Real profit {money(all_metrics.get('profit_real'))}", HEX_GREEN),
         email_metric_card("Real Margin", pct1(all_metrics.get("margin_real")), f"KB margin {pct1(all_metrics.get('margin'))}", HEX_YELLOW),
+        email_metric_card("Customers", f"{int(as_float(all_metrics.get('closing_customers'))):,}", f"{pct1(all_metrics.get('closing_new_customer_rate'))} new", HEX_GREEN),
         email_metric_card("New Customers", f"{int(as_float(all_metrics.get('closing_new_customers'))):,}", "Official closing report total", HEX_GREEN),
         email_metric_card("Tickets", f"{int(as_float(all_metrics.get('tickets'))):,}", f"{as_float(all_metrics.get('items_per_ticket')):.2f} items / ticket", HEX_GREEN),
-        email_metric_card("Basket", money(all_metrics.get("basket")), f"Net/item {money(all_metrics.get('net_price_per_item'))}", HEX_GREEN),
+        email_metric_card("Avg Cart > $1", money1(all_metrics.get("basket")), f"{int(as_float(all_metrics.get('low_value_cart_count_excluded_from_basket'))):,} tiny carts excluded", HEX_GREEN),
         email_metric_card("Discount Rate", pct1(all_metrics.get("discount_rate")), discount_detail, "#F59E0B"),
         email_metric_card("OTD Round-Up Loss", money(all_metrics.get("tax_rounding_loss")), f"{money2(all_metrics.get('tax_rounding_avg_loss_per_transaction'))} avg / transaction", "#F59E0B"),
         email_metric_card("Ending Inventory", optional_money(all_metrics.get("inventory_end_value")), inventory_detail, "#111827"),
@@ -6258,8 +6635,10 @@ def main() -> None:
     product_summary = compute_monthly_product_summary(all_raw, start_day, end_day)
     budtender_summary = compute_budtender_summary(all_raw, start_day, end_day)
     budtender_summary = budtender_summary if budtender_summary is not None else pd.DataFrame()
+    budtender_summary = apply_adjusted_basket_to_budtenders(all_raw, budtender_summary, start_day, end_day)
     cart_distribution = compute_cart_value_distribution(all_raw, start_day, end_day)
     cart_distribution = cart_distribution if cart_distribution is not None else pd.DataFrame()
+    adjusted_cart_metrics = compute_adjusted_cart_metrics(all_raw, start_day, end_day)
     hourly_summary = compute_monthly_hourly_summary(all_raw, start_day, end_day)
     weekday_summary = compute_weekday_summary(all_daily, start_day, end_day)
     weekday_hour_summary = compute_weekday_hour_summary(all_raw, start_day, end_day)
@@ -6270,10 +6649,14 @@ def main() -> None:
 
     base_all_metrics = metrics_for_range(all_daily, start_day, end_day)
     all_metrics = enrich_monthly_metrics(base_all_metrics, all_daily, category_summary, brand_summary, product_summary)
+    apply_adjusted_cart_metrics(all_metrics, bundles, adjusted_cart_metrics)
     all_metrics["kickback"] = as_float(kickback_summary["kickback"].sum()) if kickback_summary is not None and not kickback_summary.empty and "kickback" in kickback_summary.columns else 0.0
     store_scorecards = build_store_scorecards(bundles, all_metrics)
     tax_rounding_summary, tax_rounding_daily = compute_tax_rounding_loss(all_raw, start_day, end_day)
     store_scorecards = apply_tax_rounding_metrics(all_metrics, store_scorecards, tax_rounding_summary)
+    all_daily = apply_tax_rounding_to_daily_detail(all_daily, bundles, tax_rounding_daily)
+    weekday_summary = compute_weekday_summary(all_daily, start_day, end_day)
+    sync_bundle_metrics_from_scorecards(bundles, store_scorecards)
     store_kickback_summary = compute_store_kickback_summary(all_raw, store_scorecards)
     if args.fetch_inventory_api:
         inventory_start, inventory_end = fetch_monthly_inventory_snapshots_from_api(
@@ -6300,6 +6683,8 @@ def main() -> None:
     else:
         closing_summary = load_monthly_closing_summary(data_dir)
     add_closing_summary_metrics(all_metrics, closing_summary)
+    store_scorecards = apply_closing_summary_to_scorecards(store_scorecards, closing_summary)
+    sync_bundle_metrics_from_scorecards(bundles, store_scorecards)
     closing_dir = args.closing_report_dir or (MONTHLY_CLOSING_ROOT / month_key)
     if args.fetch_closing_api or args.fetch_closing_summary_api:
         closing_raw = fetch_monthly_closing_reports_from_api(
@@ -6338,10 +6723,13 @@ def main() -> None:
         closing_raw = load_monthly_closing_reports(closing_dir, start_day, end_day, warnings)
     new_customer_summary, new_customer_daily = build_new_customer_summaries(closing_raw, store_scorecards)
     all_metrics["new_customers"] = as_float(new_customer_daily["new_customers"].sum()) if not new_customer_daily.empty else 0.0
-    all_metrics["new_customer_rate"] = (
-        as_float(new_customer_daily["new_customers"].sum()) / as_float(new_customer_daily["total_customers"].sum())
-        if not new_customer_daily.empty and as_float(new_customer_daily["total_customers"].sum()) else 0.0
-    )
+    if all_metrics.get("closing_summary_has_data"):
+        all_metrics["new_customer_rate"] = all_metrics.get("closing_new_customer_rate", 0.0)
+    else:
+        all_metrics["new_customer_rate"] = (
+            as_float(new_customer_daily["new_customers"].sum()) / as_float(new_customer_daily["total_customers"].sum())
+            if not new_customer_daily.empty and as_float(new_customer_daily["total_customers"].sum()) else 0.0
+        )
 
     comparison_metrics = {
         "previous_month": load_comparison_metrics(*previous_month_range(start_day), warnings=warnings),
@@ -6361,6 +6749,8 @@ def main() -> None:
         "discount_rate",
         "returns_net",
         "closing_new_customers",
+        "closing_customers",
+        "closing_new_customer_rate",
         "inventory_end_value",
         "inventory_value_change",
     ]
@@ -6423,6 +6813,7 @@ def main() -> None:
         product_summary=product_summary,
         budtender_summary=budtender_summary,
         cart_distribution=cart_distribution,
+        adjusted_cart_metrics=adjusted_cart_metrics,
         hourly_summary=hourly_summary,
         weekday_summary=weekday_summary,
         weekday_hour_summary=weekday_hour_summary,
@@ -6487,7 +6878,11 @@ def main() -> None:
             "margin_real": all_metrics.get("margin_real"),
             "tickets": all_metrics.get("tickets"),
             "basket": all_metrics.get("basket"),
+            "basket_raw_including_low_value_carts": all_metrics.get("basket_raw_including_low_value_carts"),
+            "low_value_cart_count_excluded_from_basket": all_metrics.get("low_value_cart_count_excluded_from_basket"),
             "closing_new_customers": all_metrics.get("closing_new_customers", "N/A"),
+            "closing_customers": all_metrics.get("closing_customers", "N/A"),
+            "closing_new_customer_rate": all_metrics.get("closing_new_customer_rate", "N/A"),
             "ending_inventory": all_metrics.get("inventory_end_value", "N/A"),
             "discount_rate": all_metrics.get("discount_rate"),
             "tax_rounding_loss": all_metrics.get("tax_rounding_loss"),
