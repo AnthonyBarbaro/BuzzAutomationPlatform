@@ -1,0 +1,8 @@
+{
+  "default_target_margin": 0.35,
+  "default_max_discount_rate": 0.45,
+  "default_max_days_supply": 60,
+  "default_min_sell_through": 0.25,
+  "updated_at": "2026-05-05T00:00:00",
+  "brand_targets": {}
+}

@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -32,6 +32,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
@@ -43,9 +44,26 @@ from reportlab.platypus import (
     Paragraph,
     SimpleDocTemplate,
     Spacer,
+    Table,
+    TableStyle,
 )
 
 import owner_snapshot as osnap
+from brand_credit_ledger import (
+    export_credit_csv,
+    ledger_to_dataframe,
+    load_credit_ledger,
+    summarize_credit_reconciliation,
+)
+from creditflow_api import fetch_creditflow_credits_for_brand, write_creditflow_cache
+from brand_meeting_insights import (
+    build_followup_text,
+    generate_brand_action_items,
+    generate_brand_health_score,
+    generate_meeting_ask,
+    load_monthly_reference,
+)
+from brand_meeting_targets import get_brand_targets, load_targets
 from dutchie_api_reports import (
     DEFAULT_API_WORKERS,
     canonical_env_map as dutchie_canonical_env_map,
@@ -134,6 +152,15 @@ class PacketOptions:
     top_n: int = 20
     force_refresh_data: bool = False
     api_workers: int = DEFAULT_PACKET_API_WORKERS
+    include_credit_reconciliation: bool = True
+    credit_ledger_path: str = "brand_credit_ledger.json"
+    include_creditflow_credits: bool = True
+    creditflow_base_url: str = "https://creditflow.replit.app/api/v1"
+    target_margin: Optional[float] = None
+    include_monthly_reference: bool = True
+    packet_mode: str = "standard"
+    generate_followup_notes: bool = True
+    compact_pdf_mode: bool = True
 
 
 @dataclass
@@ -151,6 +178,7 @@ class PacketArtifacts:
     detail_pdf_path: Path
     pdf_path: Path
     xlsx_path: Optional[Path]
+    followup_notes_path: Optional[Path]
     run_paths: RunPaths
     missing_sales_stores: List[str]
     missing_catalog_stores: List[str]
@@ -174,6 +202,86 @@ def _default_logger(msg: str) -> None:
 
 def _log(msg: str, logger: Optional[Callable[[str], None]]) -> None:
     (logger or _default_logger)(msg)
+
+
+def _short_terminal_text(value: Any, max_chars: int = 140) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _print_creditflow_pull_audit(brand: str, rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+    """Print CreditFlow rows directly to stdout so GUI runs are debuggable from the terminal."""
+    print("")
+    print("=" * 88)
+    print(f"[CREDITFLOW PULLED CREDITS] Brand packet: {brand}")
+    print(
+        f"Raw credits pulled: {int(meta.get('raw_credits') or 0)} | "
+        f"Matched to brand: {len(rows)} | "
+        f"Brands loaded: {int(meta.get('brands') or 0)} | Stores loaded: {int(meta.get('stores') or 0)}"
+    )
+    target_ids = meta.get("target_brand_ids") or []
+    target_codes = meta.get("target_vendor_codes") or []
+    if target_ids or target_codes:
+        print(
+            f"CreditFlow brand filter: ids={', '.join(map(str, target_ids)) or 'N/A'} | "
+            f"vendorCodes={', '.join(map(str, target_codes)) or 'N/A'} | "
+            f"used={bool(meta.get('brand_filter_used'))}"
+        )
+    warning = str(meta.get("warning") or "").strip()
+    if warning:
+        print(f"Warning: {warning}")
+    raw_brand_counts = meta.get("raw_brand_counts") or {}
+    if isinstance(raw_brand_counts, dict) and raw_brand_counts:
+        print("Raw CreditFlow brand counts:")
+        for raw_brand, count in list(raw_brand_counts.items())[:50]:
+            print(f"  - {raw_brand}: {count}")
+        if len(raw_brand_counts) > 50:
+            print(f"  ... {len(raw_brand_counts) - 50} more raw brands")
+    matched_raw_brands = meta.get("matched_raw_brands") or {}
+    if isinstance(matched_raw_brands, dict) and matched_raw_brands:
+        print("Matched raw brand names:")
+        for raw_brand, count in matched_raw_brands.items():
+            print(f"  - {raw_brand}: {count}")
+    if not rows:
+        print("No CreditFlow credits matched this brand/date window.")
+        print("=" * 88)
+        print("")
+        sys.stdout.flush()
+        return
+    print("Matched CreditFlow rows used by the report:")
+    for idx, row in enumerate(rows, start=1):
+        expected = float(row.get("expected_amount") or 0.0)
+        received = float(row.get("received_amount") or 0.0)
+        gap = max(expected - received, 0.0)
+        print(
+            f"  #{idx:02d} external_id={row.get('external_id') or row.get('id') or ''} "
+            f"store={row.get('store_code') or 'All'} "
+            f"brand={_short_terminal_text(row.get('brand'), 42)} "
+            f"canonical={_short_terminal_text(row.get('canonical_brand'), 42)}"
+        )
+        print(
+            f"      dates={row.get('start_date') or ''} -> {row.get('end_date') or ''} "
+            f"type={row.get('credit_type') or ''} status={row.get('status') or ''} "
+            f"expected={money0(expected)} received={money0(received)} gap={money0(gap)}"
+        )
+        scope_parts = []
+        if row.get("category"):
+            scope_parts.append(f"category={_short_terminal_text(row.get('category'), 55)}")
+        if row.get("product"):
+            scope_parts.append(f"product={_short_terminal_text(row.get('product'), 70)}")
+        if row.get("invoice_reference"):
+            scope_parts.append(f"invoice={_short_terminal_text(row.get('invoice_reference'), 36)}")
+        if row.get("payment_reference"):
+            scope_parts.append(f"payment={_short_terminal_text(row.get('payment_reference'), 36)}")
+        if scope_parts:
+            print("      " + " | ".join(scope_parts))
+        if row.get("notes"):
+            print(f"      notes={_short_terminal_text(row.get('notes'), 170)}")
+    print("=" * 88)
+    print("")
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -1591,6 +1699,170 @@ def derive_merge_fields(
     }
 
 
+def _ordering_key_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _first_nonempty_text(*values: Any, default: str = "") -> str:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            if pd.isna(value):
+                continue
+        except Exception:
+            pass
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "none", "null"}:
+            return text
+    return default
+
+
+def _ordering_display_product_without_brand(product: Any) -> str:
+    raw_product = str(product or "").strip()
+    if not raw_product:
+        return ""
+    parts = [part.strip() for part in raw_product.split("|") if part.strip()]
+    if len(parts) <= 1:
+        return raw_product
+    return " | ".join(parts[1:])
+
+
+def _ordering_normalize_strain_bucket(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if re.fullmatch(r"i|ind|indica", text):
+        return "I"
+    if re.fullmatch(r"h|hyb|hybrid", text):
+        return "H"
+    if re.fullmatch(r"s|sat|sativa", text):
+        return "S"
+    return ""
+
+
+def _ordering_combine_group_products(values: Any) -> str:
+    unique_values = list(
+        OrderedDict.fromkeys(
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+        )
+    )
+    if not unique_values:
+        return ""
+    if len(unique_values) == 1:
+        return unique_values[0]
+
+    tokenized = [[part.strip() for part in value.split("|") if part.strip()] for value in unique_values]
+    min_len = min((len(tokens) for tokens in tokenized), default=0)
+    prefix_length = 0
+    for index in range(min_len):
+        candidate_key = _ordering_key_text(tokenized[0][index])
+        if all(_ordering_key_text(tokens[index]) == candidate_key for tokens in tokenized[1:]):
+            prefix_length += 1
+            continue
+        break
+
+    if prefix_length > 0:
+        prefix = tokenized[0][:prefix_length]
+        suffixes = list(
+            OrderedDict.fromkeys(
+                " | ".join(tokens[prefix_length:]).strip()
+                for tokens in tokenized
+                if " | ".join(tokens[prefix_length:]).strip()
+            )
+        )
+        if suffixes:
+            return " | ".join(prefix + [" / ".join(suffixes)])
+
+    return " / ".join(unique_values)
+
+
+def _ordering_base_row_key(row: pd.Series, include_store: bool = False) -> str:
+    store_code = str(row.get("_store_abbr", "") or "").strip().upper() if include_store else ""
+    prefix = f"{store_code}|" if store_code else ""
+    sku_text = _first_nonempty_text(row.get("SKU"), row.get("Sku"), row.get("sku"))
+    if sku_text:
+        return f"{prefix}sku:{sku_text}"
+
+    raw_product = _first_nonempty_text(
+        row.get("Product"),
+        row.get("Product Name"),
+        row.get("_product_raw"),
+        row.get("display_product"),
+        default="Unknown Product",
+    )
+    brand_key = str(row.get("brand_key") or "unknown").strip() or "unknown"
+    product_key = _ordering_key_text(raw_product)
+    if product_key:
+        return f"{prefix}fallback:{brand_key}|{product_key}"
+
+    brand_product_text = str(row.get("brand_product_key") or "").strip()
+    if brand_product_text:
+        return f"{prefix}product:{brand_product_text}"
+    return f"{prefix}fallback:{brand_key}|unknown"
+
+
+def _ordering_family_group_metadata(row: pd.Series, include_store: bool = False) -> Dict[str, Any]:
+    raw_product = _first_nonempty_text(
+        row.get("Product"),
+        row.get("Product Name"),
+        row.get("_product_raw"),
+        row.get("display_product"),
+        default="Unknown Product",
+    )
+    row_key = _ordering_base_row_key(row, include_store=include_store)
+    parts = [part.strip() for part in raw_product.split("|") if part.strip()]
+    product_parts = parts[1:] if len(parts) > 1 else ([raw_product] if raw_product else [])
+
+    strain_index = None
+    strain_bucket = ""
+    for index, token in enumerate(product_parts):
+        normalized = _ordering_normalize_strain_bucket(token)
+        if normalized:
+            strain_index = index
+            strain_bucket = normalized
+            break
+
+    if strain_index is not None and strain_index > 0:
+        base_parts = product_parts[:strain_index]
+        family_display = " | ".join(base_parts + [strain_bucket]).strip()
+        family_key = _ordering_key_text(family_display)
+        category_key = _ordering_key_text(row.get("category_normalized") or row.get("Category") or "UNKNOWN")
+        brand_text = str(row.get("brand_key") or "unknownbrand").strip() or "unknownbrand"
+        store_code = str(row.get("_store_abbr", "") or "").strip().upper() if include_store else ""
+        prefix = f"{store_code}|" if store_code else ""
+        return {
+            "ordering_product_key": f"{prefix}family:{brand_text}|{category_key}|{family_key}",
+            "ordering_product_display": _ordering_display_product_without_brand(raw_product),
+            "ordering_product_is_family": True,
+        }
+
+    return {
+        "ordering_product_key": row_key,
+        "ordering_product_display": _ordering_display_product_without_brand(raw_product),
+        "ordering_product_is_family": False,
+    }
+
+
+def _apply_weekly_ordering_product_identity(df: pd.DataFrame, include_store: bool = False) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+    out = df.copy()
+    meta = pd.DataFrame(
+        [_ordering_family_group_metadata(row, include_store=include_store) for _, row in out.iterrows()],
+        index=out.index,
+    )
+    for col in meta.columns:
+        out[col] = meta[col]
+    out["ordering_product_key"] = out["ordering_product_key"].fillna("").astype(str)
+    out["ordering_product_display"] = out["ordering_product_display"].fillna("").astype(str)
+    return out
+
+
 def _merge_token_to_float(token: Any, fallback: float) -> float:
     try:
         v = float(token)
@@ -2280,7 +2552,7 @@ def summarize_product_groups(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "product_group_key", "product_group_display", "category_normalized", "size_normalized", "variant_type",
             "net_revenue", "units", "profit", "profit_real", "margin", "margin_real", "avg_price_per_item",
-            "avg_cost_per_item", "tickets", "merged_count", "raw_names_top5", "product_list",
+            "avg_cost_per_item", "tickets", "discount", "discount_rate", "merged_count", "raw_names_top5", "product_list",
         ])
 
     df = _filter_product_group_rows(df)
@@ -2288,19 +2560,26 @@ def summarize_product_groups(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "product_group_key", "product_group_display", "category_normalized", "size_normalized", "variant_type",
             "net_revenue", "units", "profit", "profit_real", "margin", "margin_real", "avg_price_per_item",
-            "avg_cost_per_item", "tickets", "merged_count", "raw_names_top5", "product_list",
+            "avg_cost_per_item", "tickets", "discount", "discount_rate", "merged_count", "raw_names_top5", "product_list",
         ])
 
-    group_col = "product_group_key" if "product_group_key" in df.columns else "merge_key"
-    display_col = "product_group_display" if "product_group_display" in df.columns else "display_product"
+    df = _apply_weekly_ordering_product_identity(df, include_store=False)
+    group_col = "ordering_product_key" if "ordering_product_key" in df.columns else (
+        "product_group_key" if "product_group_key" in df.columns else "merge_key"
+    )
+    display_col = "ordering_product_display" if "ordering_product_display" in df.columns else (
+        "product_group_display" if "product_group_display" in df.columns else "display_product"
+    )
 
     grouped = df.groupby(group_col, as_index=False).agg(
-        product_group_display=(display_col, lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+        product_group_display=(display_col, _ordering_combine_group_products),
         category_normalized=("category_normalized", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
         size_normalized=("size_normalized", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
         variant_type=("variant_type", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
         net_revenue=("_net", "sum"),
+        gross_sales=("_gross", "sum"),
         units=("_qty", "sum"),
+        discount=("_disc_total", "sum"),
         cogs_real=("_cogs_real", "sum"),
         profit=("_profit_kb", "sum"),
         profit_real=("_profit_real", "sum"),
@@ -2319,12 +2598,14 @@ def summarize_product_groups(df: pd.DataFrame) -> pd.DataFrame:
                 if str(x).strip()
             }
         )
-        if not names:
+        if display_col in part.columns:
+            display_name = _ordering_combine_group_products(part[display_col].fillna("").astype(str).tolist())
+        elif not names:
             display_name = ""
         elif len(names) == 1:
-            display_name = names[0]
+            display_name = _ordering_display_product_without_brand(names[0])
         else:
-            display_name = f"{names[0]} (+{len(names) - 1} more)"
+            display_name = _ordering_display_product_without_brand(names[0])
 
         top5 = names[:5]
         raw_map[mk] = " | ".join(top5)
@@ -2341,6 +2622,7 @@ def summarize_product_groups(df: pd.DataFrame) -> pd.DataFrame:
     grouped["margin_real"] = grouped["profit_real"] / grouped["net_revenue"].replace({0: np.nan})
     grouped["avg_price_per_item"] = grouped["net_revenue"] / grouped["units"].replace({0: np.nan})
     grouped["avg_cost_per_item"] = grouped["cogs_real"] / grouped["units"].replace({0: np.nan})
+    grouped["discount_rate"] = grouped["discount"] / grouped["gross_sales"].replace({0: np.nan})
 
     if group_col != "product_group_key":
         grouped = grouped.rename(columns={group_col: "product_group_key"})
@@ -2386,7 +2668,7 @@ def relabel_product_group_movers(movers_df: pd.DataFrame, product_summary: pd.Da
 
 
 def _best_group_key_col(df: pd.DataFrame) -> str:
-    for c in ["product_group_key", "supply_merge_key", "merge_key"]:
+    for c in ["ordering_product_key", "product_group_key", "supply_merge_key", "merge_key"]:
         if c in df.columns:
             return c
     return ""
@@ -2410,6 +2692,7 @@ def build_product_group_supply_maps(
         inv = _inventory_reporting_rows(_filter_product_group_rows(catalog_brand_df))
         if inv.empty:
             inv = pd.DataFrame(columns=catalog_brand_df.columns)
+        inv = _apply_weekly_ordering_product_identity(inv, include_store=False)
         if "_store_abbr" not in inv.columns:
             inv["_store_abbr"] = ""
         inv["_store_abbr"] = inv["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
@@ -2432,6 +2715,7 @@ def build_product_group_supply_maps(
         s14 = _filter_product_group_rows(last14_sales_df)
         if s14.empty:
             s14 = pd.DataFrame(columns=last14_sales_df.columns)
+        s14 = _apply_weekly_ordering_product_identity(s14, include_store=False)
         if "_is_return" in s14.columns:
             s14 = s14[~s14["_is_return"]].copy()
         if "_store_abbr" not in s14.columns:
@@ -2959,14 +3243,18 @@ def summarize_inventory_products(df: pd.DataFrame) -> pd.DataFrame:
             "effective_price", "out_the_door", "margin_current", "inventory_value", "potential_revenue",
             "potential_profit", "supply_base_key", "supply_merge_key", "merged_count", "raw_names_top5",
         ])
+    tmp = _apply_weekly_ordering_product_identity(tmp, include_store=False)
     tmp["effective_total"] = tmp["Effective_Price"] * tmp["Available"]
     if "supply_merge_key" not in tmp.columns:
         tmp["supply_merge_key"] = ""
     if "supply_base_key" not in tmp.columns:
         tmp["supply_base_key"] = tmp["supply_merge_key"].map(_supply_base_from_merge_key)
 
-    grouped = tmp.groupby("merge_key", as_index=False).agg(
-        display_product=("display_product", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+    group_col = "ordering_product_key" if "ordering_product_key" in tmp.columns else "merge_key"
+    display_col = "ordering_product_display" if "ordering_product_display" in tmp.columns else "display_product"
+
+    grouped = tmp.groupby(group_col, as_index=False).agg(
+        display_product=(display_col, _ordering_combine_group_products),
         category_normalized=("category_normalized", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
         supply_base_key=("supply_base_key", lambda s: s.mode().iloc[0] if not s.mode().empty else (str(s.iloc[0]) if len(s) else "")),
         supply_merge_key=("supply_merge_key", lambda s: s.mode().iloc[0] if not s.mode().empty else (str(s.iloc[0]) if len(s) else "")),
@@ -2988,13 +3276,15 @@ def summarize_inventory_products(df: pd.DataFrame) -> pd.DataFrame:
 
     raw_map: Dict[str, str] = {}
     merged_count_map: Dict[str, int] = {}
-    for mk, part in tmp.groupby("merge_key"):
+    for mk, part in tmp.groupby(group_col):
         cnt = Counter(part["_product_raw"].astype(str).tolist())
         raw_map[mk] = " | ".join([name for name, _n in cnt.most_common(5)])
         merged_count_map[mk] = int(len(cnt))
 
-    grouped["raw_names_top5"] = grouped["merge_key"].map(raw_map).fillna("")
-    grouped["merged_count"] = grouped["merge_key"].map(merged_count_map).fillna(1).astype(int)
+    grouped["raw_names_top5"] = grouped[group_col].map(raw_map).fillna("")
+    grouped["merged_count"] = grouped[group_col].map(merged_count_map).fillna(1).astype(int)
+    if group_col != "merge_key":
+        grouped = grouped.rename(columns={group_col: "merge_key"})
 
     keep_cols = [
         "merge_key", "display_product", "category_normalized", "units_available", "shelf_price", "cost",
@@ -3081,6 +3371,7 @@ def add_inventory_supply_metrics(
     if not sales14.empty:
         if "_is_return" in sales14.columns:
             sales14 = sales14[~sales14["_is_return"]].copy()
+        sales14 = _apply_weekly_ordering_product_identity(sales14, include_store=False)
         if "_qty" not in sales14.columns:
             sales14["_qty"] = 1.0
         sales14["_qty"] = osnap.to_number(sales14["_qty"]).fillna(0.0).astype(float)
@@ -3135,6 +3426,7 @@ def add_inventory_supply_metrics(
 
     catalog_rows = _inventory_reporting_rows(catalog_brand_df.copy() if catalog_brand_df is not None else pd.DataFrame())
     if not catalog_rows.empty:
+        catalog_rows = _apply_weekly_ordering_product_identity(catalog_rows, include_store=False)
         if ("supply_merge_key" not in catalog_rows.columns) or ("supply_base_key" not in catalog_rows.columns):
             price_series = osnap.to_number(catalog_rows.get("Price_Used", 0.0)).fillna(0.0).astype(float)
             cost_series = osnap.to_number(catalog_rows.get("Cost", 0.0)).fillna(0.0).astype(float)
@@ -3350,6 +3642,16 @@ def add_inventory_supply_metrics(
         }
         out_products["trend_units_14d"] = out_products["supply_merge_key"].map(fam_trend_map).fillna(0.0).astype(float)
         out_products["trend_units_per_day_14d"] = out_products["supply_merge_key"].map(fam_day_map).fillna(0.0).astype(float)
+        if "ordering_product_key" in sales14.columns:
+            product_trend = sales14.groupby("ordering_product_key", as_index=False).agg(trend_units_14d=("_qty", "sum"))
+            product_trend_map = {
+                str(r["ordering_product_key"]): float(r["trend_units_14d"])
+                for _, r in product_trend.iterrows()
+            }
+            product_trend_series = out_products["merge_key"].astype(str).map(product_trend_map)
+            has_product_trend = product_trend_series.notna()
+            out_products.loc[has_product_trend, "trend_units_14d"] = product_trend_series.loc[has_product_trend].astype(float)
+            out_products["trend_units_per_day_14d"] = out_products["trend_units_14d"] / float(trend_days)
         out_products["days_of_supply"] = out_products.apply(
             lambda r: _safe_dos(float(r.get("units_available", 0.0)), float(r.get("trend_units_per_day_14d", 0.0))),
             axis=1,
@@ -4696,6 +4998,159 @@ def chart_daily_net(daily_df: pd.DataFrame, title: str) -> BytesIO:
     return buf
 
 
+def chart_daily_brand_sales(daily_df: pd.DataFrame, title: str = "Daily Brand Sales") -> BytesIO:
+    _mpl_setup()
+    buf = BytesIO()
+    if daily_df is None or daily_df.empty or "date" not in daily_df.columns:
+        return buf
+
+    d = daily_df.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"]).sort_values("date")
+    if d.empty or "net_revenue" not in d.columns:
+        return buf
+    d["net_revenue"] = pd.to_numeric(d["net_revenue"], errors="coerce").fillna(0.0)
+    date_values = d["date"].dt.date.tolist()
+    labels = [f"{x.month}/{x.day}" for x in date_values]
+    vals = d["net_revenue"].astype(float).tolist()
+    x = np.arange(len(vals))
+
+    fig, ax = plt.subplots(figsize=(7.35, 2.15))
+    bars = ax.bar(x, vals, color=osnap.HEX_GREEN, edgecolor="#047857", linewidth=0.35, alpha=0.93, zorder=2)
+    if vals:
+        ax.plot(x, vals, color="#111827", linewidth=1.0, alpha=0.75, zorder=3)
+    ax.set_title(title, pad=10)
+    tick_step = 1 if len(labels) <= 16 else 2 if len(labels) <= 34 else 4
+    show = [i for i in range(len(labels)) if i % tick_step == 0 or i == len(labels) - 1]
+    ax.set_xticks(show)
+    ax.set_xticklabels([labels[i] for i in show], rotation=35, ha="right", fontsize=6.8)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _pos: f"${v/1000:.0f}k" if abs(v) >= 1000 else f"${v:.0f}"))
+    ax.grid(True, axis="y", zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    positive = [(idx, val) for idx, val in enumerate(vals) if val > 0]
+    if positive:
+        best_idx, best_val = max(positive, key=lambda t: t[1])
+        low_idx, low_val = min(positive, key=lambda t: t[1])
+        for idx, val, label, color in [
+            (best_idx, best_val, f"Best {labels[best_idx]}", "#111827"),
+            (low_idx, low_val, f"Low {labels[low_idx]}", "#6B7280"),
+        ]:
+            ax.annotate(
+                label,
+                xy=(idx, val),
+                xytext=(0, 8),
+                textcoords="offset points",
+                ha="center",
+                fontsize=6.7,
+                color=color,
+                arrowprops={"arrowstyle": "-", "lw": 0.5, "color": color},
+            )
+    for idx, val in enumerate(vals):
+        if val <= 0 or len(vals) > 18:
+            continue
+        ax.text(bars[idx].get_x() + bars[idx].get_width() / 2, val, f"${val/1000:.1f}k", ha="center", va="bottom", fontsize=6.2, color="#111827")
+    fig.subplots_adjust(left=0.075, right=0.99, bottom=0.30, top=0.82)
+    _save_chart_image(buf, dpi=170, quality=86)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def chart_daily_net_profit(daily_df: pd.DataFrame, title: str, compact: bool = False) -> BytesIO:
+    _mpl_setup()
+    buf = BytesIO()
+    if daily_df is None or daily_df.empty or "date" not in daily_df.columns:
+        return buf
+
+    d = daily_df.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"]).sort_values("date")
+    if d.empty or "net_revenue" not in d.columns:
+        return buf
+    d["net_revenue"] = pd.to_numeric(d["net_revenue"], errors="coerce").fillna(0.0)
+    profit_col = "profit_real" if "profit_real" in d.columns else "profit" if "profit" in d.columns else ""
+    d["__profit"] = pd.to_numeric(d[profit_col], errors="coerce").fillna(0.0) if profit_col else 0.0
+
+    date_values = d["date"].dt.date.tolist()
+    labels = [f"{x.month}/{x.day}" for x in date_values]
+    net_vals = d["net_revenue"].astype(float).tolist()
+    profit_vals = d["__profit"].astype(float).tolist()
+    x = np.arange(len(net_vals))
+
+    fig_h = 1.85 if compact else 2.35
+    fig, ax = plt.subplots(figsize=(7.25, fig_h))
+    ax.bar(x, net_vals, color=osnap.HEX_GREEN, edgecolor="#047857", linewidth=0.35, alpha=0.92, label="Net Sales", zorder=2)
+    ax.plot(x, profit_vals, color="#111827", linewidth=1.15, marker="o" if not compact else None, markersize=2.2, label="Real Profit", zorder=3)
+    ax.axhline(0, color="#9CA3AF", linewidth=0.6, zorder=1)
+    ax.set_title(title, pad=9)
+    tick_step = 1 if len(labels) <= 14 else 2 if len(labels) <= 34 else 4
+    show = [i for i in range(len(labels)) if i % tick_step == 0 or i == len(labels) - 1]
+    ax.set_xticks(show)
+    ax.set_xticklabels([labels[i] for i in show], rotation=35, ha="right", fontsize=6.4 if compact else 6.9)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _pos: f"${v/1000:.0f}k" if abs(v) >= 1000 else f"${v:.0f}"))
+    ax.grid(True, axis="y", zorder=0)
+    ax.legend(loc="upper left", fontsize=6.6, frameon=False, ncol=2)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    positive = [(idx, val) for idx, val in enumerate(net_vals) if val > 0]
+    if positive and not compact:
+        best_idx, best_val = max(positive, key=lambda t: t[1])
+        ax.annotate(
+            f"Best {labels[best_idx]}",
+            xy=(best_idx, best_val),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            fontsize=6.6,
+            color="#111827",
+            arrowprops={"arrowstyle": "-", "lw": 0.5, "color": "#111827"},
+        )
+    fig.subplots_adjust(left=0.075, right=0.99, bottom=0.30 if compact else 0.27, top=0.80)
+    _save_chart_image(buf, dpi=170, quality=86)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def chart_location_net_profit(store_sales_packets: Dict[str, Dict[str, Any]], title: str = "Net Sales + Real Profit by Location") -> BytesIO:
+    _mpl_setup()
+    buf = BytesIO()
+    rows: List[Dict[str, Any]] = []
+    for abbr in order_store_codes(list(store_sales_packets.keys())):
+        metrics = (((store_sales_packets.get(abbr, {}) or {}).get("window_metrics") or {}).get("report") or {})
+        rows.append({
+            "store": abbr,
+            "net": float(metrics.get("net_revenue", 0.0) or 0.0),
+            "profit": float(metrics.get("profit_real", metrics.get("profit", 0.0)) or 0.0),
+        })
+    if not rows:
+        return buf
+    df = pd.DataFrame(rows).sort_values("net", ascending=True)
+    y = np.arange(len(df))
+    fig, ax = plt.subplots(figsize=(7.25, 2.55))
+    ax.barh(y, df["net"], color=osnap.HEX_GREEN, edgecolor="#047857", linewidth=0.35, height=0.55, label="Net Sales", zorder=2)
+    ax.scatter(df["profit"], y, color="#111827", s=28, label="Real Profit", zorder=3)
+    ax.set_yticks(y)
+    ax.set_yticklabels(df["store"].tolist(), fontsize=8)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _pos: f"${v/1000:.0f}k" if abs(v) >= 1000 else f"${v:.0f}"))
+    ax.set_title(title, pad=10)
+    ax.grid(True, axis="x", zorder=0)
+    ax.legend(loc="lower right", fontsize=7, frameon=False)
+    for idx, row in enumerate(df.itertuples(index=False)):
+        ax.text(float(row.net), idx, f" {money0(row.net)}", va="center", fontsize=7.0, color="#111827")
+        ax.text(float(row.profit), idx + 0.18, f"{money0(row.profit)}", ha="center", va="bottom", fontsize=6.5, color="#111827")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.subplots_adjust(left=0.08, right=0.98, bottom=0.12, top=0.82)
+    _save_chart_image(buf, dpi=170, quality=86)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
 def chart_daily_margin(daily_df: pd.DataFrame, title: str) -> BytesIO:
     _mpl_setup()
     buf = BytesIO()
@@ -5143,6 +5598,1235 @@ def _build_table_fit(
         wrapped_rows.append([_wrap_table_value(v, cell_style) for v in row])
 
     return osnap.build_table(headers, wrapped_rows, fitted_widths)
+
+
+def _add_section(story: List[Any], title: str, styles: Dict[str, Any], min_height: float = 1.4 * inch) -> None:
+    story.append(CondPageBreak(min_height))
+    story.append(Paragraph(title, styles["Section"]))
+
+
+def _credit_reconciliation_rows(reconciliation: pd.DataFrame, top_n: int = 12) -> List[List[Any]]:
+    if reconciliation is None or reconciliation.empty:
+        return []
+    rows: List[List[Any]] = []
+    for _, r in reconciliation.head(top_n).iterrows():
+        rows.append([
+            str(r.get("Type", "")),
+            str(r.get("Scope", "")),
+            money0(float(r.get("Expected", 0.0))),
+            money0(float(r.get("Received", 0.0))),
+            money0(float(r.get("Gap", 0.0))),
+            str(r.get("Status", "")),
+            osnap.pp1(float(r.get("Margin Lift Expected", 0.0))),
+            osnap.pp1(float(r.get("Margin Lift Received", 0.0))),
+            str(r.get("Notes", "")),
+        ])
+    return rows
+
+
+def _credit_source_summary(reconciliation: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if reconciliation is None or reconciliation.empty:
+        return pd.DataFrame(columns=["Source", "Rows", "Expected", "Received", "Gap", "Applied Expected", "Applied Received", "Open Rows"])
+    rec = reconciliation.copy()
+    for col in ["Expected", "Received", "Gap", "Applied Expected", "Applied Received"]:
+        if col not in rec.columns:
+            rec[col] = 0.0
+        rec[col] = pd.to_numeric(rec[col], errors="coerce").fillna(0.0)
+    if "Source" not in rec.columns:
+        rec["Source"] = ""
+    if "Status" not in rec.columns:
+        rec["Status"] = ""
+    rec["Source"] = rec["Source"].fillna("").astype(str).replace({"": "unknown"})
+    rec["Status"] = rec["Status"].fillna("").astype(str).str.lower()
+    out = rec.groupby("Source", as_index=False).agg(
+        Rows=("Source", "size"),
+        Expected=("Expected", "sum"),
+        Received=("Received", "sum"),
+        Gap=("Gap", "sum"),
+        Applied_Expected=("Applied Expected", "sum"),
+        Applied_Received=("Applied Received", "sum"),
+    )
+    open_rows = rec[rec["Status"].isin({"expected", "partial", "overdue"})].groupby("Source").size()
+    out["Open Rows"] = out["Source"].map(open_rows).fillna(0).astype(int)
+    return out.rename(columns={"Applied_Expected": "Applied Expected", "Applied_Received": "Applied Received"})
+
+
+def _action_item_rows(action_items: Sequence[Dict[str, Any]], top_n: int = 8) -> List[List[Any]]:
+    rows: List[List[Any]] = []
+    for item in list(action_items or [])[:top_n]:
+        affected = " / ".join([str(item.get(k, "")).strip() for k in ["store", "category_name", "product"] if str(item.get(k, "")).strip()])
+        try:
+            dollar_amount = float(item.get("dollar_amount", 0.0) or 0.0)
+        except Exception:
+            dollar_amount = 0.0
+        rows.append([
+            str(item.get("priority", "")),
+            str(item.get("category", "")),
+            str(item.get("problem", "")),
+            str(item.get("evidence", "")),
+            str(item.get("brand_action", "")),
+            affected or "Brand",
+            money0(dollar_amount) if dollar_amount else "",
+        ])
+    return rows
+
+
+def _credit_metric_grid(
+    styles: Dict[str, Any],
+    credit_summary: Dict[str, Any],
+    health_score: int,
+    health_status: str,
+) -> Any:
+    cells = [
+        osnap.kpi_cell(styles, "Brand Health", f"{health_score}/100", health_status),
+        osnap.kpi_cell(styles, "Real Margin", pct1(credit_summary.get("real_margin", 0.0)), "No credit adjustment"),
+        osnap.kpi_cell(styles, "Expected Credit Margin", pct1(credit_summary.get("expected_credit_margin", 0.0)), money0(credit_summary.get("expected_credit_amount", 0.0))),
+        osnap.kpi_cell(styles, "Received Credit Margin", pct1(credit_summary.get("received_credit_margin", 0.0)), money0(credit_summary.get("received_credit_amount", 0.0))),
+        osnap.kpi_cell(styles, "Credit Gap", money0(credit_summary.get("credit_gap", 0.0)), "Expected less received"),
+        osnap.kpi_cell(styles, "Credit Needed", money0(credit_summary.get("credit_needed_to_hit_target", 0.0)), f"Target {pct1(credit_summary.get('target_margin', 0.35))}"),
+        osnap.kpi_cell(
+            styles,
+            "Deals Reference" if credit_summary.get("system_expected_reference_only") else "Deals Expected",
+            money0(credit_summary.get("system_expected_credit", 0.0)),
+            "not double-counted" if credit_summary.get("system_expected_reference_only") else "deals.py",
+        ),
+        osnap.kpi_cell(styles, "CreditFlow Rec.", money0(credit_summary.get("creditflow_received_credit", 0.0)), f"open {int(credit_summary.get('creditflow_open_rows', 0) or 0)}"),
+    ]
+    return osnap.build_kpi_grid(styles, cells, cols=4)
+
+
+def _store_credit_scorecard(
+    store_df: pd.DataFrame,
+    inv_store: pd.DataFrame,
+    credit_summary: Dict[str, Any],
+    target_margin: float,
+    top_n: int = 12,
+    credit_reconciliation: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    if store_df is None or store_df.empty:
+        return pd.DataFrame()
+    out = store_df.copy()
+    if "_store_abbr" not in out.columns:
+        out["_store_abbr"] = ""
+    out["_store_abbr"] = out["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+    for col in ["net_revenue", "items", "tickets", "profit_real", "margin_real", "discount_rate"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    if inv_store is not None and not inv_store.empty and "_store_abbr" in inv_store.columns:
+        inv = inv_store.copy()
+        inv["_store_abbr"] = inv["_store_abbr"].fillna("").astype(str).str.upper()
+        keep = [c for c in ["_store_abbr", "inventory_value", "units_available", "days_of_supply"] if c in inv.columns]
+        out = out.merge(inv[keep], on="_store_abbr", how="left")
+    for col in ["inventory_value", "units_available", "days_of_supply"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+    total_net = float(out["net_revenue"].sum())
+    out["revenue_share"] = out["net_revenue"] / total_net if total_net else 0.0
+    out["received_credit_alloc"] = 0.0
+    out["expected_credit_alloc"] = 0.0
+
+    brand_expected_unassigned = float(credit_summary.get("expected_credit_amount", 0.0) or 0.0)
+    brand_received_unassigned = float(credit_summary.get("received_credit_amount", 0.0) or 0.0)
+    if credit_reconciliation is not None and not credit_reconciliation.empty:
+        rec = credit_reconciliation.copy()
+        if "Included In Margin" in rec.columns:
+            rec = rec[rec["Included In Margin"].fillna(False).astype(bool)].copy()
+        if "Source" in rec.columns:
+            rec = rec[~rec["Source"].fillna("").astype(str).str.lower().eq("system")].copy()
+        for col in ["Applied Expected", "Applied Received", "Expected", "Received"]:
+            if col not in rec.columns:
+                rec[col] = 0.0
+            rec[col] = pd.to_numeric(rec[col], errors="coerce").fillna(0.0)
+        expected_col = "Applied Expected" if "Applied Expected" in rec.columns else "Expected"
+        received_col = "Applied Received" if "Applied Received" in rec.columns else "Received"
+        if "Store" not in rec.columns:
+            rec["Store"] = rec.get("Scope", "").astype(str).str.extract(r"^([A-Za-z]{2})", expand=False).fillna("")
+        rec["Store"] = rec["Store"].fillna("").astype(str).str.upper().str.strip()
+        store_rec = rec[rec["Store"].isin(out["_store_abbr"].fillna("").astype(str).str.upper())].copy()
+        if not store_rec.empty:
+            store_alloc = store_rec.groupby("Store", as_index=False).agg(
+                expected_credit_alloc=(expected_col, "sum"),
+                received_credit_alloc=(received_col, "sum"),
+            )
+            out = out.merge(store_alloc, left_on="_store_abbr", right_on="Store", how="left", suffixes=("", "_exact"))
+            out["expected_credit_alloc"] = pd.to_numeric(out.get("expected_credit_alloc_exact"), errors="coerce").fillna(0.0)
+            out["received_credit_alloc"] = pd.to_numeric(out.get("received_credit_alloc_exact"), errors="coerce").fillna(0.0)
+            out = out.drop(columns=[c for c in ["Store", "expected_credit_alloc_exact", "received_credit_alloc_exact"] if c in out.columns])
+        brand_level_rec = rec[~rec["Store"].isin(out["_store_abbr"].fillna("").astype(str).str.upper())].copy()
+        brand_expected_unassigned = float(pd.to_numeric(brand_level_rec[expected_col], errors="coerce").fillna(0.0).sum())
+        brand_received_unassigned = float(pd.to_numeric(brand_level_rec[received_col], errors="coerce").fillna(0.0).sum())
+
+    if brand_expected_unassigned or brand_received_unassigned:
+        out["expected_credit_alloc"] += out["revenue_share"] * brand_expected_unassigned
+        out["received_credit_alloc"] += out["revenue_share"] * brand_received_unassigned
+    out["received_credit_margin"] = (out["profit_real"] + out["received_credit_alloc"]) / out["net_revenue"].replace(0, np.nan)
+    out["expected_credit_margin"] = (out["profit_real"] + out["expected_credit_alloc"]) / out["net_revenue"].replace(0, np.nan)
+    out["credit_gap_alloc"] = (out["expected_credit_alloc"] - out["received_credit_alloc"]).clip(lower=0.0)
+    out["status"] = np.where(
+        out["received_credit_margin"].fillna(out["margin_real"]) + 0.05 < target_margin,
+        "Needs Support",
+        np.where(out["discount_rate"] > 0.45, "Watch", "Strong"),
+    )
+    return out.sort_values("net_revenue", ascending=False).head(top_n)
+
+
+def _store_credit_rows(store_credit_df: pd.DataFrame) -> List[List[Any]]:
+    if store_credit_df is None or store_credit_df.empty:
+        return []
+    rows: List[List[Any]] = []
+    for _, r in store_credit_df.iterrows():
+        rows.append([
+            str(r.get("_store_abbr", "")),
+            money0(float(r.get("net_revenue", 0.0))),
+            int0(float(r.get("items", 0.0))),
+            pct1(float(r.get("margin_real", 0.0))),
+            pct1(float(r.get("received_credit_margin", 0.0) or 0.0)),
+            money0(float(r.get("credit_gap_alloc", 0.0))),
+            pct1(float(r.get("discount_rate", 0.0))),
+            money0(float(r.get("inventory_value", 0.0))),
+            days1(float(r.get("days_of_supply", np.nan))),
+            str(r.get("status", "")),
+        ])
+    return rows
+
+
+def _monthly_reference_rows(monthly_reference: Dict[str, Any], top_n: int = 8) -> List[List[Any]]:
+    rows: List[List[Any]] = []
+    if not monthly_reference or not monthly_reference.get("available"):
+        return rows
+    brand_rows = monthly_reference.get("brand_rows")
+    if isinstance(brand_rows, pd.DataFrame) and not brand_rows.empty:
+        for _, r in brand_rows.head(top_n).iterrows():
+            rows.append([
+                "Brand Summary",
+                str(r.get("Store", r.get("store", r.get("_store_abbr", "All Stores")))),
+                money0(float(r.get("net_revenue", r.get("Revenue", 0.0)) or 0.0)),
+                pct1(float(r.get("margin_real", r.get("Real Margin", 0.0)) or 0.0)),
+                pct1(float(r.get("discount_rate", r.get("Discount Rate", 0.0)) or 0.0)),
+                "",
+            ])
+    inv_rows = monthly_reference.get("inventory_rows")
+    if isinstance(inv_rows, pd.DataFrame) and not inv_rows.empty:
+        for _, r in inv_rows.head(top_n).iterrows():
+            rows.append([
+                "Inventory Risk",
+                str(r.get("Store", r.get("store", ""))),
+                money0(float(r.get("Revenue", r.get("revenue", 0.0)) or 0.0)),
+                "",
+                "",
+                str(r.get("Product", r.get("product", r.get("Recommended Action", "")))),
+            ])
+    return rows[:top_n]
+
+
+def build_brand_packet_theme_v2() -> Dict[str, ParagraphStyle]:
+    base = getattr(osnap, "BASE_FONT", "Helvetica")
+    bold = getattr(osnap, "BOLD_FONT", "Helvetica-Bold")
+    return {
+        "deck_title": ParagraphStyle("DeckTitle", fontName=bold, fontSize=22, leading=25, textColor=colors.HexColor("#111827"), spaceAfter=4),
+        "deck_subtitle": ParagraphStyle("DeckSubtitle", fontName=base, fontSize=8.5, leading=11, textColor=colors.HexColor("#4B5563")),
+        "section_v2": ParagraphStyle("SectionV2", fontName=bold, fontSize=15, leading=18, textColor=colors.HexColor("#111827"), spaceAfter=6),
+        "small_v2": ParagraphStyle("SmallV2", fontName=base, fontSize=7.5, leading=9.2, textColor=colors.HexColor("#4B5563")),
+        "tiny_v2": ParagraphStyle("TinyV2", fontName=base, fontSize=6.8, leading=8.0, textColor=colors.HexColor("#6B7280")),
+        "card_label": ParagraphStyle("CardLabel", fontName=bold, fontSize=6.8, leading=8.0, textColor=colors.HexColor("#4B5563")),
+        "card_value": ParagraphStyle("CardValue", fontName=bold, fontSize=12.5, leading=14.5, textColor=colors.HexColor("#111827")),
+        "card_note": ParagraphStyle("CardNote", fontName=base, fontSize=6.6, leading=8.0, textColor=colors.HexColor("#6B7280")),
+        "table_cell": ParagraphStyle("PremiumTableCell", fontName=base, fontSize=7.1, leading=8.3, textColor=colors.HexColor("#111827"), wordWrap="CJK"),
+        "table_cell_center": ParagraphStyle("PremiumTableCellCenter", fontName=base, fontSize=7.1, leading=8.3, textColor=colors.HexColor("#111827"), alignment=TA_CENTER, wordWrap="CJK"),
+        "table_cell_right": ParagraphStyle("PremiumTableCellRight", fontName=base, fontSize=7.1, leading=8.3, textColor=colors.HexColor("#111827"), alignment=TA_RIGHT, wordWrap="CJK"),
+        "table_head": ParagraphStyle("PremiumTableHead", fontName=bold, fontSize=7.2, leading=8.2, textColor=colors.white, alignment=TA_CENTER),
+        "ask": ParagraphStyle("AskBox", fontName=bold, fontSize=11, leading=14, textColor=colors.HexColor("#111827")),
+    }
+
+
+def _p(text: Any, style: ParagraphStyle) -> Paragraph:
+    return Paragraph(xml_escape(str(text or "")), style)
+
+
+def _short_status(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() == "needs support":
+        return "Needs Support"
+    return text or "Watch"
+
+
+def short_product_label(product_name: Any, max_chars: int = 62) -> str:
+    text = str(product_name or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    if "(+" in text and " more)" in text:
+        text = re.sub(r"\s*\(\+\d+\s+more\)", "", text).strip()
+    parts = [part.strip() for part in text.split("|") if part.strip()]
+    if len(parts) > 1 and len(parts[0]) <= 26 and not re.search(r"\d", parts[0]) and len(parts) >= 3:
+        parts = parts[1:]
+    type_map = {
+        "h": "Hybrid",
+        "hyb": "Hybrid",
+        "hybrid": "Hybrid",
+        "i": "Indica",
+        "ind": "Indica",
+        "indica": "Indica",
+        "s": "Sativa",
+        "sat": "Sativa",
+        "sativa": "Sativa",
+    }
+    if len(parts) >= 3 and parts[1].strip().lower() in type_map:
+        product_type = parts[0].replace("0.5G", "0.5g").replace("1G", "1g").replace("3.5G", "3.5g")
+        strain_type = type_map[parts[1].strip().lower()]
+        strain_blob = " | ".join(parts[2:])
+        strains = [s.strip() for s in re.split(r"\s*/\s*", strain_blob) if s.strip()]
+        if len(strains) > 1:
+            text = f"{product_type} | {strain_type} Mix (+{len(strains) - 1})"
+        elif strains:
+            text = f"{product_type} | {strain_type} | {strains[0]}"
+        else:
+            text = f"{product_type} | {strain_type}"
+    elif len(parts) >= 2:
+        text = " | ".join(parts[:3])
+    text = text.replace("(14PK)", "14pk").replace("(5pk)", "5pk").replace("  ", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[: max_chars - 1].rsplit(" ", 1)[0].rstrip(" |-/")
+    return f"{cut}..."
+
+
+def _format_days_supply_v2(value: Any, units_per_day: Any = None, units_on_hand: Any = None) -> str:
+    try:
+        upd = float(units_per_day) if units_per_day is not None else None
+    except Exception:
+        upd = None
+    try:
+        units = float(units_on_hand) if units_on_hand is not None else 0.0
+    except Exception:
+        units = 0.0
+    try:
+        days = float(value)
+    except Exception:
+        days = float("nan")
+    if (upd is not None and upd <= 0 and units > 0) or not np.isfinite(days):
+        return "No sales" if units > 0 else "n/a"
+    if days > 180:
+        return ">180d"
+    return f"{days:.0f}d" if days >= 10 else f"{days:.1f}d"
+
+
+def limit_rows_for_pdf(df: pd.DataFrame, mode: str, section_type: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+    mode = str(mode or "standard").lower()
+    limits = {
+        "quick": {"top_products": 8, "slow_movers": 8, "fast_movers": 8, "store_products": 5, "appendix": 0},
+        "standard": {"top_products": 15, "slow_movers": 15, "fast_movers": 12, "store_products": 8, "appendix": 25},
+        "deep": {"top_products": 25, "slow_movers": 25, "fast_movers": 20, "store_products": 15, "appendix": 50},
+    }
+    n = limits.get(mode, limits["standard"]).get(section_type, 10)
+    if n <= 0:
+        return df.iloc[0:0].copy()
+    return df.head(n).copy()
+
+
+def build_premium_table(
+    rows: List[List[Any]],
+    col_widths: List[float],
+    alignments: Optional[List[str]] = None,
+    repeat_header: bool = True,
+    row_limit: Optional[int] = None,
+    money_cols: Optional[Sequence[int]] = None,
+    pct_cols: Optional[Sequence[int]] = None,
+    status_cols: Optional[Sequence[int]] = None,
+    compact: bool = True,
+) -> Table:
+    theme = build_brand_packet_theme_v2()
+    if row_limit is not None and len(rows) > row_limit + 1:
+        rows = rows[: row_limit + 1]
+    alignments = alignments or []
+    money_cols = set(money_cols or [])
+    pct_cols = set(pct_cols or [])
+    status_cols = set(status_cols or [])
+    body_style = theme["table_cell"]
+    center_style = theme["table_cell_center"]
+    right_style = theme["table_cell_right"]
+    wrapped: List[List[Any]] = []
+    for ridx, row in enumerate(rows):
+        out_row: List[Any] = []
+        for cidx, value in enumerate(row):
+            if ridx == 0:
+                out_row.append(_p(value, theme["table_head"]))
+                continue
+            style = body_style
+            if cidx in money_cols or cidx in pct_cols or (cidx < len(alignments) and alignments[cidx].lower() == "right"):
+                style = right_style
+            elif cidx in status_cols or (cidx < len(alignments) and alignments[cidx].lower() == "center"):
+                style = center_style
+            out_row.append(_p(value, style))
+        wrapped.append(out_row)
+    split_range = (2, -3) if len(wrapped) > 8 else None
+    table = Table(
+        wrapped,
+        colWidths=col_widths,
+        repeatRows=1 if repeat_header else 0,
+        hAlign="LEFT",
+        splitByRow=1,
+        rowSplitRange=split_range,
+    )
+    pad = 3 if compact else 5
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111111")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#D6B800")),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9DEE3")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), pad),
+        ("RIGHTPADDING", (0, 0), (-1, -1), pad),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7F8FA")]),
+    ]))
+    return table
+
+
+def append_section_safely(story: List[Any], section_title: str, flowables: List[Any], min_height: float = 1.5 * inch) -> None:
+    theme = build_brand_packet_theme_v2()
+    story.append(CondPageBreak(min_height))
+    story.append(Paragraph(section_title, theme["section_v2"]))
+    story.extend(flowables)
+
+
+def _metric_card(label: str, value: Any, note: str = "", accent: str = "#2F6B5D") -> Table:
+    theme = build_brand_packet_theme_v2()
+    data = [[_p(label.upper(), theme["card_label"])], [_p(value, theme["card_value"])], [_p(note, theme["card_note"])]]
+    table = Table(data, colWidths=[1.18 * inch], rowHeights=[0.18 * inch, 0.28 * inch, 0.22 * inch])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F5F7F6")),
+        ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor("#D7DEE0")),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.3, colors.HexColor(accent)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    return table
+
+
+def _metric_grid(cards: List[Table], cols: int = 6) -> Table:
+    rows: List[List[Any]] = []
+    for i in range(0, len(cards), cols):
+        row = cards[i:i + cols]
+        while len(row) < cols:
+            row.append("")
+        rows.append(row)
+    table = Table(rows, colWidths=[1.23 * inch] * cols, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    return table
+
+
+def _panel(title: str, lines: List[str], width: float = 2.35 * inch, accent: str = "#2F6B5D") -> Table:
+    theme = build_brand_packet_theme_v2()
+    data = [[_p(title, theme["card_label"])]] + [[_p(line, theme["small_v2"])] for line in lines]
+    table = Table(data, colWidths=[width])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F5F7F6")),
+        ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor("#D7DEE0")),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.2, colors.HexColor(accent)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return table
+
+
+def _deck_header(brand: str, start_day: date, end_day: date, stores: Sequence[str], packet_mode: str, generated_at: str) -> Table:
+    theme = build_brand_packet_theme_v2()
+    left = [_p(brand, theme["deck_title"]), _p(f"{start_day.isoformat()} to {end_day.isoformat()}  |  Stores: {', '.join(stores) or 'All'}", theme["deck_subtitle"])]
+    right = [_p("BRAND MEETING REVIEW", theme["card_label"]), _p(f"Mode: {packet_mode.title()}  |  Generated: {generated_at}", theme["tiny_v2"])]
+    table = Table([[left, right]], colWidths=[4.7 * inch, 2.8 * inch])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("LINEBELOW", (0, 0), (-1, -1), 1.1, colors.HexColor("#2F6B5D")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return table
+
+
+def _calc_sell_through(units_sold: Any, ending_quantity: Any) -> float:
+    try:
+        sold = float(units_sold)
+    except Exception:
+        sold = 0.0
+    try:
+        qty = float(ending_quantity)
+    except Exception:
+        qty = 0.0
+    if not np.isfinite(sold):
+        sold = 0.0
+    if not np.isfinite(qty):
+        qty = 0.0
+    denom = max(sold + qty, 1.0)
+    return sold / denom
+
+
+def _series_or_default(df: pd.DataFrame, column: str, default: Any = "") -> pd.Series:
+    if column in df.columns:
+        return df[column]
+    return pd.Series(default, index=df.index)
+
+
+def _enriched_product_inventory(product_60: pd.DataFrame, inv_products: pd.DataFrame) -> pd.DataFrame:
+    inv = inv_products.copy() if inv_products is not None else pd.DataFrame()
+    prod = product_60.copy() if product_60 is not None else pd.DataFrame()
+    if inv.empty and prod.empty:
+        return pd.DataFrame()
+    if inv.empty:
+        inv = pd.DataFrame(columns=["merge_key", "display_product", "units_available", "inventory_value", "trend_units_per_day_30d", "days_of_supply"])
+    if prod.empty:
+        prod = pd.DataFrame(columns=["product_group_key", "product_group_display", "net_revenue", "units", "margin_real", "discount_rate", "category_normalized"])
+    inv_key = "merge_key" if "merge_key" in inv.columns else "display_product"
+    prod_key = "product_group_key" if "product_group_key" in prod.columns else "product_group_display"
+    inv[inv_key] = _series_or_default(inv, inv_key, "").fillna("").astype(str)
+    prod[prod_key] = _series_or_default(prod, prod_key, "").fillna("").astype(str)
+    keep_prod = [c for c in [prod_key, "product_group_display", "net_revenue", "units", "margin_real", "discount_rate", "category_normalized"] if c in prod.columns]
+    out = inv.merge(prod[keep_prod], left_on=inv_key, right_on=prod_key, how="outer", suffixes=("_inv", "_sales"))
+    fallback_series = pd.Series("", index=out.index)
+    left_key = out[inv_key] if inv_key in out.columns else fallback_series
+    right_key = out[prod_key] if prod_key in out.columns else fallback_series
+    out["product_key"] = left_key.fillna(right_key).astype(str)
+    display_series = out["display_product"] if "display_product" in out.columns else fallback_series
+    product_group_series = out["product_group_display"] if "product_group_display" in out.columns else fallback_series
+    out["product"] = display_series.replace("", np.nan).fillna(product_group_series).astype(str)
+    category_series = out["category_normalized_sales"] if "category_normalized_sales" in out.columns else (
+        out["category_normalized"] if "category_normalized" in out.columns else fallback_series
+    )
+    out["category"] = category_series.fillna("").astype(str)
+    for col in ["net_revenue", "units", "margin_real", "discount_rate", "units_available", "inventory_value", "trend_units_per_day_30d", "days_of_supply"]:
+        out[col] = pd.to_numeric(_series_or_default(out, col, 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["sell_through"] = out.apply(lambda r: _calc_sell_through(r.get("units", 0.0), r.get("units_available", 0.0)), axis=1)
+    return out
+
+
+def compute_inventory_risk_v2(product_60: pd.DataFrame, inv_products: pd.DataFrame) -> pd.DataFrame:
+    out = _enriched_product_inventory(product_60, inv_products)
+    if out.empty:
+        return out
+    risks: List[str] = []
+    actions: List[str] = []
+    scores: List[float] = []
+    for _, r in out.iterrows():
+        revenue = float(r.get("net_revenue", 0.0) or 0.0)
+        inv_value = float(r.get("inventory_value", 0.0) or 0.0)
+        sell = float(r.get("sell_through", 0.0) or 0.0)
+        days = float(r.get("days_of_supply", 0.0) or 0.0)
+        units = float(r.get("units_available", 0.0) or 0.0)
+        high = (days > 90 and units > 0) or (sell < 0.15 and inv_value >= 1000) or (revenue <= 0 and inv_value >= 1000)
+        med = (days > 60 and units > 0) or (sell < 0.25 and inv_value > 0)
+        if high:
+            risk = "High"
+        elif med:
+            risk = "Medium"
+        else:
+            risk = "Low"
+        if revenue <= 0 and inv_value >= 1000:
+            action = "Feature in promo"
+        elif sell < 0.10 and inv_value >= 1000:
+            action = "Fund markdown"
+        elif days > 90:
+            action = "Buy back"
+        elif days > 60:
+            action = "Transfer"
+        elif float(r.get("trend_units_per_day_30d", 0.0) or 0.0) > 2 and days < 21:
+            action = "Restock"
+        else:
+            action = "Watch depth"
+        score = (100 if risk == "High" else 40 if risk == "Medium" else 0) + inv_value / 1000.0 + max(days - 30, 0) / 10.0
+        risks.append(risk)
+        actions.append(action)
+        scores.append(score)
+    out["risk"] = risks
+    out["action"] = actions
+    out["risk_score"] = scores
+    return out.sort_values(["risk_score", "inventory_value"], ascending=False)
+
+
+def compute_slow_movers_v2(product_60: pd.DataFrame, inv_products: pd.DataFrame) -> pd.DataFrame:
+    risk = compute_inventory_risk_v2(product_60, inv_products)
+    if risk.empty:
+        return risk
+    return risk[risk["risk"].isin(["High", "Medium"])].sort_values(["risk_score", "inventory_value"], ascending=False)
+
+
+def compute_fast_movers_v2(product_60: pd.DataFrame, inv_products: pd.DataFrame) -> pd.DataFrame:
+    risk = compute_inventory_risk_v2(product_60, inv_products)
+    if risk.empty:
+        return risk
+    out = risk[(risk["units"] > 0) | (risk["trend_units_per_day_30d"] > 0)].copy()
+    out["fast_score"] = out["units"] + (out["trend_units_per_day_30d"] * 10)
+    out["action"] = np.where((out["units_available"] <= 0) | (out["days_of_supply"].between(0.01, 21)), "Restock", "Watch depth")
+    return out.sort_values(["fast_score", "net_revenue"], ascending=False)
+
+
+def _premium_action_rows(action_items: Sequence[Dict[str, Any]], top_n: int) -> List[List[Any]]:
+    rows = [["Priority", "Area", "Problem", "Evidence", "Brand Action", "Impact"]]
+    action_map = {
+        "Fund additional credit": "Fund credit",
+        "Pay outstanding credit": "Pay credit",
+        "Lower invoice cost": "Lower cost",
+        "Reduce required discount": "Reduce discount",
+        "Fund markdown": "Fund markdown",
+        "Send rep for store training": "Train staff",
+        "Increase kickback percentage": "Increase support",
+        "Confirm invoice credit": "Confirm credit",
+    }
+    area_map = {
+        "Margin Support": "Margin",
+        "Credit Follow-Up": "Credit",
+        "Discount Strategy": "Discount",
+        "Slow Inventory": "Slow Inv",
+        "Fast-Mover Replenishment": "Replenish",
+        "Store-Level Support": "Store",
+        "Store Support": "Store",
+        "Product Mix": "Mix",
+        "Training / Education": "Training",
+    }
+    def _money_impact(item: Dict[str, Any]) -> str:
+        try:
+            amount = float(item.get("dollar_amount", 0.0) or 0.0)
+        except Exception:
+            amount = 0.0
+        return money0(amount) if amount else str(item.get("store", "") or "Brand")
+
+    def _compact_evidence(value: Any) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        for marker in [" has $", " at $", " generated $"]:
+            if marker in text:
+                before, after = text.split(marker, 1)
+                text = f"{short_product_label(before, 44)}{marker}{after}"
+                break
+        text = re.sub(r"(\d+(?:\.\d+)?) days of supply", r"\1d supply", text)
+        text = text.replace("real margin is", "margin")
+        if len(text) <= 76:
+            return text
+        return text[:75].rsplit(" ", 1)[0].rstrip(" ,.;") + "..."
+
+    for item in list(action_items or [])[:top_n]:
+        priority = str(item.get("priority", "Low")).upper().replace("MEDIUM", "MED")
+        area_raw = str(item.get("category", "")).replace("Slow-Moving Inventory", "Slow Inventory")
+        area = area_map.get(area_raw, area_raw[:12])
+        action = action_map.get(str(item.get("brand_action", "")), str(item.get("brand_action", "")))
+        impact = _money_impact(item)
+        rows.append([
+            priority,
+            area,
+            str(item.get("problem", ""))[:70],
+            _compact_evidence(item.get("evidence", "")),
+            action,
+            impact,
+        ])
+    if len(rows) == 1:
+        rows.append(["LOW", "Watch", "No major rule-based issue triggered.", "Review margin, inventory, and promo plan in meeting.", "Watch depth", "Brand"])
+    return rows
+
+
+def _store_needed_from_brand(row: pd.Series) -> str:
+    status = str(row.get("status", "Watch"))
+    margin = float(row.get("received_credit_margin", row.get("margin_real", 0.0)) or 0.0)
+    discount = float(row.get("discount_rate", 0.0) or 0.0)
+    days = float(row.get("days_of_supply", 0.0) or 0.0)
+    if status == "Needs Support" or margin < 0.30:
+        return "Fund credit"
+    if discount > 0.45:
+        return "Reduce discount"
+    if days > 75:
+        return "Move inventory"
+    return "Support winners"
+
+
+def _store_scorecard_rows(store_credit_scorecard: pd.DataFrame) -> List[List[Any]]:
+    rows = [["Store", "Revenue", "Units", "Real", "Rec.", "Credit Gap", "Discount", "Inventory", "Days", "Status", "Need"]]
+    if store_credit_scorecard is None or store_credit_scorecard.empty:
+        return rows
+    for _, r in store_credit_scorecard.iterrows():
+        status = _short_status(r.get("status", ""))
+        table_status = "Support" if status == "Needs Support" else status
+        rows.append([
+            str(r.get("_store_abbr", "")),
+            money0(r.get("net_revenue", 0.0)),
+            int0(r.get("items", 0.0)),
+            pct1(r.get("margin_real", 0.0)),
+            pct1(r.get("received_credit_margin", r.get("margin_real", 0.0))),
+            money0(r.get("credit_gap_alloc", 0.0)),
+            pct1(r.get("discount_rate", 0.0)),
+            money0(r.get("inventory_value", 0.0)),
+            _format_days_supply_v2(r.get("days_of_supply", np.nan), units_on_hand=r.get("units_available", 0.0)),
+            table_status,
+            _store_needed_from_brand(r),
+        ])
+    return rows
+
+
+def _product_perf_rows(product_df: pd.DataFrame, mode: str) -> List[List[Any]]:
+    rows = [["Product Group", "Category", "Revenue", "Units", "Real Margin", "Discount", "Days"]]
+    if product_df is None or product_df.empty:
+        return rows
+    tmp = limit_rows_for_pdf(product_df.sort_values("net_revenue", ascending=False), mode, "top_products")
+    for _, r in tmp.iterrows():
+        rows.append([
+            short_product_label(r.get("product_group_display", r.get("display_product", "")), 56),
+            str(r.get("category_normalized", r.get("category", "")))[:14],
+            money0(r.get("net_revenue", 0.0)),
+            int0(r.get("units", 0.0)),
+            pct1(r.get("margin_real", 0.0)),
+            pct1(r.get("discount_rate", 0.0)),
+            _format_days_supply_v2(r.get("days_of_supply", np.nan), units_per_day=r.get("trend_units_per_day_30d", None), units_on_hand=r.get("units_available", 0.0)),
+        ])
+    return rows
+
+
+def _inventory_rows(df: pd.DataFrame, mode: str, section_type: str) -> List[List[Any]]:
+    rows = [["Product", "Revenue", "Units", "On Hand", "Sell-Thru", "Days", "Action"]]
+    if df is None or df.empty:
+        return rows
+    tmp = limit_rows_for_pdf(df, mode, section_type)
+    for _, r in tmp.iterrows():
+        rows.append([
+            short_product_label(r.get("product", r.get("display_product", "")), 42),
+            money0(r.get("net_revenue", 0.0)),
+            int0(r.get("units", 0.0)),
+            int0(r.get("units_available", 0.0)),
+            pct1(r.get("sell_through", 0.0)),
+            _format_days_supply_v2(r.get("days_of_supply", np.nan), r.get("trend_units_per_day_30d", None), r.get("units_available", 0.0)),
+            str(r.get("action", "Watch depth")),
+        ])
+    return rows
+
+
+def _category_rows(category_60: pd.DataFrame, mode: str) -> List[List[Any]]:
+    rows = [["Category", "Revenue", "Units", "Margin", "Discount"]]
+    if category_60 is None or category_60.empty:
+        return rows
+    n = 6 if mode == "quick" else 10
+    for _, r in category_60.head(n).iterrows():
+        rows.append([
+            str(r.get("category_normalized", "")),
+            money0(r.get("net_revenue", 0.0)),
+            int0(r.get("items", 0.0)),
+            pct1(r.get("margin_real", 0.0)),
+            pct1(r.get("discount_rate", 0.0)),
+        ])
+    return rows
+
+
+def _location_overview_rows(store_sales_packets: Dict[str, Dict[str, Any]]) -> List[List[Any]]:
+    rows = [["Store", "Net Sales", "Gross", "Real Profit", "Margin", "Tickets", "Basket", "Units", "Discount", "Inv Value", "Days"]]
+    for abbr in order_store_codes(list(store_sales_packets.keys())):
+        pkt = store_sales_packets.get(abbr, {}) or {}
+        metrics = ((pkt.get("window_metrics") or {}).get("report") or {})
+        inv = pkt.get("inventory", {}) or {}
+        rows.append([
+            abbr,
+            money0(metrics.get("net_revenue", 0.0)),
+            money0(metrics.get("gross_sales", 0.0)),
+            money0(metrics.get("profit_real", metrics.get("profit", 0.0))),
+            pct1(metrics.get("margin_real", metrics.get("margin", 0.0))),
+            int0(metrics.get("tickets", 0.0)),
+            money2(metrics.get("basket", 0.0)),
+            int0(metrics.get("items", 0.0)),
+            pct1(metrics.get("discount_rate", 0.0)),
+            money0(inv.get("inventory_value", 0.0)),
+            _format_days_supply_v2(inv.get("days_of_supply", np.nan), inv.get("trend_units_per_day_30d", inv.get("trend_units_per_day_14d", 0.0)), inv.get("units_available", 0.0)),
+        ])
+    return rows
+
+
+def _store_metric_detail_rows(metrics: Dict[str, Any], inv: Dict[str, Any]) -> List[List[Any]]:
+    return [
+        ["Metric", "Value"],
+        ["Net Sales", money0(metrics.get("net_revenue", 0.0))],
+        ["Gross Sales", money0(metrics.get("gross_sales", 0.0))],
+        ["Real Profit", money0(metrics.get("profit_real", metrics.get("profit", 0.0)))],
+        ["COGS", money0(metrics.get("cogs_real", metrics.get("cogs", 0.0)))],
+        ["Real Margin", pct1(metrics.get("margin_real", metrics.get("margin", 0.0)))],
+        ["Tickets", int0(metrics.get("tickets", 0.0))],
+        ["Avg Basket", money2(metrics.get("basket", 0.0))],
+        ["Units Sold", int0(metrics.get("items", 0.0))],
+        ["Discounts", money0(metrics.get("discount", 0.0))],
+        ["Discount Rate", pct1(metrics.get("discount_rate", 0.0))],
+        ["Returns", money0(metrics.get("returns_net", 0.0))],
+        ["Inventory Value", money0(inv.get("inventory_value", 0.0))],
+        ["Units On Hand", int0(inv.get("units_available", inv.get("units", 0.0)))],
+        ["Days Supply", _format_days_supply_v2(inv.get("days_of_supply", np.nan), inv.get("trend_units_per_day_30d", inv.get("trend_units_per_day_14d", 0.0)), inv.get("units_available", inv.get("units", 0.0)))],
+    ]
+
+
+def _section_page(story: List[Any], title: str, flowables: List[Any], page_break: bool = True) -> None:
+    theme = build_brand_packet_theme_v2()
+    story.append(Paragraph(title, theme["section_v2"]))
+    story.extend(flowables)
+    if page_break:
+        story.append(PageBreak())
+
+
+def _chart_image(buf: BytesIO, width: float, height: float) -> Any:
+    return Image(buf, width=width, height=height) if buf and buf.getbuffer().nbytes > 0 else Spacer(1, 0.01 * inch)
+
+
+def build_cover_dashboard_v2(
+    story: List[Any],
+    brand: str,
+    start_day: date,
+    end_day: date,
+    options: PacketOptions,
+    selected_store_codes: Sequence[str],
+    generated_at: str,
+    report_metrics: Dict[str, float],
+    credit_summary: Dict[str, Any],
+    inv_overview: Dict[str, float],
+    inventory_risk: pd.DataFrame,
+    action_items: Sequence[Dict[str, Any]],
+    health_score: int,
+    health_status: str,
+    health_reason: str,
+    meeting_ask: str,
+) -> None:
+    theme = build_brand_packet_theme_v2()
+    sell_through = 0.0
+    if inventory_risk is not None and not inventory_risk.empty:
+        sold = float(pd.to_numeric(inventory_risk.get("units", 0.0), errors="coerce").fillna(0.0).sum())
+        qty = float(pd.to_numeric(inventory_risk.get("units_available", 0.0), errors="coerce").fillna(0.0).sum())
+        sell_through = _calc_sell_through(sold, qty)
+    story.append(_deck_header(brand, start_day, end_day, selected_store_codes, options.packet_mode, generated_at))
+    story.append(Spacer(1, 0.08 * inch))
+    cards = [
+        _metric_card("Health", f"{health_score}/100", health_status, "#2F6B5D"),
+        _metric_card("Net Revenue", money0(report_metrics.get("net_revenue", 0.0)), "brand sales"),
+        _metric_card("Units Sold", int0(report_metrics.get("items", 0.0)), "report window"),
+        _metric_card("Real Margin", pct1(report_metrics.get("margin_real", 0.0)), "before credits", "#D6B800"),
+        _metric_card("Target", pct1(credit_summary.get("target_margin", 0.35)), "margin goal"),
+        _metric_card("Credit Gap", money0(credit_summary.get("credit_gap", 0.0)), "owed support", "#B54034" if float(credit_summary.get("credit_gap", 0.0) or 0.0) else "#2F6B5D"),
+        _metric_card("Expected Margin", pct1(credit_summary.get("expected_credit_margin", 0.0)), money0(credit_summary.get("expected_credit_amount", 0.0))),
+        _metric_card("Received Margin", pct1(credit_summary.get("received_credit_margin", 0.0)), money0(credit_summary.get("received_credit_amount", 0.0))),
+        _metric_card("Discount", pct1(report_metrics.get("discount_rate", 0.0)), money0(report_metrics.get("discount", 0.0))),
+        _metric_card("Inventory", money0(inv_overview.get("inventory_value", 0.0)), f"{int0(inv_overview.get('units', 0.0))} units"),
+        _metric_card("Sell-Through", pct1(sell_through), "sold / sold+on hand"),
+        _metric_card("Days Supply", _format_days_supply_v2(inv_overview.get("days_of_supply", np.nan), inv_overview.get("trend_units_per_day_30d", inv_overview.get("trend_units_per_day_14d", 0.0)), inv_overview.get("units", 0.0)), "30d pace"),
+    ]
+    story.append(_metric_grid(cards, cols=6))
+    story.append(Spacer(1, 0.10 * inch))
+    ask_box = _panel("PRIMARY MEETING ASK", [meeting_ask or "Confirm margin support and next promo plan."], width=7.45 * inch, accent="#D6B800")
+    story.append(ask_box)
+    story.append(Spacer(1, 0.08 * inch))
+    rows = _premium_action_rows(action_items, top_n=3)
+    story.append(build_premium_table(
+        rows,
+        [0.55 * inch, 0.85 * inch, 1.35 * inch, 2.65 * inch, 1.1 * inch, 0.75 * inch],
+        alignments=["center", "left", "left", "left", "left", "right"],
+        status_cols=[0],
+        money_cols=[5],
+    ))
+    story.append(Spacer(1, 0.05 * inch))
+    story.append(Paragraph(f"Health note: {xml_escape(health_reason or 'No major risk flags.')}", theme["tiny_v2"]))
+    at_risk_value = 0.0
+    slow_count = 0
+    if inventory_risk is not None and not inventory_risk.empty:
+        risk_mask = inventory_risk.get("risk", pd.Series("", index=inventory_risk.index)).astype(str).isin(["High", "Medium"])
+        at_risk_value = float(pd.to_numeric(inventory_risk.loc[risk_mask, "inventory_value"], errors="coerce").fillna(0.0).sum()) if "inventory_value" in inventory_risk.columns else 0.0
+        slow_count = int(risk_mask.sum())
+    focus_store = ""
+    for item in action_items or []:
+        store_val = str(item.get("store", "") or "").strip()
+        if store_val:
+            focus_store = store_val
+            break
+    if not focus_store:
+        focus_store = "All stores"
+    snapshot = Table([[
+        _panel("MARGIN FOCUS", [
+            f"Received margin: {pct1(credit_summary.get('received_credit_margin', report_metrics.get('margin_real', 0.0)))}",
+            f"Support to target: {money0(credit_summary.get('credit_needed_to_hit_target', 0.0))}",
+        ], width=2.42 * inch, accent="#D6B800"),
+        _panel("INVENTORY FOCUS", [
+            f"At-risk inventory: {money0(at_risk_value)}",
+            f"Slow-moving rows: {int0(slow_count)}",
+        ], width=2.42 * inch, accent="#B54034" if at_risk_value else "#2F6B5D"),
+        _panel("STORE FOCUS", [
+            f"Focus: {focus_store}",
+            "Use scorecards to target support.",
+        ], width=2.42 * inch, accent="#2F6B5D"),
+    ]], colWidths=[2.48 * inch] * 3)
+    snapshot.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(snapshot)
+    story.append(PageBreak())
+
+
+def build_margin_truth_page_v2(
+    story: List[Any],
+    credit_summary: Dict[str, Any],
+    credit_reconciliation: pd.DataFrame,
+    meeting_ask: str,
+    mode: str,
+    action_items: Optional[Sequence[Dict[str, Any]]] = None,
+    daily_60: Optional[pd.DataFrame] = None,
+) -> None:
+    theme = build_brand_packet_theme_v2()
+    panels = [
+        _panel("REAL MARGIN", [
+            f"Net revenue: {money0(credit_summary.get('net_revenue', 0.0))}",
+            f"Real profit: {money0(credit_summary.get('real_profit', 0.0))}",
+            f"Real margin: {pct1(credit_summary.get('real_margin', 0.0))}",
+        ], width=2.42 * inch),
+        _panel("EXPECTED SUPPORT", [
+            (
+                f"Deals reference: {money0(credit_summary.get('system_expected_credit', 0.0))}"
+                if credit_summary.get("system_expected_reference_only")
+                else f"Deals expected: {money0(credit_summary.get('system_expected_credit', 0.0))}"
+            ),
+            f"CreditFlow expected: {money0(credit_summary.get('creditflow_expected_credit', 0.0))}",
+            f"Ledger expected: {money0(credit_summary.get('ledger_expected_credit', 0.0))}",
+            f"Expected margin: {pct1(credit_summary.get('expected_credit_margin', 0.0))}",
+        ], width=2.42 * inch, accent="#D6B800"),
+        _panel("RECEIVED SUPPORT", [
+            f"CreditFlow received: {money0(credit_summary.get('creditflow_received_credit', 0.0))}",
+            f"Ledger received: {money0(credit_summary.get('ledger_received_credit', 0.0))}",
+            f"Credit gap: {money0(credit_summary.get('credit_gap', 0.0))}",
+            f"Open ERP rows: {int(credit_summary.get('creditflow_open_rows', 0) or 0)}",
+            f"Received margin: {pct1(credit_summary.get('received_credit_margin', 0.0))}",
+        ], width=2.42 * inch, accent="#2F6B5D"),
+    ]
+    panel_table = Table([panels], colWidths=[2.48 * inch] * 3)
+    panel_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]))
+    flows: List[Any] = [panel_table, Spacer(1, 0.08 * inch)]
+    rec_rows = [["Credit Type", "Source", "Scope", "Expected", "Received", "Gap", "Status", "Action"]]
+    if credit_reconciliation is not None and not credit_reconciliation.empty:
+        rec_limit = 5 if mode == "quick" else 10 if mode == "standard" else 18
+        for _, r in credit_reconciliation.head(rec_limit).iterrows():
+            gap = float(r.get("Gap", 0.0) or 0.0)
+            action = "Pay credit" if gap > 0 else "Verify support"
+            source = str(r.get("Source", ""))
+            source_label = "CreditFlow" if source.lower() == "creditflow" else source.title() if source else ""
+            rec_rows.append([
+                str(r.get("Type", "")),
+                source_label,
+                str(r.get("Scope", "")),
+                money0(r.get("Expected", 0.0)),
+                money0(r.get("Received", 0.0)),
+                money0(gap),
+                str(r.get("Status", "")),
+                action,
+            ])
+    else:
+        rec_rows.append(["Manual ledger", "", "Brand", "$0", "$0", "$0", "None", "No manual credits entered"])
+    flows.append(build_premium_table(rec_rows, [1.05 * inch, 0.75 * inch, 0.75 * inch, 0.78 * inch, 0.78 * inch, 0.68 * inch, 0.72 * inch, 0.9 * inch], money_cols=[3, 4, 5], status_cols=[6]))
+    flows.append(Spacer(1, 0.08 * inch))
+    flows.append(_panel("RECOMMENDED BRAND ASK", [meeting_ask], width=7.45 * inch, accent="#D6B800"))
+    if daily_60 is not None and not daily_60.empty:
+        flows.append(Spacer(1, 0.07 * inch))
+        flows.append(_chart_image(chart_daily_brand_sales(daily_60, "Daily Brand Sales"), 7.35 * inch, 2.05 * inch))
+    if str(mode or "").lower() == "quick":
+        flows.append(Spacer(1, 0.08 * inch))
+        flows.append(Paragraph("Detailed Brand Asks", theme["small_v2"]))
+        flows.append(build_premium_table(
+            _premium_action_rows(action_items or [], top_n=5),
+            [0.55 * inch, 0.85 * inch, 1.35 * inch, 2.65 * inch, 1.1 * inch, 0.75 * inch],
+            status_cols=[0],
+            money_cols=[5],
+        ))
+    _section_page(story, "Margin Truth + Credit Reconciliation", flows)
+
+
+def build_brand_action_page_v2(story: List[Any], action_items: Sequence[Dict[str, Any]], mode: str) -> None:
+    top_n = 6 if mode == "quick" else 10 if mode == "standard" else 15
+    rows = _premium_action_rows(action_items, top_n=top_n)
+    _section_page(story, "What The Brand Can Do Better", [
+        build_premium_table(rows, [0.55 * inch, 0.85 * inch, 1.35 * inch, 2.65 * inch, 1.1 * inch, 0.75 * inch], status_cols=[0], money_cols=[5]),
+    ])
+
+
+def build_store_scorecards_page_v2(story: List[Any], store_credit_scorecard: pd.DataFrame, mode: str) -> None:
+    theme = build_brand_packet_theme_v2()
+    cards: List[Any] = []
+    if store_credit_scorecard is not None and not store_credit_scorecard.empty:
+        for _, r in store_credit_scorecard.iterrows():
+            label = f"{str(r.get('_store_abbr', ''))}  {_short_status(r.get('status', ''))}"
+            lines = [
+                f"Revenue {money0(r.get('net_revenue', 0.0))} | Units {int0(r.get('items', 0.0))}",
+                f"Real {pct1(r.get('margin_real', 0.0))} | Rec {pct1(r.get('received_credit_margin', r.get('margin_real', 0.0)))}",
+                f"Credits rec {money0(r.get('received_credit_alloc', 0.0))} | gap {money0(r.get('credit_gap_alloc', 0.0))}",
+                f"Discount {pct1(r.get('discount_rate', 0.0))}",
+                f"Inventory {money0(r.get('inventory_value', 0.0))} | Days {_format_days_supply_v2(r.get('days_of_supply', np.nan), units_on_hand=r.get('units_available', 0.0))}",
+                f"Need: {_store_needed_from_brand(r)}",
+            ]
+            cards.append(_panel(label, lines, width=2.42 * inch, accent="#B54034" if str(r.get("status")) == "Needs Support" else "#D6B800" if str(r.get("status")) == "Watch" else "#2F6B5D"))
+    card_rows: List[List[Any]] = []
+    for i in range(0, len(cards), 3):
+        row = cards[i:i + 3]
+        while len(row) < 3:
+            row.append("")
+        card_rows.append(row)
+    flowables: List[Any] = []
+    if card_rows:
+        card_table = Table(card_rows, colWidths=[2.48 * inch] * 3)
+        card_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+        flowables.append(card_table)
+        flowables.append(Spacer(1, 0.06 * inch))
+    rows = _store_scorecard_rows(store_credit_scorecard)
+    flowables.append(build_premium_table(rows, [0.42 * inch, 0.72 * inch, 0.42 * inch, 0.52 * inch, 0.52 * inch, 0.66 * inch, 0.58 * inch, 0.68 * inch, 0.48 * inch, 0.68 * inch, 0.85 * inch], money_cols=[1, 5, 7], pct_cols=[3, 4, 6], status_cols=[9]))
+    if len(rows) <= 1:
+        flowables.append(Paragraph("No store-level rows were available for this brand/window.", theme["small_v2"]))
+    _section_page(story, "Store Scorecards", flowables)
+
+
+def build_location_performance_overview_v2(story: List[Any], store_sales_packets: Dict[str, Dict[str, Any]]) -> None:
+    if not store_sales_packets:
+        return
+    flows: List[Any] = [
+        Paragraph("Revenue, profit, traffic, discounting, and inventory by location.", build_brand_packet_theme_v2()["small_v2"]),
+        Spacer(1, 0.05 * inch),
+        _chart_image(chart_location_net_profit(store_sales_packets), 7.25 * inch, 2.45 * inch),
+        Spacer(1, 0.06 * inch),
+        build_premium_table(
+            _location_overview_rows(store_sales_packets),
+            [0.42 * inch, 0.77 * inch, 0.72 * inch, 0.78 * inch, 0.58 * inch, 0.55 * inch, 0.58 * inch, 0.52 * inch, 0.58 * inch, 0.72 * inch, 0.55 * inch],
+            money_cols=[1, 2, 3, 6, 9],
+            pct_cols=[4, 8],
+            alignments=["center", "right", "right", "right", "right", "right", "right", "right", "right", "right", "right"],
+        ),
+    ]
+    _section_page(story, "Location Performance Overview", flows)
+
+
+def build_product_category_page_v2(story: List[Any], category_60: pd.DataFrame, product_60: pd.DataFrame, mode: str) -> None:
+    chart_flows: List[Any] = []
+    cat_chart_df = category_60.copy() if category_60 is not None else pd.DataFrame()
+    prod_chart_df = product_60.copy() if product_60 is not None else pd.DataFrame()
+    if not prod_chart_df.empty:
+        prod_chart_df = prod_chart_df.head(8).copy()
+        prod_chart_df["short_product"] = prod_chart_df["product_group_display"].map(lambda x: short_product_label(x, 34))
+    ch_cat = chart_rank_barh(cat_chart_df.head(6), "category_normalized", "net_revenue", "Revenue by Category", value_kind="money") if not cat_chart_df.empty else BytesIO()
+    ch_prod = chart_rank_barh(prod_chart_df, "short_product", "net_revenue", "Revenue by Product Family", value_kind="money") if not prod_chart_df.empty else BytesIO()
+    chart_table = Table([[_chart_image(ch_cat, 3.45 * inch, 2.05 * inch), _chart_image(ch_prod, 3.45 * inch, 2.05 * inch)]], colWidths=[3.65 * inch, 3.65 * inch])
+    chart_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    product_rows = _product_perf_rows(product_60, mode)
+    insights: List[str] = []
+    if product_60 is not None and not product_60.empty:
+        top = product_60.sort_values("net_revenue", ascending=False).iloc[0]
+        insights.append(f"Top revenue driver: {short_product_label(top.get('product_group_display', ''), 52)} at {money0(top.get('net_revenue', 0.0))}.")
+        low_margin = product_60[pd.to_numeric(product_60.get("margin_real", 0.0), errors="coerce").fillna(0.0) < 0.25].sort_values("net_revenue", ascending=False)
+        if not low_margin.empty:
+            r = low_margin.iloc[0]
+            insights.append(f"Margin review: {short_product_label(r.get('product_group_display', ''), 52)} at {pct1(r.get('margin_real', 0.0))}.")
+    if not insights:
+        insights.append("No major product mix flags triggered.")
+    _section_page(story, "Product + Category Performance", [
+        chart_table,
+        Spacer(1, 0.05 * inch),
+        build_premium_table(product_rows, [2.55 * inch, 0.8 * inch, 0.78 * inch, 0.52 * inch, 0.7 * inch, 0.65 * inch, 0.55 * inch], money_cols=[2], pct_cols=[4, 5]),
+        Spacer(1, 0.06 * inch),
+        _panel("PRODUCT SIGNALS", insights[:3], width=7.45 * inch),
+    ])
+
+
+def build_inventory_sellthrough_page_v2(story: List[Any], inv_overview: Dict[str, float], inventory_risk: pd.DataFrame, fast_movers: pd.DataFrame, slow_movers: pd.DataFrame, mode: str) -> None:
+    high_count = int((inventory_risk.get("risk", pd.Series(dtype=str)).astype(str) == "High").sum()) if inventory_risk is not None and not inventory_risk.empty else 0
+    at_risk = 0.0
+    if inventory_risk is not None and not inventory_risk.empty:
+        at_risk = float(pd.to_numeric(inventory_risk.loc[inventory_risk["risk"].isin(["High", "Medium"]), "inventory_value"], errors="coerce").fillna(0.0).sum())
+    cards = [
+        _metric_card("Inventory Value", money0(inv_overview.get("inventory_value", 0.0)), "cost on hand"),
+        _metric_card("Units On Hand", int0(inv_overview.get("units", 0.0)), "current inventory"),
+        _metric_card("Days Supply", _format_days_supply_v2(inv_overview.get("days_of_supply", np.nan), inv_overview.get("trend_units_per_day_30d", inv_overview.get("trend_units_per_day_14d", 0.0)), inv_overview.get("units", 0.0)), "30d pace"),
+        _metric_card("At-Risk Inv", money0(at_risk), f"{high_count} high-risk rows", "#B54034" if at_risk else "#2F6B5D"),
+        _metric_card("Fast Movers", int0(len(fast_movers) if fast_movers is not None else 0), "restock/watch"),
+        _metric_card("Slow Movers", int0(len(slow_movers) if slow_movers is not None else 0), "support needed"),
+    ]
+    fast_rows = _inventory_rows(fast_movers, mode, "fast_movers")
+    slow_rows = _inventory_rows(slow_movers, mode, "slow_movers")
+    _section_page(story, "Inventory + Sell-Through", [
+        _metric_grid(cards, cols=6),
+        Spacer(1, 0.08 * inch),
+        Paragraph("Fast Movers", build_brand_packet_theme_v2()["small_v2"]),
+        build_premium_table(fast_rows, [1.95 * inch, 0.7 * inch, 0.45 * inch, 0.55 * inch, 0.65 * inch, 0.5 * inch, 0.85 * inch], money_cols=[1], pct_cols=[4]),
+        Spacer(1, 0.07 * inch),
+        Paragraph("Slow Movers / Inventory Risk", build_brand_packet_theme_v2()["small_v2"]),
+        build_premium_table(slow_rows, [1.95 * inch, 0.7 * inch, 0.45 * inch, 0.55 * inch, 0.65 * inch, 0.5 * inch, 0.85 * inch], money_cols=[1], pct_cols=[4]),
+    ])
+
+
+def build_store_detail_page_v2(story: List[Any], abbr: str, pkt: Dict[str, Any], mode: str, credit_summary: Dict[str, Any]) -> None:
+    theme = build_brand_packet_theme_v2()
+    wm = pkt.get("window_metrics", {}) or {}
+    metrics = wm.get("report", {}) or {}
+    inv = pkt.get("inventory", {}) or {}
+    daily = pkt.get("daily", pd.DataFrame())
+    category = pkt.get("category_60", pd.DataFrame())
+    product = pkt.get("product_60", pd.DataFrame())
+    inv_products = pkt.get("inventory_products", pd.DataFrame())
+    risk = compute_inventory_risk_v2(product, inv_products)
+    slow = limit_rows_for_pdf(risk[risk.get("risk", pd.Series(dtype=str)).isin(["High", "Medium"])] if not risk.empty else risk, mode, "store_products")
+    top_products = limit_rows_for_pdf(product.sort_values("net_revenue", ascending=False) if product is not None and not product.empty else pd.DataFrame(), mode, "store_products")
+    cards = [
+        _metric_card("Revenue", money0(metrics.get("net_revenue", 0.0)), abbr),
+        _metric_card("Units", int0(metrics.get("items", 0.0)), "sold"),
+        _metric_card("Real Margin", pct1(metrics.get("margin_real", 0.0)), "before credits"),
+        _metric_card("Discount", pct1(metrics.get("discount_rate", 0.0)), money0(metrics.get("discount", 0.0))),
+        _metric_card("Inventory", money0(inv.get("inventory_value", 0.0)), f"{int0(inv.get('units_available', 0.0))} units"),
+        _metric_card("Days Supply", _format_days_supply_v2(inv.get("days_of_supply", np.nan), inv.get("trend_units_per_day_30d", 0.0), inv.get("units_available", 0.0)), "store pace"),
+    ]
+    product_rows = _product_perf_rows(top_products, mode)
+    slow_rows = _inventory_rows(slow, mode, "store_products")
+    metric_table = build_premium_table(_store_metric_detail_rows(metrics, inv), [1.2 * inch, 1.25 * inch], money_cols=[1], pct_cols=[1])
+    category_rows = _category_rows(category, mode)
+    category_table = build_premium_table(category_rows, [1.35 * inch, 0.7 * inch, 0.42 * inch, 0.55 * inch, 0.55 * inch], money_cols=[1], pct_cols=[3, 4])
+    trend_chart = _chart_image(chart_daily_net_profit(daily, f"{abbr} Daily Net Sales + Profit"), 7.25 * inch, 2.25 * inch)
+    margin_chart = _chart_image(chart_daily_margin(daily, f"{abbr} Daily Real Margin"), 3.55 * inch, 1.75 * inch) if daily is not None and not daily.empty else Spacer(1, 0.01 * inch)
+    top_flowables: List[Any] = [
+        _metric_grid(cards, cols=6),
+        Spacer(1, 0.06 * inch),
+        trend_chart,
+        Spacer(1, 0.05 * inch),
+        Table([
+            [
+                metric_table,
+                Table([[margin_chart], [category_table]], colWidths=[4.9 * inch]),
+            ]
+        ], colWidths=[2.45 * inch, 4.95 * inch]),
+        Spacer(1, 0.06 * inch),
+        _panel("STORE ASK", [f"{abbr}: {_store_needed_from_brand(pd.Series({'status': 'Watch', 'discount_rate': metrics.get('discount_rate', 0.0), 'days_of_supply': inv.get('days_of_supply', 0.0), 'margin_real': metrics.get('margin_real', 0.0)}))}."], width=7.45 * inch),
+    ]
+    _section_page(story, f"{abbr} Store Detail", top_flowables)
+
+    detail_flowables: List[Any] = [
+        Paragraph("Top Product Groups", theme["small_v2"]),
+        build_premium_table(
+            product_rows,
+            [2.70 * inch, 0.85 * inch, 0.82 * inch, 0.55 * inch, 0.72 * inch, 0.68 * inch, 0.58 * inch],
+            money_cols=[2],
+            pct_cols=[4, 5],
+        ),
+        Spacer(1, 0.05 * inch),
+        Paragraph("Slow Movers / Inventory Risk", theme["small_v2"]),
+        build_premium_table(
+            slow_rows,
+            [2.70 * inch, 0.82 * inch, 0.52 * inch, 0.62 * inch, 0.70 * inch, 0.58 * inch, 0.95 * inch],
+            money_cols=[1],
+            pct_cols=[4],
+        ),
+        Spacer(1, 0.05 * inch),
+    ]
+    _section_page(story, f"{abbr} Products + Inventory Risk", detail_flowables)
+
+
+def build_appendix_v2(story: List[Any], product_60: pd.DataFrame, category_60: pd.DataFrame, credit_reconciliation: pd.DataFrame, inventory_risk: pd.DataFrame, mode: str) -> None:
+    if mode == "quick":
+        return
+    appendix_n = 25 if mode == "standard" else 50
+    flows: List[Any] = []
+    if credit_reconciliation is not None and not credit_reconciliation.empty:
+        rows = [["Source", "Type", "Store", "Expected", "Received", "Gap", "Status", "Memo"]]
+        for _, r in credit_reconciliation.head(appendix_n).iterrows():
+            rows.append([
+                r.get("Source", ""),
+                r.get("Type", ""),
+                r.get("Store", "") or r.get("Scope", ""),
+                money0(r.get("Expected", 0.0)),
+                money0(r.get("Received", 0.0)),
+                money0(r.get("Gap", 0.0)),
+                r.get("Status", ""),
+                r.get("Invoice Reference", "") or r.get("Credit ID", ""),
+            ])
+        flows.extend([Paragraph("Credit Ledger Detail", build_brand_packet_theme_v2()["small_v2"]), build_premium_table(rows, [0.75 * inch, 1.0 * inch, 0.62 * inch, 0.78 * inch, 0.78 * inch, 0.7 * inch, 0.68 * inch, 1.08 * inch], money_cols=[3, 4, 5]), Spacer(1, 0.08 * inch)])
+    rows = _product_perf_rows(product_60.head(appendix_n), "deep")
+    flows.extend([Paragraph("Top Product Detail", build_brand_packet_theme_v2()["small_v2"]), build_premium_table(rows, [2.55 * inch, 0.8 * inch, 0.78 * inch, 0.52 * inch, 0.7 * inch, 0.65 * inch, 0.55 * inch], money_cols=[2], pct_cols=[4, 5])])
+    _section_page(story, "Appendix / Data Detail", flows, page_break=False)
+
+
+def build_brand_packet_premium_pdf(
+    out_pdf: Path,
+    brand: str,
+    start_day: date,
+    end_day: date,
+    options: PacketOptions,
+    windows: Dict[str, Tuple[date, date]],
+    window_metrics: Dict[str, Dict[str, float]],
+    prior_window_covered: bool,
+    daily_60: pd.DataFrame,
+    store_60: pd.DataFrame,
+    category_60: pd.DataFrame,
+    product_60: pd.DataFrame,
+    movers_store: pd.DataFrame,
+    movers_category: pd.DataFrame,
+    movers_product: pd.DataFrame,
+    inv_overview: Dict[str, float],
+    inv_products: pd.DataFrame,
+    inv_category: pd.DataFrame,
+    inv_store: pd.DataFrame,
+    store_sales_packets: Dict[str, Dict[str, Any]],
+    missing_sales_stores: Sequence[str],
+    missing_catalog_stores: Sequence[str],
+    credit_summary: Optional[Dict[str, Any]] = None,
+    credit_reconciliation: Optional[pd.DataFrame] = None,
+    action_items: Optional[Sequence[Dict[str, Any]]] = None,
+    monthly_reference: Optional[Dict[str, Any]] = None,
+    health_score: int = 0,
+    health_status: str = "",
+    health_reason: str = "",
+    meeting_ask: str = "",
+    store_credit_scorecard: Optional[pd.DataFrame] = None,
+) -> None:
+    osnap.setup_fonts()
+    theme = build_brand_packet_theme_v2()
+    credit_summary = credit_summary or {}
+    credit_reconciliation = credit_reconciliation if credit_reconciliation is not None else pd.DataFrame()
+    action_items = list(action_items or [])
+    store_credit_scorecard = store_credit_scorecard if store_credit_scorecard is not None else pd.DataFrame()
+    mode = str(options.packet_mode or "standard").lower()
+    report_metrics = window_metrics.get("report", {})
+    generated_at = datetime.now(ZoneInfo(REPORT_TZ)).strftime("%b %d, %Y %I:%M %p")
+    inventory_risk = compute_inventory_risk_v2(product_60, inv_products)
+    fast_movers = compute_fast_movers_v2(product_60, inv_products)
+    slow_movers = compute_slow_movers_v2(product_60, inv_products)
+
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    doc = SimpleDocTemplate(
+        str(out_pdf),
+        pagesize=letter,
+        leftMargin=0.42 * inch,
+        rightMargin=0.42 * inch,
+        topMargin=0.38 * inch,
+        bottomMargin=0.42 * inch,
+        pageCompression=1,
+        title=f"Brand Meeting Packet - {brand}",
+        author="Buzz Automation",
+    )
+    story: List[Any] = []
+    build_cover_dashboard_v2(story, brand, start_day, end_day, options, order_store_codes(list(store_sales_packets.keys()) or list(store_60.get("_store_abbr", []))), generated_at, report_metrics, credit_summary, inv_overview, inventory_risk, action_items, health_score, health_status, health_reason, meeting_ask)
+    build_margin_truth_page_v2(story, credit_summary, credit_reconciliation, meeting_ask, mode, action_items=action_items, daily_60=daily_60)
+    if mode != "quick":
+        build_brand_action_page_v2(story, action_items, mode)
+    build_store_scorecards_page_v2(story, store_credit_scorecard, mode)
+    build_location_performance_overview_v2(story, store_sales_packets)
+    build_product_category_page_v2(story, category_60, product_60, mode)
+    build_inventory_sellthrough_page_v2(story, inv_overview, inventory_risk, fast_movers, slow_movers, mode)
+    if mode in {"standard", "deep"} and options.include_store_sections:
+        for abbr in order_store_codes(list(store_sales_packets.keys())):
+            build_store_detail_page_v2(story, abbr, store_sales_packets.get(abbr, {}), mode, credit_summary)
+    if mode in {"standard", "deep"} and options.include_product_appendix:
+        build_appendix_v2(story, product_60, category_60, credit_reconciliation, inventory_risk, mode)
+
+    footer = _footer(f"Brand Review - {brand} - {mode.title()}", end_day)
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
 
 
 def _metrics_table_rows(metrics: Dict[str, float]) -> List[List[Any]]:
@@ -5967,10 +7651,27 @@ def build_brand_packet_quick_pdf(
     store_sales_packets: Dict[str, Dict[str, Any]],
     missing_sales_stores: Sequence[str],
     missing_catalog_stores: Sequence[str],
+    credit_summary: Optional[Dict[str, Any]] = None,
+    credit_reconciliation: Optional[pd.DataFrame] = None,
+    action_items: Optional[Sequence[Dict[str, Any]]] = None,
+    monthly_reference: Optional[Dict[str, Any]] = None,
+    health_score: int = 0,
+    health_status: str = "",
+    health_reason: str = "",
+    meeting_ask: str = "",
+    store_credit_scorecard: Optional[pd.DataFrame] = None,
 ) -> None:
     osnap.setup_fonts()
     styles = osnap.build_styles()
     generated_at = datetime.now(ZoneInfo(REPORT_TZ)).strftime("%B %d, %Y at %I:%M %p %Z")
+    credit_summary = credit_summary or {}
+    credit_reconciliation = credit_reconciliation if credit_reconciliation is not None else pd.DataFrame()
+    action_items = list(action_items or [])
+    monthly_reference = monthly_reference or {}
+    store_credit_scorecard = store_credit_scorecard if store_credit_scorecard is not None else pd.DataFrame()
+    mode = str(options.packet_mode or "standard").lower()
+    main_top_n = 6 if mode == "quick" else (15 if mode == "deep" else 10)
+    main_top_n = min(max(5, int(options.top_n or main_top_n)), main_top_n)
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     doc = SimpleDocTemplate(
@@ -6031,6 +7732,84 @@ def build_brand_packet_quick_pdf(
             styles["Muted"],
         ))
 
+    story.append(Spacer(1, 0.04 * inch))
+    if options.include_credit_reconciliation:
+        story.append(Paragraph(
+            f"<b>Meeting Status:</b> {xml_escape(health_status or 'Review')} &nbsp;&nbsp; "
+            f"<b>Brand Health:</b> {int(health_score or 0)}/100 &nbsp;&nbsp; "
+            f"<b>Why:</b> {xml_escape(health_reason or 'No health flags generated.')}",
+            styles["Muted"],
+        ))
+        story.append(Spacer(1, 0.04 * inch))
+        story.append(_credit_metric_grid(styles, credit_summary, int(health_score or 0), health_status or "Review"))
+        story.append(Spacer(1, 0.05 * inch))
+        ask = meeting_ask or generate_meeting_ask(credit_summary, action_items)
+        story.append(Paragraph(f"<b>Recommended Meeting Ask:</b> {xml_escape(ask)}", styles["Muted"]))
+        if action_items:
+            rows = _action_item_rows(action_items, top_n=3)
+            story.append(Spacer(1, 0.04 * inch))
+            story.append(_build_table_fit(
+                ["Priority", "Category", "Problem", "Evidence", "Brand Action", "Affected", "$"],
+                rows,
+                [0.65 * inch, 1.0 * inch, 1.15 * inch, 1.85 * inch, 1.15 * inch, 1.0 * inch, 0.5 * inch],
+            ))
+        story.append(PageBreak())
+
+        story.append(Paragraph("Margin Truth + Credit Reconciliation", styles["TitleBig"]))
+        story.append(Paragraph(
+            "Real margin uses actual sales and COGS only. Expected and received margins are shown separately so support is not double-counted.",
+            styles["Tiny"],
+        ))
+        story.append(Spacer(1, 0.05 * inch))
+        story.append(_credit_metric_grid(styles, credit_summary, int(health_score or 0), health_status or "Review"))
+        rec_rows = _credit_reconciliation_rows(credit_reconciliation, top_n=main_top_n + 2)
+        if rec_rows:
+            story.append(Spacer(1, 0.06 * inch))
+            story.append(_build_table_fit(
+                ["Type", "Scope", "Expected", "Received", "Gap", "Status", "Lift Exp", "Lift Rec", "Notes"],
+                rec_rows,
+                [0.95 * inch, 0.9 * inch, 0.8 * inch, 0.8 * inch, 0.75 * inch, 0.7 * inch, 0.65 * inch, 0.65 * inch, 1.1 * inch],
+            ))
+        else:
+            story.append(Paragraph("No manual credit ledger rows matched this brand/date window.", styles["Muted"]))
+        story.append(Spacer(1, 0.05 * inch))
+        story.append(Paragraph(f"<b>Recommended Ask:</b> {xml_escape(ask)}", styles["Muted"]))
+        story.append(PageBreak())
+
+        story.append(Paragraph("What The Brand Can Do Better", styles["TitleBig"]))
+        action_rows = _action_item_rows(action_items, top_n=main_top_n)
+        if action_rows:
+            story.append(_build_table_fit(
+                ["Priority", "Category", "Problem", "Evidence", "Brand Action", "Affected", "$"],
+                action_rows,
+                [0.65 * inch, 1.0 * inch, 1.15 * inch, 1.95 * inch, 1.15 * inch, 1.0 * inch, 0.45 * inch],
+            ))
+        else:
+            story.append(Paragraph("No high-priority rule-based action items were triggered for this window.", styles["Muted"]))
+        story.append(Spacer(1, 0.05 * inch))
+
+        store_credit_rows = _store_credit_rows(store_credit_scorecard)
+        if store_credit_rows:
+            story.append(Paragraph("Store Scorecards", styles["Section"]))
+            story.append(_build_table_fit(
+                ["Store", "Net", "Units", "Real Margin", "Rec. Credit Margin", "Credit Gap", "Disc Rate", "Inventory", "Days Supply", "Status"],
+                store_credit_rows,
+                [0.45 * inch, 0.85 * inch, 0.55 * inch, 0.75 * inch, 0.95 * inch, 0.8 * inch, 0.7 * inch, 0.8 * inch, 0.75 * inch, 0.7 * inch],
+            ))
+            story.append(Spacer(1, 0.05 * inch))
+
+        monthly_rows = _monthly_reference_rows(monthly_reference, top_n=main_top_n)
+        if monthly_rows:
+            story.append(Paragraph("Monthly Context", styles["Section"]))
+            story.append(_build_table_fit(
+                ["Context", "Store", "Revenue", "Margin", "Disc Rate", "Note"],
+                monthly_rows,
+                [1.0 * inch, 0.75 * inch, 1.0 * inch, 0.75 * inch, 0.75 * inch, 3.05 * inch],
+            ))
+        elif options.include_monthly_reference:
+            story.append(Paragraph("Monthly owner-report reference was not available for this date window.", styles["Tiny"]))
+        story.append(PageBreak())
+
     if category_60 is not None and not category_60.empty:
         story.append(Spacer(1, 0.05 * inch))
         story.append(Paragraph("Top Categories (All Stores, 60d)", styles["Section"]))
@@ -6047,7 +7826,7 @@ def build_brand_packet_quick_pdf(
                 story.append(Spacer(1, 0.04 * inch))
 
         cat_rows = []
-        for r in category_60.head(10).itertuples(index=False):
+        for r in category_60.head(main_top_n).itertuples(index=False):
             cat_rows.append([
                 str(getattr(r, "category_normalized", "")),
                 money0(float(getattr(r, "net_revenue", 0.0))),
@@ -6842,6 +8621,15 @@ def build_brand_packet_xlsx(
     inv_category: pd.DataFrame,
     margin_risk: pd.DataFrame,
     best_candidates: pd.DataFrame,
+    credit_summary: Optional[Dict[str, Any]] = None,
+    credit_reconciliation: Optional[pd.DataFrame] = None,
+    credit_ledger_rows: Optional[pd.DataFrame] = None,
+    store_credit_scorecard: Optional[pd.DataFrame] = None,
+    action_items: Optional[Sequence[Dict[str, Any]]] = None,
+    monthly_reference: Optional[Dict[str, Any]] = None,
+    inventory_risk: Optional[pd.DataFrame] = None,
+    slow_movers: Optional[pd.DataFrame] = None,
+    fast_movers: Optional[pd.DataFrame] = None,
 ) -> None:
     out_xlsx.parent.mkdir(parents=True, exist_ok=True)
 
@@ -6853,8 +8641,29 @@ def build_brand_packet_xlsx(
 
     summary_df = pd.DataFrame(summary_rows)
     inv_summary_df = pd.DataFrame([inv_overview])
+    inventory_risk = inventory_risk if inventory_risk is not None else compute_inventory_risk_v2(product_60, inv_products)
+    slow_movers = slow_movers if slow_movers is not None else compute_slow_movers_v2(product_60, inv_products)
+    fast_movers = fast_movers if fast_movers is not None else compute_fast_movers_v2(product_60, inv_products)
 
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Meeting Summary", index=False)
+        pd.DataFrame([credit_summary or {}]).to_excel(writer, sheet_name="Credit Summary", index=False)
+        _credit_source_summary(credit_reconciliation).to_excel(writer, sheet_name="Credit Source Summary", index=False)
+        (credit_reconciliation if credit_reconciliation is not None else pd.DataFrame()).to_excel(writer, sheet_name="Credit Reconciliation", index=False)
+        (credit_ledger_rows if credit_ledger_rows is not None else pd.DataFrame()).to_excel(writer, sheet_name="Credit Ledger", index=False)
+        (store_credit_scorecard if store_credit_scorecard is not None else pd.DataFrame()).to_excel(writer, sheet_name="Store Scorecards", index=False)
+        pd.DataFrame(list(action_items or [])).to_excel(writer, sheet_name="Action Items", index=False)
+        product_60.to_excel(writer, sheet_name="Product Performance", index=False)
+        category_60.to_excel(writer, sheet_name="Category Performance", index=False)
+        (inventory_risk if inventory_risk is not None else pd.DataFrame()).to_excel(writer, sheet_name="Inventory Risk", index=False)
+        (slow_movers if slow_movers is not None else pd.DataFrame()).to_excel(writer, sheet_name="Slow Movers", index=False)
+        (fast_movers if fast_movers is not None else pd.DataFrame()).to_excel(writer, sheet_name="Fast Movers", index=False)
+        if monthly_reference and isinstance(monthly_reference.get("brand_rows"), pd.DataFrame):
+            monthly_reference["brand_rows"].to_excel(writer, sheet_name="Monthly Reference", index=False)
+        else:
+            pd.DataFrame().to_excel(writer, sheet_name="Monthly Reference", index=False)
+        inv_products.to_excel(writer, sheet_name="Raw Product Detail", index=False)
+
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
         inv_summary_df.to_excel(writer, sheet_name="Inventory_Summary", index=False)
 
@@ -6872,6 +8681,33 @@ def build_brand_packet_xlsx(
         inv_category.to_excel(writer, sheet_name="Inv_Category", index=False)
         margin_risk.to_excel(writer, sheet_name="Margin_Risk", index=False)
         best_candidates.to_excel(writer, sheet_name="Best_Candidates", index=False)
+
+        pd.DataFrame([credit_summary or {}]).to_excel(writer, sheet_name="Credit_Summary", index=False)
+        _credit_source_summary(credit_reconciliation).to_excel(writer, sheet_name="Credit_Source_Summary", index=False)
+        (credit_reconciliation if credit_reconciliation is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="Credit_Reconciliation",
+            index=False,
+        )
+        (credit_ledger_rows if credit_ledger_rows is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="Credit_Ledger",
+            index=False,
+        )
+        (store_credit_scorecard if store_credit_scorecard is not None else pd.DataFrame()).to_excel(
+            writer,
+            sheet_name="Store_Scorecards",
+            index=False,
+        )
+        pd.DataFrame(list(action_items or [])).to_excel(writer, sheet_name="Action_Items", index=False)
+        if monthly_reference and isinstance(monthly_reference.get("brand_rows"), pd.DataFrame):
+            monthly_reference["brand_rows"].to_excel(writer, sheet_name="Monthly_Reference", index=False)
+        else:
+            pd.DataFrame().to_excel(writer, sheet_name="Monthly_Reference", index=False)
+        if monthly_reference and isinstance(monthly_reference.get("inventory_rows"), pd.DataFrame):
+            monthly_reference["inventory_rows"].to_excel(writer, sheet_name="Monthly_Inventory_Risk", index=False)
+        else:
+            pd.DataFrame().to_excel(writer, sheet_name="Monthly_Inventory_Risk", index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -6917,6 +8753,8 @@ def send_brand_packet_email(
     top_store_name: str,
     to_email: str,
     logger: Optional[Callable[[str], None]],
+    credit_summary: Optional[Dict[str, Any]] = None,
+    meeting_ask: str = "",
 ) -> None:
     service = _build_gmail_service()
 
@@ -6926,6 +8764,27 @@ def send_brand_packet_email(
     for r in top_products.head(3).itertuples(index=False):
         name = str(getattr(r, "product_group_display", getattr(r, "display_product", "")))
         top_lines.append(f"- {name}: {money0(float(r.net_revenue))}")
+    credit_summary = credit_summary or {}
+    credit_plain = ""
+    credit_html = ""
+    if credit_summary:
+        credit_plain = (
+            f"\nCredit + Margin Truth:\n"
+            f"Real Margin: {pct1(credit_summary.get('real_margin', report_metrics.get('margin_real', 0.0)))}\n"
+            f"Expected Credit Margin: {pct1(credit_summary.get('expected_credit_margin', 0.0))}\n"
+            f"Received Credit Margin: {pct1(credit_summary.get('received_credit_margin', 0.0))}\n"
+            f"Credit Gap: {money0(credit_summary.get('credit_gap', 0.0))}\n"
+            f"Meeting Ask: {meeting_ask or 'Confirm margin support and next steps.'}\n"
+        )
+        credit_html = f"""
+      <br/>
+      <div><b>Credit + Margin Truth:</b></div>
+      <div>Real Margin: {pct1(credit_summary.get('real_margin', report_metrics.get('margin_real', 0.0)))}</div>
+      <div>Expected Credit Margin: {pct1(credit_summary.get('expected_credit_margin', 0.0))}</div>
+      <div>Received Credit Margin: {pct1(credit_summary.get('received_credit_margin', 0.0))}</div>
+      <div>Credit Gap: {money0(credit_summary.get('credit_gap', 0.0))}</div>
+      <div>Meeting Ask: {xml_escape(meeting_ask or 'Confirm margin support and next steps.')}</div>
+        """
 
     plain = (
         f"Brand Meeting Packet\n"
@@ -6948,6 +8807,7 @@ def send_brand_packet_email(
         f"Trend Units/Day (7d): {float(inv_overview.get('trend_units_per_day_7d', 0.0)):,.1f}\n"
         f"Days of Supply: {days1(inv_overview.get('days_of_supply', np.nan))}\n"
         f"Est. OOS Date: {inv_overview.get('est_oos_date', 'n/a')}\n"
+        f"{credit_plain}"
     )
 
     html = f"""
@@ -6973,6 +8833,7 @@ def send_brand_packet_email(
       <div>Trend Units/Day (7d): {float(inv_overview.get('trend_units_per_day_7d', 0.0)):,.1f}</div>
       <div>Days of Supply: {days1(inv_overview.get('days_of_supply', np.nan))}</div>
       <div>Est. OOS Date: {inv_overview.get('est_oos_date', 'n/a')}</div>
+      {credit_html}
     </div>
     """
 
@@ -7495,6 +9356,143 @@ def generate_brand_meeting_packet(
     margin_risk = inv_products[inv_products["margin_current"] < 0.35].copy() if not inv_products.empty else pd.DataFrame()
     best_candidates = inv_products[(inv_products["margin_current"] > 0.55) & (inv_products["units_available"] > 10)].copy() if not inv_products.empty else pd.DataFrame()
 
+    targets_payload = load_targets(THIS_DIR / "brand_meeting_targets.json")
+    brand_targets = get_brand_targets(targets_payload, brand)
+    target_margin = float(options.target_margin if options.target_margin is not None else brand_targets.get("target_margin", DEAL_TARGET_MARGIN))
+    brand_targets["target_margin"] = target_margin
+
+    all_credit_rows: List[Dict[str, Any]] = []
+    credit_ledger_df = pd.DataFrame()
+    credit_summary: Dict[str, Any] = {
+        "brand": brand,
+        "target_margin": target_margin,
+        "net_revenue": float(window_metrics.get("report", {}).get("net_revenue", 0.0)),
+        "real_profit": float(window_metrics.get("report", {}).get("profit_real", 0.0)),
+        "real_margin": float(window_metrics.get("report", {}).get("margin_real", 0.0)),
+        "system_expected_credit": 0.0,
+        "manual_expected_credit": 0.0,
+        "manual_received_credit": 0.0,
+        "expected_credit_amount": 0.0,
+        "received_credit_amount": 0.0,
+        "credit_gap": 0.0,
+        "expected_credit_margin": float(window_metrics.get("report", {}).get("margin_real", 0.0)),
+        "received_credit_margin": float(window_metrics.get("report", {}).get("margin_real", 0.0)),
+        "credit_needed_to_hit_target": 0.0,
+    }
+    credit_reconciliation = pd.DataFrame()
+    if options.include_credit_reconciliation:
+        ledger_path = Path(options.credit_ledger_path or "brand_credit_ledger.json")
+        if not ledger_path.is_absolute():
+            ledger_path = THIS_DIR / ledger_path
+        manual_credit_rows = load_credit_ledger(ledger_path)
+        all_credit_rows = list(manual_credit_rows)
+        creditflow_rows: List[Dict[str, Any]] = []
+        if options.include_creditflow_credits:
+            creditflow_rows, creditflow_meta = fetch_creditflow_credits_for_brand(
+                brand=brand,
+                start_day=start_day,
+                end_day=end_day,
+                env_file=THIS_DIR / options.api_env_file,
+                base_url=options.creditflow_base_url,
+                aliases=brand_aliases,
+            )
+            try:
+                write_creditflow_cache(paths.cache_dir / "creditflow_credits_cache.json", creditflow_rows, creditflow_meta)
+            except Exception:
+                pass
+            _print_creditflow_pull_audit(brand, creditflow_rows, creditflow_meta)
+            if creditflow_meta.get("warning"):
+                _log(f"[CREDITFLOW] {creditflow_meta.get('warning')}", logger)
+            else:
+                _log(
+                    f"[CREDITFLOW] matched {len(creditflow_rows)} of {creditflow_meta.get('raw_credits', 0)} credits "
+                    f"for {brand} ({creditflow_meta.get('brands', 0)} brands, {creditflow_meta.get('stores', 0)} stores loaded).",
+                    logger,
+                )
+            all_credit_rows.extend(creditflow_rows)
+        credit_ledger_df = ledger_to_dataframe(all_credit_rows)
+        system_expected_credit = float(window_metrics.get("report", {}).get("kickback_total", 0.0) or 0.0)
+        credit_summary, credit_reconciliation = summarize_credit_reconciliation(
+            all_credit_rows,
+            report_df,
+            brand=brand,
+            start_day=start_day,
+            end_day=end_day,
+            target_margin=target_margin,
+            system_expected_credit=system_expected_credit,
+        )
+        if not credit_reconciliation.empty:
+            src = credit_reconciliation.get("Source", pd.Series("", index=credit_reconciliation.index)).astype(str).str.lower()
+            cf_mask = src.eq("creditflow")
+            ledger_mask = src.eq("manual")
+            credit_summary["creditflow_expected_credit"] = float(pd.to_numeric(credit_reconciliation.loc[cf_mask, "Expected"], errors="coerce").fillna(0.0).sum())
+            credit_summary["creditflow_received_credit"] = float(pd.to_numeric(credit_reconciliation.loc[cf_mask, "Received"], errors="coerce").fillna(0.0).sum())
+            credit_summary["creditflow_gap"] = float(pd.to_numeric(credit_reconciliation.loc[cf_mask, "Gap"], errors="coerce").fillna(0.0).sum())
+            credit_summary["creditflow_open_rows"] = int(
+                (cf_mask & credit_reconciliation.get("Status", pd.Series("", index=credit_reconciliation.index)).astype(str).str.lower().isin({"expected", "partial", "overdue"})).sum()
+            )
+            credit_summary["ledger_expected_credit"] = float(pd.to_numeric(credit_reconciliation.loc[ledger_mask, "Expected"], errors="coerce").fillna(0.0).sum())
+            credit_summary["ledger_received_credit"] = float(pd.to_numeric(credit_reconciliation.loc[ledger_mask, "Received"], errors="coerce").fillna(0.0).sum())
+            credit_summary["ledger_gap"] = float(pd.to_numeric(credit_reconciliation.loc[ledger_mask, "Gap"], errors="coerce").fillna(0.0).sum())
+        else:
+            credit_summary["creditflow_expected_credit"] = 0.0
+            credit_summary["creditflow_received_credit"] = 0.0
+            credit_summary["creditflow_gap"] = 0.0
+            credit_summary["creditflow_open_rows"] = 0
+            credit_summary["ledger_expected_credit"] = 0.0
+            credit_summary["ledger_received_credit"] = 0.0
+            credit_summary["ledger_gap"] = 0.0
+        window_metrics["report"].update({
+            "target_margin": target_margin,
+            "expected_credit_amount": float(credit_summary.get("expected_credit_amount", 0.0)),
+            "received_credit_amount": float(credit_summary.get("received_credit_amount", 0.0)),
+            "credit_gap": float(credit_summary.get("credit_gap", 0.0)),
+            "expected_credit_margin": float(credit_summary.get("expected_credit_margin", 0.0)),
+            "received_credit_margin": float(credit_summary.get("received_credit_margin", 0.0)),
+        })
+        try:
+            export_credit_csv(paths.cache_dir / "brand_credit_ledger_export.csv", all_credit_rows)
+        except Exception:
+            pass
+        _log(
+            f"[CREDITS] rows={len(all_credit_rows)} manual={len(manual_credit_rows)} creditflow={len(creditflow_rows)} "
+            f"expected={money0(credit_summary.get('expected_credit_amount', 0.0))} "
+            f"received={money0(credit_summary.get('received_credit_amount', 0.0))} gap={money0(credit_summary.get('credit_gap', 0.0))}",
+            logger,
+        )
+
+    store_credit_scorecard = _store_credit_scorecard(
+        store_60,
+        inv_store,
+        credit_summary,
+        target_margin,
+        top_n=max(options.top_n, 12),
+        credit_reconciliation=credit_reconciliation,
+    )
+    monthly_reference: Dict[str, Any] = {}
+    if options.include_monthly_reference:
+        monthly_reference = load_monthly_reference(brand, start_day, end_day)
+        if monthly_reference.get("available"):
+            _log(f"[MONTHLY] Loaded owner monthly reference for {monthly_reference.get('month')}.", logger)
+        else:
+            _log(f"[MONTHLY] Owner monthly reference not found for {monthly_reference.get('month')}.", logger)
+    action_items = generate_brand_action_items(
+        metrics=window_metrics.get("report", {}),
+        credit_summary=credit_summary,
+        inv_products=inv_products,
+        store_df=store_60,
+        targets=brand_targets,
+        max_items=12,
+    )
+    health_score, health_status, health_reason = generate_brand_health_score(
+        metrics=window_metrics.get("report", {}),
+        credit_summary=credit_summary,
+        inv_overview=inv_overview,
+        store_df=store_60,
+        targets=brand_targets,
+    )
+    meeting_ask = generate_meeting_ask(credit_summary, action_items)
+
     # Persist cache CSVs for debugging / quick QA
     try:
         p_sales = paths.cache_dir / "sales_brand_rows.csv"
@@ -7504,6 +9502,10 @@ def generate_brand_meeting_packet(
         p_pg14 = paths.cache_dir / "product_groups_14d.csv"
         p_pg30 = paths.cache_dir / "product_groups_30d.csv"
         p_inv = paths.cache_dir / "inventory_products.csv"
+        p_credit = paths.cache_dir / "credit_reconciliation.csv"
+        p_credit_source = paths.cache_dir / "credit_source_summary.csv"
+        p_actions = paths.cache_dir / "brand_action_items.csv"
+        p_store_credit = paths.cache_dir / "store_credit_scorecards.csv"
 
         report_df.to_csv(p_sales, index=False)
         last14_df.to_csv(p_sales_14, index=False)
@@ -7512,6 +9514,10 @@ def generate_brand_meeting_packet(
         product_14.to_csv(p_pg14, index=False)
         add_supply_to_product_groups(summarize_product_groups(last30_df), all_pg_units_day_map, all_pg_dos_map).to_csv(p_pg30, index=False)
         inv_products.to_csv(p_inv, index=False)
+        credit_reconciliation.to_csv(p_credit, index=False)
+        _credit_source_summary(credit_reconciliation).to_csv(p_credit_source, index=False)
+        pd.DataFrame(action_items).to_csv(p_actions, index=False)
+        store_credit_scorecard.to_csv(p_store_credit, index=False)
 
         # DOS QA files: shows the trend keys and how sales/inventory align.
         sales_q_grp = pd.DataFrame(columns=["supply_base_key", "supply_merge_key", "units_sold"])
@@ -7571,7 +9577,8 @@ def generate_brand_meeting_packet(
     )
     out_quick_pdf = paths.pdf_dir / quick_pdf_name
 
-    build_brand_packet_quick_pdf(
+    pdf_builder = build_brand_packet_premium_pdf if options.compact_pdf_mode else build_brand_packet_quick_pdf
+    pdf_builder(
         out_pdf=out_quick_pdf,
         brand=brand,
         start_day=start_day,
@@ -7594,8 +9601,17 @@ def generate_brand_meeting_packet(
         store_sales_packets=store_sales_packets,
         missing_sales_stores=missing_sales_stores,
         missing_catalog_stores=missing_catalog_stores,
+        credit_summary=credit_summary,
+        credit_reconciliation=credit_reconciliation,
+        action_items=action_items,
+        monthly_reference=monthly_reference,
+        health_score=health_score,
+        health_status=health_status,
+        health_reason=health_reason,
+        meeting_ask=meeting_ask,
+        store_credit_scorecard=store_credit_scorecard,
     )
-    _log(f"[PDF] Created (Quick Store Dashboards): {out_quick_pdf}", logger)
+    _log(f"[PDF] Created ({'Premium Compact' if options.compact_pdf_mode else 'Quick Store Dashboards'}): {out_quick_pdf}", logger)
 
     out_xlsx: Optional[Path] = None
     if options.generate_xlsx:
@@ -7618,8 +9634,32 @@ def generate_brand_meeting_packet(
             inv_category,
             margin_risk,
             best_candidates,
+            credit_summary=credit_summary,
+            credit_reconciliation=credit_reconciliation,
+            credit_ledger_rows=credit_ledger_df,
+            store_credit_scorecard=store_credit_scorecard,
+            action_items=action_items,
+            monthly_reference=monthly_reference,
         )
         _log(f"[XLSX] Created: {out_xlsx}", logger)
+
+    followup_notes_path: Optional[Path] = None
+    if options.generate_followup_notes:
+        followup_name = safe_filename(f"Brand Meeting Follow-Up - {brand} - {start_day.isoformat()}_to_{end_day.isoformat()}.txt")
+        followup_notes_path = paths.pdf_dir / followup_name
+        followup_notes_path.write_text(
+            build_followup_text(
+                brand=brand,
+                start_day=start_day,
+                end_day=end_day,
+                metrics=window_metrics.get("report", {}),
+                credit_summary=credit_summary,
+                action_items=action_items,
+                meeting_ask=meeting_ask,
+            ),
+            encoding="utf-8",
+        )
+        _log(f"[NOTES] Created: {followup_notes_path}", logger)
 
     if options.email_results:
         top_store = "N/A"
@@ -7638,6 +9678,8 @@ def generate_brand_meeting_packet(
             top_store_name=top_store,
             to_email=DEFAULT_REPORT_EMAIL,
             logger=logger,
+            credit_summary=credit_summary,
+            meeting_ask=meeting_ask,
         )
 
     _log("Done ✅", logger)
@@ -7647,6 +9689,7 @@ def generate_brand_meeting_packet(
         detail_pdf_path=out_quick_pdf,
         pdf_path=out_quick_pdf,
         xlsx_path=out_xlsx,
+        followup_notes_path=followup_notes_path,
         run_paths=paths,
         missing_sales_stores=missing_sales_stores,
         missing_catalog_stores=missing_catalog_stores,
@@ -7686,6 +9729,25 @@ def parse_cli_args() -> argparse.Namespace:
     p.add_argument("--xlsx", action="store_true", help="Also generate XLSX workbook.")
     p.add_argument("--force-refresh", action="store_true", help="Ignore cached inputs for this run and download fresh data.")
     p.add_argument("--no-prior-data", action="store_true", help="Use only the selected report window and disable prior-comparison data.")
+    p.add_argument("--include-credit-reconciliation", dest="include_credit_reconciliation", action="store_true", help="Include manual credit/support reconciliation (default).")
+    p.add_argument("--no-credit-reconciliation", dest="include_credit_reconciliation", action="store_false", help="Skip manual credit/support reconciliation.")
+    p.set_defaults(include_credit_reconciliation=True)
+    p.add_argument("--credit-ledger", type=str, default="brand_credit_ledger.json", help="Path to manual brand credit ledger JSON.")
+    p.add_argument("--fetch-creditflow-credits", dest="include_creditflow_credits", action="store_true", help="Pull CreditFlow ERP credits from the API when an API key is configured (default).")
+    p.add_argument("--no-creditflow-credits", dest="include_creditflow_credits", action="store_false", help="Do not pull CreditFlow ERP credits.")
+    p.set_defaults(include_creditflow_credits=True)
+    p.add_argument("--creditflow-base-url", type=str, default="https://creditflow.replit.app/api/v1", help="CreditFlow API base URL.")
+    p.add_argument("--target-margin", type=float, default=None, help="Target margin as decimal or percent (0.35 or 35).")
+    p.add_argument("--include-monthly-reference", dest="include_monthly_reference", action="store_true", help="Use monthly owner report exports as context (default).")
+    p.add_argument("--no-monthly-reference", dest="include_monthly_reference", action="store_false", help="Skip monthly owner report context.")
+    p.set_defaults(include_monthly_reference=True)
+    p.add_argument("--packet-mode", choices=["quick", "standard", "deep"], default="standard", help="Packet depth. Default: standard.")
+    p.add_argument("--generate-followup-notes", dest="generate_followup_notes", action="store_true", help="Write meeting follow-up notes text file (default).")
+    p.add_argument("--no-followup-notes", dest="generate_followup_notes", action="store_false", help="Skip meeting follow-up notes.")
+    p.set_defaults(generate_followup_notes=True)
+    p.add_argument("--compact-pdf-mode", dest="compact_pdf_mode", action="store_true", help="Use compact PDF layout (default).")
+    p.add_argument("--no-compact-pdf-mode", dest="compact_pdf_mode", action="store_false", help="Use legacy spacing where still available.")
+    p.set_defaults(compact_pdf_mode=True)
 
     return p.parse_args()
 
@@ -7712,6 +9774,9 @@ def main() -> None:
 
     start_day, end_day = _resolve_dates(args)
     stores = parse_store_codes_arg(args.stores)
+    target_margin = args.target_margin
+    if target_margin is not None and target_margin > 1:
+        target_margin = target_margin / 100.0
 
     options = PacketOptions(
         run_export=bool((args.use_api or args.run_export) and not args.no_export),
@@ -7728,6 +9793,15 @@ def main() -> None:
         top_n=max(5, int(args.top_n)),
         force_refresh_data=bool(args.force_refresh),
         api_workers=max(1, int(args.workers or DEFAULT_PACKET_API_WORKERS)),
+        include_credit_reconciliation=bool(args.include_credit_reconciliation),
+        credit_ledger_path=str(args.credit_ledger),
+        include_creditflow_credits=bool(args.include_creditflow_credits),
+        creditflow_base_url=str(args.creditflow_base_url),
+        target_margin=target_margin,
+        include_monthly_reference=bool(args.include_monthly_reference),
+        packet_mode=str(args.packet_mode or "standard"),
+        generate_followup_notes=bool(args.generate_followup_notes),
+        compact_pdf_mode=bool(args.compact_pdf_mode),
     )
 
     generate_brand_meeting_packet(

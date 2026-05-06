@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import brand_meeting_packet as bmp
+import brand_credit_ledger as bcl
 
 try:
     import deals
@@ -86,11 +87,21 @@ class BrandMeetingPacketGUI:
         self.include_prior_var = tk.BooleanVar(value=True)
         self.include_kickback_var = tk.BooleanVar(value=False)
         self.email_var = tk.BooleanVar(value=True)
-        self.xlsx_var = tk.BooleanVar(value=False)
+        self.xlsx_var = tk.BooleanVar(value=True)
         self.force_refresh_var = tk.BooleanVar(value=False)
         self.use_api_var = tk.BooleanVar(value=True)
+        self.api_workers_var = tk.StringVar(value="6")
+        self.include_credit_reconciliation_var = tk.BooleanVar(value=True)
+        self.include_creditflow_credits_var = tk.BooleanVar(value=True)
+        self.include_monthly_reference_var = tk.BooleanVar(value=True)
+        self.generate_followup_notes_var = tk.BooleanVar(value=True)
+        self.compact_pdf_mode_var = tk.BooleanVar(value=True)
+        self.packet_mode_var = tk.StringVar(value="standard")
+        self.target_margin_var = tk.StringVar(value="35")
         self.brand_search_var = tk.StringVar()
         self.custom_brand_var = tk.StringVar()
+        self.credit_ledger_path = Path(__file__).with_name("brand_credit_ledger.json")
+        self.credit_rows: List[Dict[str, object]] = []
 
         self.status_var = tk.StringVar(value="Ready")
         self.activity_var = tk.StringVar(value="Choose brands, review settings, and run a packet.")
@@ -109,6 +120,7 @@ class BrandMeetingPacketGUI:
         self.brand_options = self._load_brand_options()
         self.brand_lookup = {item.name: item for item in self.brand_options}
         self.brand_lookup_lower = {item.name.lower(): item for item in self.brand_options}
+        self._load_credit_rows()
 
         self._configure_theme()
         self._build_ui()
@@ -336,14 +348,17 @@ class BrandMeetingPacketGUI:
 
         self.brands_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
         self.settings_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
+        self.credits_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
         self.activity_tab = tk.Frame(self.notebook, bg=self.colors["bg"], padx=6, pady=10)
 
         self.notebook.add(self.brands_tab, text="Brands")
         self.notebook.add(self.settings_tab, text="Settings")
+        self.notebook.add(self.credits_tab, text="Credits & Targets")
         self.notebook.add(self.activity_tab, text="Activity")
 
         self._build_brands_tab(self.brands_tab)
         self._build_settings_tab(self.settings_tab)
+        self._build_credits_tab(self.credits_tab)
         self._build_activity_tab(self.activity_tab)
         self._build_header_nav()
         self.notebook.select(self.brands_tab)
@@ -714,26 +729,152 @@ class BrandMeetingPacketGUI:
             command=self._update_header_summary,
         ).grid(row=8, column=0, sticky="w", pady=(8, 8))
 
+        worker_row = tk.Frame(options_body, bg=self.colors["card"])
+        worker_row.grid(row=9, column=0, sticky="ew", pady=(0, 8))
+        tk.Label(
+            worker_row,
+            text="API store workers",
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=self.fonts["small"],
+        ).pack(side="left", padx=(0, 8))
+        ttk.Entry(worker_row, textvariable=self.api_workers_var, width=6).pack(side="left")
+
         self._make_help_row(
             options_body,
             "Dutchie API mode",
             "Recommended. Sales and catalog/inventory come straight from the Dutchie POS API using the keys in .env, so the GUI does not need to drive browser exports.",
-        ).grid(row=9, column=0, sticky="ew", pady=(8, 8))
+        ).grid(row=10, column=0, sticky="ew", pady=(8, 8))
         self._make_help_row(
             options_body,
             "Reuse saved data",
             "Default mode. Saved sales and catalog files in the run folder are used first, so the app only pulls fresh data when something is missing or when Force refresh is turned on.",
-        ).grid(row=10, column=0, sticky="ew", pady=(0, 8))
+        ).grid(row=11, column=0, sticky="ew", pady=(0, 8))
         self._make_help_row(
             options_body,
             "Prior comparison data",
             "When enabled, the app loads the prior comparable window so delta views can compare against it. Turn it off to keep downloads to the selected dates only.",
-        ).grid(row=11, column=0, sticky="ew", pady=(0, 8))
+        ).grid(row=12, column=0, sticky="ew", pady=(0, 8))
         self._make_help_row(
             options_body,
             "Force refresh downloads",
             "Use this only when you know the saved files are stale and want fresh exports. Build-only modes still stay build-only and reuse saved files.",
-        ).grid(row=12, column=0, sticky="ew")
+        ).grid(row=13, column=0, sticky="ew")
+
+    def _build_credits_tab(self, parent: tk.Widget) -> None:
+        parent.grid_columnconfigure(0, weight=3)
+        parent.grid_columnconfigure(1, weight=2)
+        parent.grid_rowconfigure(0, weight=1)
+
+        ledger_card, _, ledger_body = self._make_card(
+            parent,
+            "Credit Ledger",
+            "Track expected support, received credits, and gaps by brand, store, category, or product.",
+        )
+        ledger_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        ledger_body.grid_columnconfigure(0, weight=1)
+        ledger_body.grid_rowconfigure(1, weight=1)
+
+        toolbar = tk.Frame(ledger_body, bg=self.colors["card"])
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(toolbar, text="Add Credit", style="Accent.TButton", command=self._add_credit_dialog).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="Edit Selected", style="Secondary.TButton", command=self._edit_selected_credit).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="Delete", style="Ghost.TButton", command=self._delete_selected_credit).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="Save", style="Secondary.TButton", command=self._save_credit_rows).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="Import CSV", style="Ghost.TButton", command=self._import_credit_csv).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="Export CSV", style="Ghost.TButton", command=self._export_credit_csv).pack(side="left")
+
+        columns = ("brand", "store", "type", "basis", "expected", "received", "gap", "status", "notes")
+        self.credit_tree = ttk.Treeview(ledger_body, columns=columns, show="headings", height=16)
+        headings = {
+            "brand": "Brand",
+            "store": "Store",
+            "type": "Type",
+            "basis": "Basis",
+            "expected": "Expected",
+            "received": "Received",
+            "gap": "Gap",
+            "status": "Status",
+            "notes": "Notes",
+        }
+        widths = {
+            "brand": 150,
+            "store": 60,
+            "type": 130,
+            "basis": 120,
+            "expected": 90,
+            "received": 90,
+            "gap": 80,
+            "status": 85,
+            "notes": 220,
+        }
+        for col in columns:
+            self.credit_tree.heading(col, text=headings[col])
+            self.credit_tree.column(col, width=widths[col], anchor="w")
+        self.credit_tree.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(ledger_body, orient="vertical", command=self.credit_tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.credit_tree.configure(yscrollcommand=scroll.set)
+
+        status_row = tk.Frame(ledger_body, bg=self.colors["card"])
+        status_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(status_row, text="Mark Received", style="Ghost.TButton", command=lambda: self._mark_selected_credit("received")).pack(side="left", padx=(0, 8))
+        ttk.Button(status_row, text="Mark Partial", style="Ghost.TButton", command=lambda: self._mark_selected_credit("partial")).pack(side="left", padx=(0, 8))
+        ttk.Button(status_row, text="Mark Disputed", style="Ghost.TButton", command=lambda: self._mark_selected_credit("disputed")).pack(side="left")
+
+        target_card, _, target_body = self._make_card(
+            parent,
+            "Targets & Packet Options",
+            "These settings feed the margin truth and meeting ask sections.",
+        )
+        target_card.grid(row=0, column=1, sticky="nsew")
+        target_body.grid_columnconfigure(1, weight=1)
+
+        self._field_label(target_body, "Target Margin %").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        ttk.Entry(target_body, textvariable=self.target_margin_var, width=10).grid(row=0, column=1, sticky="ew", pady=(0, 8))
+
+        self._field_label(target_body, "Packet Mode").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.packet_mode_combo = ttk.Combobox(
+            target_body,
+            textvariable=self.packet_mode_var,
+            values=["quick", "standard", "deep"],
+            state="readonly",
+            width=12,
+        )
+        self.packet_mode_combo.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        self.packet_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_header_summary())
+
+        checks = [
+            ("Include Credit Reconciliation", self.include_credit_reconciliation_var),
+            ("Pull CreditFlow Credits", self.include_creditflow_credits_var),
+            ("Include Monthly Reference", self.include_monthly_reference_var),
+            ("Generate Meeting Follow-Up Notes", self.generate_followup_notes_var),
+            ("Compact PDF Mode", self.compact_pdf_mode_var),
+        ]
+        for idx, (label, var) in enumerate(checks, start=2):
+            ttk.Checkbutton(
+                target_body,
+                text=label,
+                variable=var,
+                style="Card.TCheckbutton",
+                command=self._update_header_summary,
+            ).grid(row=idx, column=0, columnspan=2, sticky="w", pady=2)
+
+        self.credit_summary_var = tk.StringVar(value="")
+        tk.Label(
+            target_body,
+            textvariable=self.credit_summary_var,
+            bg=self.colors["card_alt"],
+            fg=self.colors["text"],
+            font=self.fonts["small"],
+            justify="left",
+            anchor="nw",
+            wraplength=380,
+            padx=12,
+            pady=12,
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+
+        self._refresh_credit_tree()
 
     def _build_activity_tab(self, parent: tk.Widget) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -948,6 +1089,7 @@ class BrandMeetingPacketGUI:
         pages = [
             ("Brands", self.brands_tab),
             ("Settings", self.settings_tab),
+            ("Credits", self.credits_tab),
             ("Activity", self.activity_tab),
         ]
         for label, tab in pages:
@@ -1130,6 +1272,8 @@ class BrandMeetingPacketGUI:
         self.custom_start_var.trace_add("write", lambda *_args: self._update_header_summary())
         self.custom_end_var.trace_add("write", lambda *_args: self._update_header_summary())
         self.output_dir_var.trace_add("write", lambda *_args: self._update_header_summary())
+        self.target_margin_var.trace_add("write", lambda *_args: self._update_header_summary())
+        self.api_workers_var.trace_add("write", lambda *_args: self._update_header_summary())
 
         self.brand_list.bind("<<ListboxSelect>>", self._on_brand_selection_changed)
         self.brand_list.bind("<KeyPress>", self._on_brand_list_keypress)
@@ -1141,6 +1285,258 @@ class BrandMeetingPacketGUI:
         self.custom_brand_entry.bind("<Return>", self._add_custom_brand_event)
         self.root.bind("<Control-f>", self._focus_brand_search)
         self.root.bind("<Configure>", self._on_root_configure, add="+")
+
+    def _load_credit_rows(self) -> None:
+        try:
+            self.credit_rows = bcl.load_credit_ledger(self.credit_ledger_path)
+        except Exception:
+            self.credit_rows = []
+
+    def _save_credit_rows(self) -> None:
+        try:
+            bcl.save_credit_ledger(self.credit_ledger_path, self.credit_rows)
+            self._refresh_credit_tree()
+            self._queue_activity("Credit ledger saved.")
+        except Exception as exc:
+            messagebox.showerror("Save Credits", f"Could not save credit ledger:\n{exc}")
+
+    def _money_display(self, value: object) -> str:
+        try:
+            return f"${float(value or 0.0):,.0f}"
+        except Exception:
+            return "$0"
+
+    def _refresh_credit_tree(self) -> None:
+        if not hasattr(self, "credit_tree"):
+            return
+        self.credit_tree.delete(*self.credit_tree.get_children())
+        expected = 0.0
+        received = 0.0
+        for idx, row in enumerate(self.credit_rows):
+            rec = bcl.normalize_credit_record(row)
+            exp = float(rec.get("expected_amount") or 0.0)
+            rec_amt = float(rec.get("received_amount") or 0.0)
+            expected += exp
+            received += rec_amt
+            self.credit_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(
+                    rec.get("canonical_brand") or rec.get("brand"),
+                    rec.get("store_code") or "All",
+                    rec.get("credit_type"),
+                    rec.get("basis"),
+                    self._money_display(exp),
+                    self._money_display(rec_amt),
+                    self._money_display(max(exp - rec_amt, 0.0)),
+                    rec.get("status"),
+                    rec.get("notes"),
+                ),
+            )
+        if hasattr(self, "credit_summary_var"):
+            self.credit_summary_var.set(
+                f"Ledger entries: {len(self.credit_rows):,}\n"
+                f"Expected support: {self._money_display(expected)}\n"
+                f"Received support: {self._money_display(received)}\n"
+                f"Open gap: {self._money_display(max(expected - received, 0.0))}"
+            )
+
+    def _selected_credit_index(self) -> Optional[int]:
+        if not hasattr(self, "credit_tree"):
+            return None
+        sel = self.credit_tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except Exception:
+            return None
+
+    def _default_credit_brand(self) -> str:
+        names = self._selected_brand_names_list()
+        if names:
+            return names[0]
+        custom = self.custom_brand_var.get().strip()
+        return custom or ""
+
+    def _credit_dialog(self, existing: Optional[Dict[str, object]] = None) -> Optional[Dict[str, object]]:
+        existing = bcl.normalize_credit_record(existing or {})
+        start_day, end_day = self._resolve_window()
+        win = tk.Toplevel(self.root)
+        win.title("Credit Entry")
+        win.transient(self.root)
+        win.grab_set()
+        win.configure(bg=self.colors["card"], padx=18, pady=16)
+        win.grid_columnconfigure(1, weight=1)
+
+        brand_var = tk.StringVar(value=str(existing.get("brand") or self._default_credit_brand()))
+        store_var = tk.StringVar(value=str(existing.get("store_code") or "All Stores"))
+        category_var = tk.StringVar(value=str(existing.get("category") or ""))
+        product_var = tk.StringVar(value=str(existing.get("product") or ""))
+        type_var = tk.StringVar(value=str(existing.get("credit_type") or "Other"))
+        basis_var = tk.StringVar(value=str(existing.get("basis") or "manual_adjustment"))
+        expected_var = tk.StringVar(value=str(existing.get("expected_amount") or ""))
+        received_var = tk.StringVar(value=str(existing.get("received_amount") or ""))
+        expected_pct_var = tk.StringVar(value="" if existing.get("expected_percent") is None else str(float(existing.get("expected_percent") or 0.0) * 100.0))
+        received_pct_var = tk.StringVar(value="" if existing.get("received_percent") is None else str(float(existing.get("received_percent") or 0.0) * 100.0))
+        per_unit_var = tk.StringVar(value="" if existing.get("per_unit_amount") is None else str(existing.get("per_unit_amount")))
+        start_var = tk.StringVar(value=str(existing.get("start_date") or start_day.isoformat()))
+        end_var = tk.StringVar(value=str(existing.get("end_date") or end_day.isoformat()))
+        status_var = tk.StringVar(value=str(existing.get("status") or "expected"))
+        notes_var = tk.StringVar(value=str(existing.get("notes") or ""))
+        apply_var = tk.BooleanVar(value=bool(existing.get("apply_to_margin", True)))
+
+        def row(label: str, widget: tk.Widget, r: int) -> None:
+            tk.Label(win, text=label, bg=self.colors["card"], fg=self.colors["text"], font=self.fonts["small"]).grid(row=r, column=0, sticky="w", padx=(0, 8), pady=4)
+            widget.grid(row=r, column=1, sticky="ew", pady=4)
+
+        row("Brand", ttk.Entry(win, textvariable=brand_var), 0)
+        row("Store", ttk.Combobox(win, textvariable=store_var, values=["All Stores", "MV", "LM", "SV", "LG", "NC", "WP"], state="readonly"), 1)
+        row("Category", ttk.Entry(win, textvariable=category_var), 2)
+        row("Product", ttk.Entry(win, textvariable=product_var), 3)
+        row("Credit Type", ttk.Combobox(win, textvariable=type_var, values=bcl.CREDIT_TYPES, state="readonly"), 4)
+        row("Basis", ttk.Combobox(win, textvariable=basis_var, values=bcl.BASIS_TYPES, state="readonly"), 5)
+        row("Expected Amount", ttk.Entry(win, textvariable=expected_var), 6)
+        row("Received Amount", ttk.Entry(win, textvariable=received_var), 7)
+        row("Expected Percent", ttk.Entry(win, textvariable=expected_pct_var), 8)
+        row("Received Percent", ttk.Entry(win, textvariable=received_pct_var), 9)
+        row("Per Unit Amount", ttk.Entry(win, textvariable=per_unit_var), 10)
+        row("Start Date", ttk.Entry(win, textvariable=start_var), 11)
+        row("End Date", ttk.Entry(win, textvariable=end_var), 12)
+        row("Status", ttk.Combobox(win, textvariable=status_var, values=bcl.STATUS_TYPES, state="readonly"), 13)
+        row("Notes", ttk.Entry(win, textvariable=notes_var), 14)
+        ttk.Checkbutton(win, text="Apply to margin", variable=apply_var).grid(row=15, column=1, sticky="w", pady=(6, 4))
+
+        result: Dict[str, object] = {}
+
+        def parse_amount(text: str, label: str) -> float:
+            cleaned = text.strip().replace("$", "").replace(",", "")
+            if not cleaned:
+                return 0.0
+            try:
+                return float(cleaned)
+            except ValueError as exc:
+                raise ValueError(f"{label} must be numeric.") from exc
+
+        def parse_percent(text: str) -> Optional[float]:
+            cleaned = text.strip().replace("%", "")
+            if not cleaned:
+                return None
+            val = float(cleaned)
+            if val > 1:
+                val = val / 100.0
+            if val < 0 or val > 1:
+                raise ValueError("Percent fields must be between 0 and 100.")
+            return val
+
+        def on_save() -> None:
+            try:
+                brand = brand_var.get().strip()
+                if not brand:
+                    raise ValueError("Brand is required.")
+                date.fromisoformat(start_var.get().strip())
+                date.fromisoformat(end_var.get().strip())
+                store = store_var.get().strip()
+                if store == "All Stores":
+                    store = ""
+                result.update({
+                    "id": existing.get("id") or bcl.make_credit_id(brand, start_var.get().strip()),
+                    "brand": brand,
+                    "canonical_brand": brand,
+                    "store_code": store,
+                    "category": category_var.get().strip(),
+                    "product": product_var.get().strip(),
+                    "start_date": start_var.get().strip(),
+                    "end_date": end_var.get().strip(),
+                    "credit_type": type_var.get().strip(),
+                    "basis": basis_var.get().strip(),
+                    "expected_amount": parse_amount(expected_var.get(), "Expected amount"),
+                    "received_amount": parse_amount(received_var.get(), "Received amount"),
+                    "expected_percent": parse_percent(expected_pct_var.get()),
+                    "received_percent": parse_percent(received_pct_var.get()),
+                    "per_unit_amount": parse_amount(per_unit_var.get(), "Per-unit amount") if per_unit_var.get().strip() else None,
+                    "status": status_var.get().strip(),
+                    "notes": notes_var.get().strip(),
+                    "apply_to_margin": apply_var.get(),
+                    "created_at": existing.get("created_at") or datetime.now().replace(microsecond=0).isoformat(),
+                    "updated_at": datetime.now().replace(microsecond=0).isoformat(),
+                })
+                win.destroy()
+            except Exception as exc:
+                messagebox.showerror("Credit Entry", str(exc), parent=win)
+
+        buttons = tk.Frame(win, bg=self.colors["card"])
+        buttons.grid(row=16, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", style="Ghost.TButton", command=win.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Save Credit", style="Accent.TButton", command=on_save).pack(side="left")
+
+        self.root.wait_window(win)
+        return bcl.normalize_credit_record(result) if result else None
+
+    def _add_credit_dialog(self) -> None:
+        rec = self._credit_dialog()
+        if rec:
+            self.credit_rows.append(rec)
+            self._refresh_credit_tree()
+
+    def _edit_selected_credit(self) -> None:
+        idx = self._selected_credit_index()
+        if idx is None or idx < 0 or idx >= len(self.credit_rows):
+            messagebox.showinfo("Edit Credit", "Select a credit row first.")
+            return
+        rec = self._credit_dialog(self.credit_rows[idx])
+        if rec:
+            self.credit_rows[idx] = rec
+            self._refresh_credit_tree()
+
+    def _delete_selected_credit(self) -> None:
+        idx = self._selected_credit_index()
+        if idx is None or idx < 0 or idx >= len(self.credit_rows):
+            messagebox.showinfo("Delete Credit", "Select a credit row first.")
+            return
+        if messagebox.askyesno("Delete Credit", "Delete the selected credit row?"):
+            del self.credit_rows[idx]
+            self._refresh_credit_tree()
+
+    def _mark_selected_credit(self, status: str) -> None:
+        idx = self._selected_credit_index()
+        if idx is None or idx < 0 or idx >= len(self.credit_rows):
+            messagebox.showinfo("Mark Credit", "Select a credit row first.")
+            return
+        self.credit_rows[idx]["status"] = status
+        self.credit_rows[idx]["updated_at"] = datetime.now().replace(microsecond=0).isoformat()
+        self._refresh_credit_tree()
+
+    def _import_credit_csv(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Import credit ledger CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            imported = bcl.import_credit_csv(Path(path))
+            self.credit_rows.extend(imported)
+            self._refresh_credit_tree()
+            self._queue_activity(f"Imported {len(imported):,} credit rows.")
+        except Exception as exc:
+            messagebox.showerror("Import CSV", f"Could not import CSV:\n{exc}")
+
+    def _export_credit_csv(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Export credit ledger CSV",
+            defaultextension=".csv",
+            initialfile="brand_credit_ledger.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            bcl.export_credit_csv(Path(path), self.credit_rows)
+            self._queue_activity(f"Exported credit ledger to {path}.")
+        except Exception as exc:
+            messagebox.showerror("Export CSV", f"Could not export CSV:\n{exc}")
 
     def _load_brand_options(self) -> List[BrandOption]:
         brand_map: Dict[str, BrandOption] = {}
@@ -1593,6 +1989,13 @@ class BrandMeetingPacketGUI:
             xlsx_state = "On" if self.xlsx_var.get() else "Off"
             prior_state = "On" if self.include_prior_var.get() else "Off"
             data_state = "API" if self.use_api_var.get() else "Browser exports"
+            credit_state = "On" if self.include_credit_reconciliation_var.get() else "Off"
+            creditflow_state = "On" if self.include_creditflow_credits_var.get() else "Off"
+            monthly_state = "On" if self.include_monthly_reference_var.get() else "Off"
+            compact_state = "On" if self.compact_pdf_mode_var.get() else "Off"
+            mode_state = self.packet_mode_var.get().title()
+            target_state = self.target_margin_var.get().strip() or "35"
+            workers_state = str(self._api_worker_count())
             next_step = ""
             if brand_count == 0:
                 next_step = "  •  Next: open Brands and queue at least one brand."
@@ -1600,7 +2003,8 @@ class BrandMeetingPacketGUI:
                 next_step = "  •  Next: pick at least one store in Settings."
             self.setup_summary_var.set(
                 f"Brands: {brand_count}  •  Stores: {store_count}  •  Window: {start_day.isoformat()} to {end_day.isoformat()}  •  "
-                f"Data: {data_state}  •  Email: {email_state}  •  XLSX: {xlsx_state}  •  Prior: {prior_state}  •  Downloads: {'Fresh pull' if self.force_refresh_var.get() else 'Saved data first'}"
+                f"Mode: {mode_state}  •  Target: {target_state}%  •  Workers: {workers_state}  •  Data: {data_state}  •  Email: {email_state}  •  XLSX: {xlsx_state}  •  "
+                f"Credits: {credit_state}  •  CreditFlow: {creditflow_state}  •  Monthly Ref: {monthly_state}  •  Compact PDF: {compact_state}  •  Prior: {prior_state}  •  Downloads: {'Fresh pull' if self.force_refresh_var.get() else 'Saved data first'}"
                 f"{next_step}"
             )
         except Exception:
@@ -1611,6 +2015,12 @@ class BrandMeetingPacketGUI:
     def _on_window_changed(self) -> None:
         self._set_custom_date_state()
         self._update_header_summary()
+
+    def _api_worker_count(self) -> int:
+        try:
+            return max(1, int(str(self.api_workers_var.get()).strip() or "6"))
+        except ValueError:
+            return 6
 
     def _set_custom_date_state(self) -> None:
         custom = self.date_preset_var.get() == "Custom"
@@ -1705,6 +2115,12 @@ class BrandMeetingPacketGUI:
         return bmp.compute_default_window(60)
 
     def _build_options(self, run_export: bool, email_results: bool, run_catalog_export: bool = True) -> bmp.PacketOptions:
+        try:
+            target_margin = float(self.target_margin_var.get().strip() or "35")
+        except ValueError:
+            target_margin = 35.0
+        if target_margin > 1:
+            target_margin = target_margin / 100.0
         return bmp.PacketOptions(
             run_export=run_export,
             run_catalog_export=run_catalog_export,
@@ -1719,6 +2135,15 @@ class BrandMeetingPacketGUI:
             generate_xlsx=self.xlsx_var.get(),
             top_n=20,
             force_refresh_data=self.force_refresh_var.get(),
+            api_workers=self._api_worker_count(),
+            include_credit_reconciliation=self.include_credit_reconciliation_var.get(),
+            credit_ledger_path=str(self.credit_ledger_path),
+            include_creditflow_credits=self.include_creditflow_credits_var.get(),
+            target_margin=target_margin,
+            include_monthly_reference=self.include_monthly_reference_var.get(),
+            packet_mode=self.packet_mode_var.get(),
+            generate_followup_notes=self.generate_followup_notes_var.get(),
+            compact_pdf_mode=self.compact_pdf_mode_var.get(),
         )
 
     def _queue_event(self, kind: str, payload: object = "") -> None:
@@ -1971,6 +2396,7 @@ class BrandMeetingPacketGUI:
             force_refresh=self.force_refresh_var.get(),
             use_api=self.use_api_var.get(),
             api_env_file=bmp.DEFAULT_API_ENV_FILE,
+            api_workers=self._api_worker_count(),
             logger=self._queue_log,
         )
         if self.use_api_var.get():
@@ -1981,6 +2407,7 @@ class BrandMeetingPacketGUI:
                 force_refresh=self.force_refresh_var.get(),
                 use_api=True,
                 api_env_file=bmp.DEFAULT_API_ENV_FILE,
+                api_workers=self._api_worker_count(),
                 logger=self._queue_log,
             )
         if missing:
