@@ -911,6 +911,19 @@ def _contains_any(haystack_series, needles):
         return pd.Series(index=s.index, dtype=bool)
     return s.apply(lambda x: any(n in x for n in needles)).astype(bool)
 
+def _parse_rule_date(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.normalize()
+
 def filter_by_rule(df, rule):
     """
     Apply all filters for a single rule.
@@ -925,11 +938,24 @@ def filter_by_rule(df, rule):
     brands = rule.get("brands") or []
     include_phrases = rule.get("include_phrases") or []
     excluded_phrases = rule.get("excluded_phrases") or []
+    start_date = _parse_rule_date(rule.get("start_date"))
+    end_date = _parse_rule_date(rule.get("end_date"))
 
     if vendors:
         out = out[out["vendor name"].isin(vendors)]
     if days:
         out = out[out["day of week"].isin(days)]
+    if start_date is not None or end_date is not None:
+        if "order time" not in out.columns:
+            return out.iloc[0:0]
+
+        order_dates = pd.to_datetime(out["order time"], errors="coerce").dt.normalize()
+        date_mask = order_dates.notna()
+        if start_date is not None:
+            date_mask &= order_dates >= start_date
+        if end_date is not None:
+            date_mask &= order_dates <= end_date
+        out = out[date_mask]
     if categories:
         out = out[out["category"].isin(categories)]
 

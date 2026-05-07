@@ -18,6 +18,8 @@ CSV_COLUMNS = [
     "vendors",
     "brands",
     "days",
+    "start_date",
+    "end_date",
     "discount",
     "kickback",
     "categories",
@@ -141,6 +143,8 @@ def _looks_like_deals_criteria(value):
         "include_phrases",
         "excluded_phrases",
         "include_units",
+        "start_date",
+        "end_date",
     }
 
     if isinstance(value, dict):
@@ -214,6 +218,8 @@ def flatten_brand_criteria(criteria_by_brand):
                     "vendors": ";".join(_split_config_list(rule.get("vendors"))),
                     "brands": ";".join(_split_config_list(rule.get("brands"))),
                     "days": ";".join(_parse_sheet_days(rule.get("days"))),
+                    "start_date": str(rule.get("start_date") or "").strip(),
+                    "end_date": str(rule.get("end_date") or "").strip(),
                     "discount": _format_rate(rule.get("discount")),
                     "kickback": _format_rate(rule.get("kickback")),
                     "categories": ";".join(_split_config_list(rule.get("categories"))),
@@ -292,6 +298,14 @@ def _load_brand_criteria_from_csv_text(text, source_name):
         days = _parse_sheet_days(row.get("days"))
         if days:
             rule["days"] = days
+
+        start_date = str(row.get("start_date", "") or "").strip()
+        if start_date:
+            rule["start_date"] = start_date
+
+        end_date = str(row.get("end_date", "") or "").strip()
+        if end_date:
+            rule["end_date"] = end_date
 
         discount = _parse_rate(row.get("discount"))
         if discount is not None:
@@ -501,6 +515,8 @@ def _column_width_requests(sheet_id, headers):
         "vendors": 280,
         "brands": 180,
         "days": 170,
+        "start_date": 110,
+        "end_date": 110,
         "discount": 95,
         "kickback": 95,
         "categories": 180,
