@@ -190,7 +190,7 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ['Terra', 'Petra', 'KIVA', 'Lost Farms', 'Camino']
     },
     'Dabwoods': {
-        'vendors': ['The Clear Group Inc.','Decoi','Garden Of Weeden Inc.','Garden Of Weeden'],
+        #'vendors': ['The Clear Group Inc.','Decoi','Garden Of Weeden Inc.','Garden Of Weeden'],
         'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
         'discount': 0.50,
         'kickback': 0.30,
@@ -199,31 +199,43 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ['Dabwoods','DabBar']
     },
      'Time Machine': {
-         'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','Garden Of Weeden'],
+         #'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','Garden Of Weeden'],
          'days': ['Tuesday','Friday'],
          'discount': 0.50,
-         'kickback': 0.25,
+         'kickback': 0.30,
          'brands': ['Time Machine']
      },
      'Pacific Stone': {
-         'vendors': ['Vino & Cigarro, LLC','KIVA / LCISM CORP', 'Garden Of Weeden Inc.','Pacific Stone','Garden Of Weeden','NC INVESTMENT GROUP, LLC'],
-         'days': ['Monday','Thursday'],
-         'discount': 0.50,
-         'kickback': 0.25,
-         'brands': ['Pacific Stone']
+         #'vendors': ['Vino & Cigarro, LLC','KIVA / LCISM CORP', 'Garden Of Weeden Inc.','Pacific Stone','Garden Of Weeden','NC INVESTMENT GROUP, LLC'],
+         'brands': ['Pacific Stone'],
+         'rules': [
+             {
+                 'rule_name': 'Pacific Stone - Monday Thursday (50/30)',
+                 'days': ['Monday','Thursday'],
+                 'discount': 0.50,
+                 'kickback': 0.30,
+             },
+             {
+                 'rule_name': 'Pacific Stone - DI everyday (30/30)',
+                 'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+                 'discount': 0.50,
+                 'kickback': 0.30,
+                 'include_phrases': ['DI Pre-', 'DI IN', 'Pre-Rolls 1g (3pk)',' Hash Pre-Rolls 0.5g'],
+             },
+         ]
     },
     'Heavy Hitters': {
-        'vendors': ['Fluids Manufacturing Inc.','Garden Of Weeden Inc.'],
+        #'vendors': ['Fluids Manufacturing Inc.','Garden Of Weeden Inc.'],
         'days': ['Friday','Saturday'],
         'discount': 0.50,
-        'kickback': 0.25,
+        'kickback': 0.30,
         'brands': ['Heavy Hitters']
     },
     'Almora': {
-        'vendors': ['Fluids Manufacturing Inc.','Garden Of Weeden Inc.','Vino & Cigarro, LLC'],
+       # 'vendors': ['Fluids Manufacturing Inc.','Garden Of Weeden Inc.','Vino & Cigarro, LLC'],
         'days': ['Sunday','Saturday'],
         'discount': 0.50,
-        'kickback': 0.25,
+        'kickback': 0.30,
         'brands': ['Almora']
     },
     'WYLD/GoodTide': {
@@ -237,7 +249,7 @@ DEFAULT_BRAND_CRITERIA = {
         'vendors': ['KIVA / LCISM CORP', 'Vino & Cigarro, LLC','Garden Of Weeden Inc.','Garden Of Weeden'],
         'days': ['Thursday'],
         'discount': 0.50,
-        'kickback': 0.25,
+        'kickback': 0.30,
         #'excluded_phrases': ['Jetty | Cart 1g |'],
         #'include_phrases': ['SVL','ULR',],
         'brands': ['Jetty']
@@ -246,7 +258,7 @@ DEFAULT_BRAND_CRITERIA = {
         'vendors': ['Garden Of Weeden Inc.','Helios | Hypeereon Corporation','Garden Of Weeden'],
         'days': ['Monday','Wednesday'],
         'discount': 0.50,
-        'kickback': 0.25,
+        'kickback': 0.30,
         'brands': ['Preferred Gardens']
     },
     'Kikoko': {
@@ -294,7 +306,7 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ['Eureka |']
     }, 
     'Ember Valley': { 
-        'vendors': ['LB Atlantis LLC', 'Garden Of Weeden Inc.', 'Courtney Lang','NC INVESTMENT GROUP, LLC','Hilife Group MV , LLC', 'Ember Valley', 'Helios | Hypeereon Corporation'],
+       # 'vendors': ['LB Atlantis LLC', 'Garden Of Weeden Inc.', 'Courtney Lang','NC INVESTMENT GROUP, LLC','Hilife Group MV , LLC', 'Ember Valley', 'Helios | Hypeereon Corporation'],
         'days': ['Thursday','Tuesday'],
         'discount': 0.50,
         'kickback': 0.30,
@@ -314,16 +326,16 @@ DEFAULT_BRAND_CRITERIA = {
         'kickback': 0.0,
         'brands': ['Cake |']
     }, 
-    'Mary Medical': { 
-        'vendors': ["Mary's Tech CA, Inc.",'BRB California LLC', 'Garden Of Weeden Inc.', 'Broadway Alliance, LLC','Garden Of Weeden','Garden Society / LCISM Corp'],
-        'days': ['Thursday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        #'categories': [''], 
-        'brands': ["Mary's Medicinals |"]
-    }, 
+    # 'Mary Medical': { 
+    #     'vendors': ["Mary's Tech CA, Inc.",'BRB California LLC', 'Garden Of Weeden Inc.', 'Broadway Alliance, LLC','Garden Of Weeden','Garden Society / LCISM Corp'],
+    #     'days': ['Thursday'],
+    #     'discount': 0.50,
+    #     'kickback': 0.30,
+    #     #'categories': [''], 
+    #     'brands': ["Mary's Medicinals |"]
+    # }, 
     'LA FARMS': { 
-        'vendors': ["LA Family Farms LLC",'Los Angeles Family Farms LLC'],
+        #'vendors': ["LA Family Farms LLC",'Los Angeles Family Farms LLC'],
         'days': ['Monday','Friday','Sunday'],
         'discount': 0.50,
         'kickback': 0.30,
@@ -331,7 +343,7 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ["L.A.FF |"]
     },  
     'COTC': { 
-        'vendors': ["TERPX COTC/WCTC (Riverside)"],
+        #'vendors': ["TERPX COTC/WCTC (Riverside)"],
         'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
         'discount': 0.40,
         'kickback': 0.0,
@@ -359,13 +371,13 @@ DEFAULT_BRAND_CRITERIA = {
         'categories': ['Pre-Rolls','Eighths'],
         'brands': ['BLEM']
     },
-    'Baba Ku': {
-        'vendors': ["Higher Ground Holdings, LLC"],
-        'days': ['Monday','Friday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        'brands': ['Baba Ku']
-    },
+    # 'Baba Ku': {
+    #     'vendors': ["Higher Ground Holdings, LLC"],
+    #     'days': ['Monday','Friday'],
+    #     'discount': 0.50,
+    #     'kickback': 0.30,
+    #     'brands': ['Baba Ku']
+    # },
        "P&B": {
         'vendors': ['Fluids Manufacturing Inc.'],
         'days': ['Sunday','Tuesday'],
@@ -420,7 +432,7 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ['Turn |']
     },
   "Level": {
-    "vendors": ["Garden Of Weeden Inc.", "Vino & Cigarro, LLC"],
+    #"vendors": ["Garden Of Weeden Inc.", "Vino & Cigarro, LLC"],
     "brands": ["Level |", "LEVEL |"],
 
     "rules": [
@@ -448,7 +460,7 @@ DEFAULT_BRAND_CRITERIA = {
         'brands': ['Raw Garden |']
     }, 
     "Claybourne": {
-        'vendors': ['CI Distribution','Garden Of Weeden Inc.','Cinco Elementals LLC'],
+        #'vendors': ['CI Distribution','Garden Of Weeden Inc.','Cinco Elementals LLC'],
         'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
         'discount': 0.50,
         'kickback': 0.30,
@@ -525,7 +537,8 @@ DEFAULT_BRAND_CRITERIA = {
             'discount': 0.5,
             'kickback': 0.3,
             'brands': ['CLSICS']},
-    'Nasha': {'vendors': ['KIVA / LCISM CORP', 'Vino & Cigarro, LLC','Hilife LM'],
+    'Nasha': {
+            #'vendors': ['KIVA / LCISM CORP', 'Vino & Cigarro, LLC','Hilife LM'],
            'days': ['Tuesday'],
            'discount': 0.5,
            'kickback': 0.3,
@@ -540,28 +553,28 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Pusha']},
-    'Sol Flora': {'vendors': ['Twisted Roots, Inc.','Garden Of Weeden Inc.','Garden Of Weeden'],
+    'Sol Flora': {
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
            'discount': 0.3,
            'kickback': 0.0,
            'brands': ['Sol Flora']},
-    'Planta': {'vendors': ['Higher Logic LLC','Garden Of Weeden Inc.','Garden Of Weeden'],
-           'days': ['Monday','Sunday'],
-           'discount': 0.5,
-           'kickback': 0.3,
-           'brands': ['Planta |']},
+    # 'Planta': {'vendors': ['Higher Logic LLC','Garden Of Weeden Inc.','Garden Of Weeden'],
+    #        'days': ['Monday','Sunday'],
+    #        'discount': 0.5,
+    #        'kickback': 0.3,
+    #        'brands': ['Planta |']},
     'Sauce': {'vendors': ['Garden Of Weeden','Garden Of Weeden Inc.'],
            'days': ['Friday'],
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Sauce |']},
-    'Cannabiotix (CBX)': {'vendors': ['Four Star Distribution and Delivery LLC','Highstar Distribution LLC','Hilife LM'],
+    'Cannabiotix (CBX)': {
            'days': ['Tuesday'],
            'discount': 0.5,
            'kickback': 0.3,
             'excluded_phrases': ['14G'],
            'brands': ['CBX |']},
-    'Heirbloom': {'vendors': ['Four Star Distribution and Delivery LLC','Highstar Distribution LLC','Hilife LM'],
+    'Heirbloom': {
            'days': ['Wednesday'],
            'discount': 0.5,
            'kickback': 0.3,
@@ -571,22 +584,30 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Happy Fruit |']},
-    'Highatus': {'vendors': ['Four Star Distribution and Delivery LLC','Highstar Distribution LLC','Hilife LM'],
+    'Highatus': {
            'days': ['Tuesday'],
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Highatus |']},
-    'Ghost': {'vendors': ['DISTRIBUTION HAUS LLC','Bud Technology'],
+    'Ghost': {
            'days': ['Thursday'],
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Ghost |']},
-    'Maven': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden','NC INVESTMENT GROUP, LLC'],
+    'Gelato': {'days': ['Wednesday','Saturday'],
+           'discount': 0.5,
+           'kickback': 0.3,
+           'brands': ['Gelato |']},
+    'Maven': {
            'days': ['Monday','Wednesday'],
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['MVN |']},
-    'Stiiizy': {'vendors': [''],
+    'Mountain Man': {'days': ['Monday'],
+           'discount': 0.5,
+           'kickback': 0.3,
+           'brands': ['MMM |']},
+    'Stiiizy': {
            'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
            'discount': 0.4,
            'kickback': 0.0,
@@ -597,17 +618,29 @@ DEFAULT_BRAND_CRITERIA = {
            'kickback': 0.30,
            'brands': ['Lyfe Sauce |']},
     'Good Good': {'vendors': ['KMMK Distribution Inc.'],
-           'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-           #'days': ['Thursday','Friday','Saturday','Sunday'],
-           'discount': 0.3,
-           'kickback': 0.0,
-           'brands': ['Goodgood |']},
+           'brands': ['Goodgood |'],
+           'rules': [
+               {
+                   'rule_name': 'Good Good - Tuesday (50/0)',
+                   'days': ['Tuesday'],
+                   'discount': 0.5,
+                   'kickback': 0.0,
+               },
+               {
+                   'rule_name': 'Good Good - Other days (30/0)',
+                   'days': ['Monday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+                   #'days': ['Thursday','Friday','Saturday','Sunday'],
+                   'discount': 0.3,
+                   'kickback': 0.0,
+               },
+           ]},
     'Wavvy': {'vendors': ['Happy Travels, LLC'],
            'days': ['Wednesday','Thursday'],
            'discount': 0.5,
            'kickback': 0.3,
            'brands': ['Wavvy']},
-    'Lime': {'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+    'Lime': {
+        #'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
            'days': ['Monday','Sunday'], #Started March 2
            'discount': 0.50,
            'kickback': 0.30,
