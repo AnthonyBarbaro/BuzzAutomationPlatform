@@ -35,6 +35,8 @@ This repository is a Python automation stack (not a web backend) that:
 - `store_discount_roundup_sheet.py` - Google Sheets discount round-up pricing planner with store tabs, cost price reference, margins, kickbacks, and an `All Pricing` shared-price rollup
 - `dutchie_today_dashboard.py` - live same-day Dutchie API HTML dashboard with store pace, hourly flow, top products, and low-stock flags
 - `dutchie_live_dashboard_gui.py` - native Tkinter live dashboard with same-day KPIs, store focus, sales mix tables, and inventory alerts
+- `aged_flower_inventory_report.py` - Dutchie API aged flower inventory report for any requested brand, with Drive upload to `aged_inventory`
+- `brand_inventory_report_job.py` - CLI/server brand inventory report job that refreshes Dutchie sources, builds one requested brand, and uploads Drive links without emailing
 - `getClosingReport.py` - closing report by day/store (GUI)
 - `owner_snapshot.py` - builds owner snapshot PDFs + summary email; can run fresh exports
 
@@ -50,6 +52,7 @@ This repository is a Python automation stack (not a web backend) that:
 - `brandDEALSEmailer.py` - brand kickback email sender
 - `BrandINVEmailer.py` - scheduled brand inventory generation + Drive + email
 - `BrandInventoryGUIemailer.py` - GUI version of inventory report workflow
+- `email_agent.py` - Gmail/OpenAI draft-only watcher that labels messages and can generate inventory/aging report drafts with Drive links
 - `googleDrive.py`, `uploadDrive.py` - Drive upload helpers
 
 ### Orchestration and utilities

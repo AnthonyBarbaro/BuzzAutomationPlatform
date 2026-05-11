@@ -45,3 +45,6 @@ old
 inventory_links
 .codex
 token_gmail_agent.json
+email_agent_config.json
+.email_agent_state.json
+.email_agent_review_queue.jsonl

@@ -1,0 +1,115 @@
+{
+  "state_file": ".email_agent_state.json",
+  "timezone": "America/Los_Angeles",
+  "gmail": {
+    "credentials_file": "credentials.json",
+    "token_file": "token_gmail_agent.json",
+    "poll_seconds": 120,
+    "search_query": "in:inbox newer_than:14d -from:help@nabis.com -from:info@headset.io -from:buzz-office@buzz -from:noreply@leaflogix.com -from:sc-noreply@google.com -from:noreply -from:no-reply -from:donotreply -from:do-not-reply",
+    "max_messages_per_poll": 10,
+    "skip_senders": [
+      "help@nabis.com",
+      "info@headset.io",
+      "buzz-office@buzz",
+      "noreply@leaflogix.com",
+      "sc-noreply@google.com"
+    ],
+    "skip_noreply_senders": true,
+    "processed_label": "AI Agent/Processed",
+    "review_label": "AI Agent/Needs Human",
+    "report_label": "AI Agent/Report Requests",
+    "headset_label": "AI Agent/Headset",
+    "ignore_label": "AI Agent/Ignore",
+    "low_confidence_label": "AI Agent/Review",
+    "draft_replies": true,
+    "archive_processed": false
+  },
+  "openai": {
+    "env_file": ".env",
+    "model": "gpt-5.5",
+    "reasoning_effort": "low"
+  },
+  "safety": {
+    "dry_run": true,
+    "auto_run_reports": false,
+    "create_drafts": true,
+    "archive_low_risk": false,
+    "allowed_requesters": [],
+    "never_auto_archive_from": [],
+    "human_review_confidence_below": 0.72
+  },
+  "review": {
+    "queue_file": ".email_agent_review_queue.jsonl",
+    "log_all_actions": true,
+    "popup_before_draft": false
+  },
+  "report_drafts": {
+    "auto_generate": false,
+    "default_age_days": 90,
+    "inventory_full_update": true,
+    "create_failure_drafts": true
+  },
+  "routing": {
+    "headset_keywords": [
+      "headset",
+      "head set",
+      "headphones",
+      "earpiece",
+      "radio",
+      "walkie"
+    ],
+    "important_keywords": [
+      "urgent",
+      "legal",
+      "complaint",
+      "refund",
+      "invoice",
+      "metrc",
+      "dutchie",
+      "owner"
+    ],
+    "report_keywords": [
+      "deal report",
+      "deals report",
+      "kickback report",
+      "inventory report",
+      "brand report"
+    ]
+  },
+  "jobs": {
+    "weekly_deals_command": [
+      ".venv/bin/python",
+      "autoJob.py"
+    ],
+    "inventory_command": [
+      ".venv/bin/python",
+      "BrandINVEmailer.py"
+    ],
+    "aged_710_flower_command": [
+      ".venv/bin/python",
+      "aged_flower_inventory_report.py",
+      "--brand",
+      "710 Labs",
+      "--brand-alias",
+      "710",
+      "--age-days",
+      "90"
+    ],
+    "weekly_schedule": [
+      {
+        "name": "weekly_deals",
+        "enabled": false,
+        "weekday": "monday",
+        "time": "07:00",
+        "command_key": "weekly_deals_command"
+      },
+      {
+        "name": "inventory",
+        "enabled": false,
+        "weekday": "monday",
+        "time": "08:30",
+        "command_key": "inventory_command"
+      }
+    ]
+  }
+}
