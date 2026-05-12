@@ -99,8 +99,8 @@ REPORTS_ROOT = Path("reports").resolve()
 RAW_ROOT = REPORTS_ROOT / "raw_sales"
 PDF_ROOT = REPORTS_ROOT / "pdf"
 
-# If True: run Selenium export and archive fresh files
-# If False: reuse latest RAW folder, do NOT run Selenium
+# If True: run the selected export source and archive fresh files
+# If False: reuse latest RAW folder
 RUN_EXPORT = True
 SHOW_BOTH_MARGINS = True
 # If RUN_EXPORT=True: delete existing /files downloads first?
@@ -140,7 +140,7 @@ EXPORT_HEADER_ROW_INDEX = 4  # Excel row 5
 FILES_DIR = (Path(gsr.__file__).resolve().parent if gsr is not None else Path(__file__).resolve().parent) / "files"
 
 # Dutchie API export support
-DEFAULT_EXPORT_SOURCE = "selenium"
+DEFAULT_EXPORT_SOURCE = "api"
 DEFAULT_API_ENV_FILE = DUTCHIE_DEFAULT_ENV_FILE
 DEFAULT_OWNER_API_WORKERS = 6
 API_EXPORT_MAX_WINDOW_DAYS = 31
@@ -1640,7 +1640,7 @@ def parse_cli_args() -> argparse.Namespace:
         "--run-export",
         dest="run_export",
         action="store_true",
-        help="Force export for the selected date window.",
+        help="Run export for the selected date window. Enabled by default.",
     )
     parser.add_argument(
         "--reuse-latest",
@@ -1664,7 +1664,7 @@ def parse_cli_args() -> argparse.Namespace:
         "--export-source",
         choices=["selenium", "api"],
         default=DEFAULT_EXPORT_SOURCE,
-        help=f"Data source when --run-export is used. Default: {DEFAULT_EXPORT_SOURCE}.",
+        help=f"Data source when exports run. Default: {DEFAULT_EXPORT_SOURCE}.",
     )
     parser.add_argument(
         "--use-api",
@@ -1754,7 +1754,7 @@ def parse_cli_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the month-end forecast step for faster test runs.",
     )
-    parser.set_defaults(run_export=None)
+    parser.set_defaults(run_export=RUN_EXPORT)
     return parser.parse_args()
 
 def parse_email_recipients(values: List[str]) -> List[str]:
@@ -4738,6 +4738,55 @@ def build_styles() -> Dict[str, Any]:
         leading=9.4,
         textColor=THEME["muted"],
     ))
+    styles.add(ParagraphStyle(
+        name="CustomerBlockTitle",
+        parent=styles["Normal"],
+        fontName=BASE_FONT_BOLD,
+        fontSize=9.1,
+        leading=10.5,
+        textColor=THEME["yellow"],
+    ))
+    styles.add(ParagraphStyle(
+        name="CustomerBlockNote",
+        parent=styles["Normal"],
+        fontName=BASE_FONT_BOLD,
+        fontSize=8.1,
+        leading=10,
+        textColor=colors.white,
+        alignment=2,
+    ))
+    styles.add(ParagraphStyle(
+        name="CustomerMetricLabel",
+        parent=styles["Normal"],
+        fontName=BASE_FONT_BOLD,
+        fontSize=7.4,
+        leading=8.8,
+        textColor=THEME["muted"],
+    ))
+    styles.add(ParagraphStyle(
+        name="CustomerMetricValue",
+        parent=styles["Normal"],
+        fontName=BASE_FONT_BOLD,
+        fontSize=18.5,
+        leading=20.0,
+        textColor=THEME["black"],
+    ))
+    styles.add(ParagraphStyle(
+        name="CustomerMetricValueSmall",
+        parent=styles["Normal"],
+        fontName=BASE_FONT_BOLD,
+        fontSize=14.0,
+        leading=15.5,
+        textColor=THEME["black"],
+    ))
+    styles.add(ParagraphStyle(
+        name="CustomerMetricDetail",
+        parent=styles["Normal"],
+        fontName=BASE_FONT,
+        fontSize=7.5,
+        leading=9.0,
+        textColor=THEME["muted"],
+    ))
     return styles
 
 def _arrow(diff: float) -> str:
@@ -4836,6 +4885,94 @@ def build_customer_counts_table(
         rows,
         [2.30 * inch, 1.25 * inch, 1.25 * inch, 2.50 * inch],
     )
+
+def _customer_count_parts(counts: Dict[str, int]) -> Tuple[int, int, int, float]:
+    new = max(int(counts.get("new", 0) or 0), 0)
+    total = max(int(counts.get("total", 0) or 0), 0)
+    returning = max(total - new, 0)
+    share = (new / total) if total else 0.0
+    return new, total, returning, share
+
+def _customer_metric_cell(
+    styles,
+    label: str,
+    value: str,
+    detail: str,
+    *,
+    large: bool = False,
+) -> List[Paragraph]:
+    value_style = styles["CustomerMetricValue"] if large else styles["CustomerMetricValueSmall"]
+    return [
+        Paragraph(label, styles["CustomerMetricLabel"]),
+        Paragraph(value, value_style),
+        Paragraph(detail, styles["CustomerMetricDetail"]),
+    ]
+
+def build_customer_growth_block(
+    styles,
+    today_counts: Dict[str, int],
+    mtd_counts: Dict[str, int],
+    width: float = 7.6 * inch,
+) -> Table:
+    today_new, today_total, today_returning, today_share = _customer_count_parts(today_counts)
+    mtd_new, mtd_total, mtd_returning, mtd_share = _customer_count_parts(mtd_counts)
+
+    rows = [
+        [
+            Paragraph("CUSTOMER GROWTH", styles["CustomerBlockTitle"]),
+            Paragraph("New customer mix", styles["CustomerBlockNote"]),
+            "",
+            "",
+        ],
+        [
+            _customer_metric_cell(
+                styles,
+                "NEW CUSTOMERS TODAY",
+                f"{today_new:,}",
+                f"{pct1(today_share)} of {today_total:,} customers",
+                large=True,
+            ),
+            _customer_metric_cell(
+                styles,
+                "TODAY CUSTOMER BASE",
+                f"{today_total:,}",
+                f"{today_returning:,} returning | {today_new:,} new",
+            ),
+            _customer_metric_cell(
+                styles,
+                "NEW CUSTOMERS MTD",
+                f"{mtd_new:,}",
+                f"{pct1(mtd_share)} of {mtd_total:,} customers",
+            ),
+            _customer_metric_cell(
+                styles,
+                "MTD CUSTOMER BASE",
+                f"{mtd_total:,}",
+                f"{mtd_returning:,} returning | {mtd_new:,} new",
+            ),
+        ],
+    ]
+    col_widths = [2.10 * inch, 1.83 * inch, 1.83 * inch, width - (5.76 * inch)]
+    t = Table(rows, colWidths=col_widths)
+    t.setStyle(TableStyle([
+        ("SPAN", (1, 0), (-1, 0)),
+        ("BACKGROUND", (0, 0), (-1, 0), THEME["black"]),
+        ("BACKGROUND", (0, 1), (0, 1), THEME["yellow"]),
+        ("BACKGROUND", (1, 1), (-1, 1), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.7, THEME["black"]),
+        ("INNERGRID", (0, 1), (-1, -1), 0.45, THEME["border"]),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.8, THEME["black"]),
+        ("LEFTPADDING", (0, 0), (-1, 0), 7),
+        ("RIGHTPADDING", (0, 0), (-1, 0), 7),
+        ("TOPPADDING", (0, 0), (-1, 0), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+        ("LEFTPADDING", (0, 1), (-1, 1), 7),
+        ("RIGHTPADDING", (0, 1), (-1, 1), 7),
+        ("TOPPADDING", (0, 1), (-1, 1), 7),
+        ("BOTTOMPADDING", (0, 1), (-1, 1), 7),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return t
 
 def _clean_authorization_person(value: Any) -> str:
     if value is None:
@@ -5423,7 +5560,7 @@ def build_store_pdf(
 
     story.append(build_kpi_grid(styles, kpis, cols=4))
     story.append(Spacer(1, SPACER["sm"]))
-    story.append(build_customer_counts_table(styles, customer_today, customer_mtd))
+    story.append(build_customer_growth_block(styles, customer_today, customer_mtd))
     story.append(Spacer(1, SPACER["xs"]))
 
     story.append(Paragraph(
@@ -5750,10 +5887,14 @@ def build_all_stores_summary_pdf(
         ]
         if raw_frames:
             all_raw = pd.concat(raw_frames, ignore_index=True)
+            all_customer_today = compute_customer_counts(all_raw, end_day, end_day)
+            all_customer_mtd = compute_customer_counts(all_raw, mtd_start, end_day)
+            story.append(build_customer_growth_block(styles, all_customer_today, all_customer_mtd))
+            story.append(Spacer(1, SPACER["sm"]))
             customer_rows.insert(0, [
                 "ALL STORES",
-                fmt_new_total(compute_customer_counts(all_raw, end_day, end_day)),
-                fmt_new_total(compute_customer_counts(all_raw, mtd_start, end_day)),
+                fmt_new_total(all_customer_today),
+                fmt_new_total(all_customer_mtd),
             ])
         story.append(Paragraph("Customer Counts", styles["Section"]))
         story.append(build_table(
@@ -5774,9 +5915,9 @@ def build_all_stores_summary_pdf(
 
     story.append(Paragraph("Store Table", styles["Section"]))
     story.append(build_table(
-        headers=["Store", "Today Net", "Δ vs LW", "MTD Net", "Δ vs Last MTD", "MTD Margin", "MTD Tickets"],
+        headers=["Store", "Today Net", "Δ vs LW", "MTD Net", "Δ vs Last MTD", "MTD Margin", "MTD Tix"],
         rows=rows,
-        col_widths=[2.45*inch, 0.85*inch, 0.80*inch, 0.85*inch, 0.95*inch, 1.05*inch, 0.65*inch],
+        col_widths=[2.25*inch, 0.85*inch, 0.78*inch, 0.85*inch, 1.05*inch, 1.00*inch, 0.82*inch],
     ))
     # -------------------------
     # ✅ Month-End Projection Page (ALL STORES)
@@ -5891,7 +6032,7 @@ def main():
     loyalty_detail_by_store: Dict[str, pd.DataFrame] = {}
     register_loyalty_by_store: Dict[str, pd.DataFrame] = {}
     loyalty_detail_workbook: Optional[Path] = None
-    run_export = RUN_EXPORT if args.run_export is None else bool(args.run_export)
+    run_export = bool(args.run_export)
 
     if args.backfill_days <= 0:
         raise SystemExit("--backfill-days must be a positive integer.")

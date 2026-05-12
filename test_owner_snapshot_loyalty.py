@@ -329,6 +329,18 @@ class OwnerSnapshotLoyaltyTests(unittest.TestCase):
         self.assertEqual(args.workers, 6)
         self.assertEqual(args.export_source, "api")
 
+    def test_owner_snapshot_defaults_run_api_export_with_six_workers(self):
+        original_argv = sys.argv[:]
+        try:
+            sys.argv = ["owner_snapshot.py"]
+            args = osnap.parse_cli_args()
+        finally:
+            sys.argv = original_argv
+
+        self.assertTrue(args.run_export)
+        self.assertEqual(args.export_source, "api")
+        self.assertEqual(args.workers, 6)
+
 
 if __name__ == "__main__":
     unittest.main()

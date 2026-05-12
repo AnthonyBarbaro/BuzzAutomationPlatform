@@ -156,6 +156,7 @@ Force the legacy browser export path if needed:
 ```
 
 ### 2) Owner snapshot (default window)
+Runs fresh Dutchie API exports by default with 6 workers:
 ```bash
 .venv/bin/python owner_snapshot.py
 ```
@@ -254,12 +255,12 @@ Setup and cron details:
 
 ### 3) Owner snapshot for one specific report day (example: Jan 31, 2026)
 ```bash
-.venv/bin/python owner_snapshot.py --report-day 2026-01-31 --run-export
+.venv/bin/python owner_snapshot.py --report-day 2026-01-31
 ```
 
 Skip email for a dry run:
 ```bash
-.venv/bin/python owner_snapshot.py --report-day 2026-01-31 --run-export --no-email
+.venv/bin/python owner_snapshot.py --report-day 2026-01-31 --no-email
 ```
 
 ### 4) Deal/kickback report generation
