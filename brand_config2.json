@@ -177,8 +177,8 @@
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },
     {
-      "brand_synonyms": ["KANHA"],
-      "folder_name": "KANHA",
+      "brand_synonyms": ["KANHA","LIME"],
+      "folder_name": "KANHA/LIME",
       "emails": ["donna@buzzcannabis.com"],
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },
@@ -189,8 +189,8 @@
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },
     {
-      "brand_synonyms": ["Maven (MVN)", "LIME", "Humo", "Happy Fruit", "Ursa"],
-      "folder_name": "Maven / LIME / Humo / Happy Fruit / Ursa",
+      "brand_synonyms": ["Maven (MVN)", "Humo", "Ursa"],
+      "folder_name": "Maven / Humo / Happy Fruit / Ursa",
       "emails": ["donna@buzzcannabis.com"],
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },
@@ -225,8 +225,8 @@
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },
     {
-      "brand_synonyms": ["Smokiez", "VetCBD"],
-      "folder_name": "Smokiez / VetCBD",
+      "brand_synonyms": ["Smokiez", "VetCBD","Happy Fruit"],
+      "folder_name": "Smokiez / VetCBD / Happy Fruit",
       "emails": ["donna@buzzcannabis.com"],
       "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     },
