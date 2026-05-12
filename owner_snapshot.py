@@ -11,7 +11,20 @@ import json
 import numpy as np
 import importlib
 import pandas as pd
-from owner_emailer import send_owner_snapshot_email
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from zipfile import is_zipfile
+
+OWNER_EMAILER_IMPORT_ERROR: Optional[Exception] = None
+try:
+    from owner_emailer import send_owner_snapshot_email
+except Exception as exc:
+    OWNER_EMAILER_IMPORT_ERROR = exc
+
+    def send_owner_snapshot_email(*args, **kwargs):
+        raise RuntimeError(
+            "Owner emailer is unavailable in this environment. "
+            f"Import error: {OWNER_EMAILER_IMPORT_ERROR}"
+        )
 
 # Charts (for PDFs)
 import matplotlib
@@ -40,8 +53,38 @@ from reportlab.platypus import (
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-# --- IMPORTANT: uses your existing exporter ---
-from getSalesReport import run_sales_report, store_abbr_map  # store_name -> "MV"
+from dutchie_api_reports import (
+    DEFAULT_ENV_FILE as DUTCHIE_DEFAULT_ENV_FILE,
+    STORE_CODES as DUTCHIE_STORE_CODES,
+    canonical_env_map as dutchie_canonical_env_map,
+    create_session as dutchie_create_session,
+    local_date_range_to_utc_strings as dutchie_local_date_range_to_utc_strings,
+    parse_store_codes as dutchie_parse_store_codes,
+    request_json as dutchie_request_json,
+    resolve_integrator_key as dutchie_resolve_integrator_key,
+    resolve_store_keys as dutchie_resolve_store_keys,
+    resolve_worker_count as dutchie_resolve_worker_count,
+)
+
+# --- IMPORTANT: uses your existing exporter when Selenium exports are selected ---
+DEFAULT_STORE_ABBR_MAP = {
+    "Buzz Cannabis - Mission Valley": "MV",
+    "Buzz Cannabis-La Mesa": "LM",
+    "Buzz Cannabis - SORRENTO VALLEY": "SV",
+    "Buzz Cannabis - Lemon Grove": "LG",
+    "Buzz Cannabis (National City)": "NC",
+    "Buzz Cannabis Wildomar Palomar": "WP",
+}
+
+GET_SALES_REPORT_IMPORT_ERROR: Optional[Exception] = None
+try:
+    import getSalesReport as gsr
+    from getSalesReport import run_sales_report, store_abbr_map  # store_name -> "MV"
+except Exception as exc:
+    gsr = None
+    run_sales_report = None
+    store_abbr_map = DEFAULT_STORE_ABBR_MAP.copy()
+    GET_SALES_REPORT_IMPORT_ERROR = exc
 
 ###############################################################################
 # CONFIG (easy to change)
@@ -94,8 +137,30 @@ FORCE_HEADER_ROW = True
 EXPORT_HEADER_ROW_INDEX = 4  # Excel row 5
 
 # Discover getSalesReport /files directory
-import getSalesReport as gsr
-FILES_DIR = Path(gsr.__file__).resolve().parent / "files"
+FILES_DIR = (Path(gsr.__file__).resolve().parent if gsr is not None else Path(__file__).resolve().parent) / "files"
+
+# Dutchie API export support
+DEFAULT_EXPORT_SOURCE = "selenium"
+DEFAULT_API_ENV_FILE = DUTCHIE_DEFAULT_ENV_FILE
+DEFAULT_OWNER_API_WORKERS = 6
+API_EXPORT_MAX_WINDOW_DAYS = 31
+
+# Loyalty detail audit appended at the bottom of PDFs and exported as XLSX
+LOYALTY_DISCOUNT_MATCH_TEXT = "Loyalty Points Adjustment"
+LOYALTY_DETAIL_ROOT = REPORTS_ROOT / "discount_details"
+LOYALTY_ADJUSTMENT_ROOT = REPORTS_ROOT / "loyalty_adjustments"
+LOYALTY_ADJUSTMENT_REPORT_URL = "https://dusk.backoffice.dutchie.com/reports/marketing/reports/loyalty-adjustment-report"
+DISCOUNT_DETAIL_EXPORT_ROOT = REPORTS_ROOT / "discount_detail_exports"
+DISCOUNT_DETAIL_REPORT_URL = "https://dusk.backoffice.dutchie.com/reports/marketing/reports/discount-detail-report"
+DEFAULT_LOYALTY_ADJUSTMENT_SOURCE = "auto"
+DEFAULT_DISCOUNT_DETAIL_SOURCE = "auto"
+DEFAULT_LOYALTY_BROWSER_WORKERS = 2
+DEFAULT_DISCOUNT_DETAIL_BROWSER_WORKERS = 2
+MAX_LOYALTY_BROWSER_WORKERS = 3
+MAX_DISCOUNT_DETAIL_BROWSER_WORKERS = 3
+LOYALTY_PDF_MAX_ROWS = 60
+API_FIELD_UNAVAILABLE = "Not provided by API"
+NO_DATA_MARKER_SUFFIX = ".NO_DATA.json"
 
 
 # -------------------------------------------------------------------
@@ -157,6 +222,13 @@ COLUMN_CANDIDATES = {
     "profit": ["Order Profit", "Profit", "Gross Profit", "Net Profit"],
     "return_date": ["Return Date"],
     "total_weight_sold": ["Total Weight Sold", "Total Weight", "Weight Sold"],
+    "discount_name": ["Discount Name", "Discount Names", "Loyalty Discount Names"],
+    "discount_reason": ["Discount Description", "Discount Reason", "Loyalty Discount Reasons"],
+    "discount_approved_by": ["Discount Approved By"],
+    "points_added_by": ["Points Added By"],
+    "loyalty_adjustment_discount": ["Loyalty Points Adjustment Discount"],
+    "completed_by": ["Completed By", "Budtender Name", "Budtender", "Employee"],
+    "customer_id": ["Customer ID"],
 }
 
 
@@ -1568,7 +1640,7 @@ def parse_cli_args() -> argparse.Namespace:
         "--run-export",
         dest="run_export",
         action="store_true",
-        help="Force Selenium export for the selected date window.",
+        help="Force export for the selected date window.",
     )
     parser.add_argument(
         "--reuse-latest",
@@ -1581,8 +1653,124 @@ def parse_cli_args() -> argparse.Namespace:
         action="store_true",
         help="Generate PDFs only; skip sending email.",
     )
+    parser.add_argument(
+        "-email",
+        "--email",
+        action="append",
+        default=[],
+        help="Recipient email address. Can be repeated or comma-separated. Defaults to the owner snapshot list.",
+    )
+    parser.add_argument(
+        "--export-source",
+        choices=["selenium", "api"],
+        default=DEFAULT_EXPORT_SOURCE,
+        help=f"Data source when --run-export is used. Default: {DEFAULT_EXPORT_SOURCE}.",
+    )
+    parser.add_argument(
+        "--use-api",
+        dest="export_source",
+        action="store_const",
+        const="api",
+        help="Shortcut for --export-source api.",
+    )
+    parser.add_argument(
+        "--api-env-file",
+        default=DEFAULT_API_ENV_FILE,
+        help=f"Path to Dutchie API .env file. Default: {DEFAULT_API_ENV_FILE}.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_OWNER_API_WORKERS,
+        help=f"Dutchie API store workers. Default: {DEFAULT_OWNER_API_WORKERS}.",
+    )
+    parser.add_argument(
+        "--stores",
+        nargs="*",
+        help="Optional store codes to include, for example: MV LG or 'MV,LG'.",
+    )
+    parser.add_argument(
+        "--loyalty-discount-name",
+        default=LOYALTY_DISCOUNT_MATCH_TEXT,
+        help=f"Discount name text to track in the loyalty detail table. Default: {LOYALTY_DISCOUNT_MATCH_TEXT}.",
+    )
+    parser.add_argument(
+        "--loyalty-person",
+        default="",
+        help="Optional person/name text to highlight in loyalty register adjustments, for example 'Anthony Barbaro'.",
+    )
+    parser.add_argument(
+        "--loyalty-adjustment-source",
+        choices=["auto", "browser", "none"],
+        default=DEFAULT_LOYALTY_ADJUSTMENT_SOURCE,
+        help=(
+            "How to add Dutchie Backoffice loyalty point adjustment audit rows. "
+            "auto tries the Backoffice report and continues if unavailable; browser requires it; none skips it."
+        ),
+    )
+    parser.add_argument(
+        "--no-loyalty-adjustment-report",
+        dest="loyalty_adjustment_source",
+        action="store_const",
+        const="none",
+        help="Skip the Dutchie Backoffice loyalty adjustment report.",
+    )
+    parser.add_argument(
+        "--loyalty-browser-workers",
+        type=int,
+        default=DEFAULT_LOYALTY_BROWSER_WORKERS,
+        help=(
+            "Parallel browser sessions for the Dutchie Backoffice loyalty adjustment report. "
+            f"Default: {DEFAULT_LOYALTY_BROWSER_WORKERS}; max: {MAX_LOYALTY_BROWSER_WORKERS}."
+        ),
+    )
+    parser.add_argument(
+        "--discount-detail-source",
+        choices=["auto", "browser", "none"],
+        default=DEFAULT_DISCOUNT_DETAIL_SOURCE,
+        help=(
+            "How to fill Discount Approved By from the Dutchie Backoffice Discount Detail Report. "
+            "auto tries the browser report and continues if unavailable; browser requires it; none keeps API-only data."
+        ),
+    )
+    parser.add_argument(
+        "--no-discount-detail-report",
+        dest="discount_detail_source",
+        action="store_const",
+        const="none",
+        help="Skip the Dutchie Backoffice Discount Detail Report approval enrichment.",
+    )
+    parser.add_argument(
+        "--discount-detail-browser-workers",
+        type=int,
+        default=DEFAULT_DISCOUNT_DETAIL_BROWSER_WORKERS,
+        help=(
+            "Parallel browser sessions for the Dutchie Backoffice Discount Detail Report. "
+            f"Default: {DEFAULT_DISCOUNT_DETAIL_BROWSER_WORKERS}; max: {MAX_DISCOUNT_DETAIL_BROWSER_WORKERS}."
+        ),
+    )
+    parser.add_argument(
+        "--no-forecast",
+        action="store_true",
+        help="Skip the month-end forecast step for faster test runs.",
+    )
     parser.set_defaults(run_export=None)
     return parser.parse_args()
+
+def parse_email_recipients(values: List[str]) -> List[str]:
+    recipients: List[str] = []
+    seen = set()
+    for value in values or []:
+        for piece in str(value).replace(",", " ").split():
+            email = piece.strip()
+            if not email:
+                continue
+            key = email.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            recipients.append(email)
+    return recipients
 
 def month_start(d: date) -> date:
     return date(d.year, d.month, 1)
@@ -1630,6 +1818,13 @@ def cleanup_files_dir(files_dir: Path) -> None:
             print(f"[WARN] Could not delete {p}: {e}")
 
 def run_export_for_range(start_day: date, end_day: date) -> None:
+    if run_sales_report is None:
+        raise SystemExit(
+            "Selenium sales export is unavailable in this environment. "
+            f"Import error: {GET_SALES_REPORT_IMPORT_ERROR}. "
+            "Use --export-source api (or --use-api) to fetch from Dutchie API."
+        )
+
     print(f"[EXPORT] Running run_sales_report({start_day} -> {end_day})")
     FILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1670,6 +1865,1712 @@ def archive_exports(start_day: date, end_day: date) -> Tuple[Path, Dict[str, Pat
 
     return range_dir, abbr_to_path
 
+def as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+def _first_nonempty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return value.strip()
+            continue
+        return value
+    return ""
+
+def parse_api_nested(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return []
+    return value if value is not None else []
+
+def api_payload_records(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "results", "items", "transactions", "products", "registerTransactions"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        return [payload]
+    return []
+
+def _selected_store_codes(values: Optional[List[str]]) -> List[str]:
+    if not values:
+        return list(dict.fromkeys(store_abbr_map.values()))
+    return dutchie_parse_store_codes(values)
+
+def _store_name_from_abbr(abbr: str) -> str:
+    for store_name, code in store_abbr_map.items():
+        if code == abbr:
+            return store_name
+    return DUTCHIE_STORE_CODES.get(abbr, abbr)
+
+def _store_iter(selected_store_codes: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+    allowed = set(selected_store_codes or list(dict.fromkeys(store_abbr_map.values())))
+    return [(store_name, abbr) for store_name, abbr in store_abbr_map.items() if abbr in allowed]
+
+def _iter_api_date_chunks(start_day: date, end_day: date, max_days: int = API_EXPORT_MAX_WINDOW_DAYS) -> List[Tuple[date, date]]:
+    chunks: List[Tuple[date, date]] = []
+    cur = start_day
+    window_days = max(1, int(max_days))
+    while cur <= end_day:
+        chunk_end = min(cur + timedelta(days=window_days - 1), end_day)
+        chunks.append((cur, chunk_end))
+        cur = chunk_end + timedelta(days=1)
+    return chunks
+
+def normalize_api_product_label(product_name: Any, brand_name: Any) -> str:
+    product = str(product_name or "").strip() or "Unknown Product"
+    brand = str(brand_name or "").strip()
+    if not brand:
+        return product
+    parsed = parse_brand_from_product(product)
+    if parsed.strip().lower() == brand.lower():
+        return product
+    return f"{brand} | {product}"
+
+def _product_lookup_by_id(products_payload: Any) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for row in api_payload_records(products_payload):
+        product_id = _first_nonempty(row.get("productId"), row.get("id"), row.get("globalProductId"))
+        if product_id in (None, ""):
+            continue
+        lookup[str(product_id)] = row
+    return lookup
+
+def _contains_text(value: Any, needle: str) -> bool:
+    if not needle:
+        return False
+    return needle.lower() in str(value or "").lower()
+
+def _discount_matches(discount: Dict[str, Any], match_text: str) -> bool:
+    haystack = " ".join(
+        str(_first_nonempty(discount.get(key), ""))
+        for key in ("discountName", "discountReason", "name", "reason", "description")
+    )
+    return _contains_text(haystack, match_text)
+
+def _join_unique(values: List[Any]) -> str:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return "; ".join(out)
+
+PERSON_FIELD_CANDIDATES = (
+    "discountApprovedBy",
+    "approvedBy",
+    "approvedByUser",
+    "approvedByUserName",
+    "approvedByEmployee",
+    "approvedByEmployeeName",
+    "managerName",
+    "manager",
+)
+
+POINTS_ADDER_FIELD_CANDIDATES = (
+    "pointsAddedBy",
+    "pointsAddedByUser",
+    "loyaltyAddedBy",
+    "loyaltyAddedByUser",
+    "addedBy",
+    "addedByUser",
+    "createdBy",
+    "createdByUser",
+)
+
+CUSTOMER_NAME_FIELDS = (
+    "name",
+    "customerName",
+    "fullName",
+    "displayName",
+)
+
+def _customer_display_name(row: Dict[str, Any]) -> str:
+    for key in CUSTOMER_NAME_FIELDS:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    first = str(row.get("firstName") or "").strip()
+    middle = str(row.get("middleName") or "").strip()
+    last = str(row.get("lastName") or "").strip()
+    return " ".join(part for part in [first, middle, last] if part).strip()
+
+def _first_person_from_records(records: List[Dict[str, Any]], keys: Tuple[str, ...]) -> str:
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key in keys:
+            value = record.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+    return ""
+
+def _transaction_item_id(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return str(int(float(value)))
+    except Exception:
+        return str(value).strip()
+
+def _matching_transaction_discounts_by_item(tx_discounts: List[Dict[str, Any]], match_text: str) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    by_item: Dict[str, List[Dict[str, Any]]] = {}
+    unassigned: List[Dict[str, Any]] = []
+    for discount in tx_discounts:
+        if not isinstance(discount, dict) or not _discount_matches(discount, match_text):
+            continue
+        item_id = _transaction_item_id(discount.get("transactionItemId"))
+        if item_id and item_id not in {"0", "0.0"}:
+            by_item.setdefault(item_id, []).append(discount)
+        else:
+            unassigned.append(discount)
+    return by_item, unassigned
+
+def _discount_amount(discount: Dict[str, Any]) -> float:
+    return as_float(_first_nonempty(discount.get("amount"), discount.get("discountAmount"), discount.get("totalDiscount")))
+
+def _discount_names(discounts: List[Dict[str, Any]]) -> str:
+    return _join_unique([
+        _first_nonempty(d.get("discountName"), d.get("name"), d.get("discountReason"), d.get("description"))
+        for d in discounts
+        if isinstance(d, dict)
+    ])
+
+def _discount_reasons(discounts: List[Dict[str, Any]]) -> str:
+    return _join_unique([
+        _first_nonempty(d.get("discountReason"), d.get("reason"), d.get("description"), d.get("discountName"))
+        for d in discounts
+        if isinstance(d, dict)
+    ])
+
+def build_customer_lookup(customer_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for row in customer_rows:
+        if not isinstance(row, dict):
+            continue
+        customer_id = _first_nonempty(row.get("customerId"), row.get("customerID"), row.get("id"))
+        if customer_id in (None, ""):
+            continue
+        lookup[str(customer_id)] = row
+    return lookup
+
+def fetch_customers_for_ids(session: Any, customer_ids: List[Any]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    seen: set[str] = set()
+    for raw_id in customer_ids:
+        customer_id = str(raw_id or "").strip()
+        if not customer_id or customer_id.lower() in {"nan", "none"} or customer_id in seen:
+            continue
+        seen.add(customer_id)
+        try:
+            payload = dutchie_request_json(
+                session,
+                "/customer/customers",
+                params={"customerID": customer_id, "includeAnonymous": False},
+                timeout=60,
+                max_attempts=2,
+            )
+        except Exception as exc:
+            print(f"[EXPORT API] WARN: customer lookup skipped for {customer_id}: {exc}")
+            continue
+        lookup.update(build_customer_lookup(api_payload_records(payload)))
+    return lookup
+
+def build_register_transaction_lookup(register_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for row in register_rows:
+        if not isinstance(row, dict):
+            continue
+        tx_id = _first_nonempty(row.get("transactionId"), row.get("transactionID"))
+        if tx_id in (None, ""):
+            continue
+        lookup[str(tx_id)] = row
+    return lookup
+
+def normalize_api_sales_rows(
+    store_code: str,
+    transactions: List[Dict[str, Any]],
+    products_payload: Any,
+    loyalty_discount_name: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    product_lookup = _product_lookup_by_id(products_payload)
+    store_name = _store_name_from_abbr(store_code)
+
+    for tx in transactions:
+        if not isinstance(tx, dict) or bool(tx.get("isVoid")):
+            continue
+
+        items = [item for item in parse_api_nested(tx.get("items")) if isinstance(item, dict) and not bool(item.get("isCoupon"))]
+        tx_discounts = [d for d in parse_api_nested(tx.get("discounts")) if isinstance(d, dict)]
+        tx_matches_by_item, tx_unassigned_matches = _matching_transaction_discounts_by_item(tx_discounts, loyalty_discount_name)
+        unassigned_total = sum(_discount_amount(d) for d in tx_unassigned_matches)
+        item_discount_total = sum(abs(as_float(item.get("totalDiscount"))) for item in items)
+        item_gross_total = sum(abs(as_float(item.get("totalPrice"))) for item in items)
+
+        transaction_id = _first_nonempty(tx.get("transactionId"), tx.get("globalId"), tx.get("referenceId"), tx.get("invoiceNumber"))
+        tx_date = _first_nonempty(tx.get("transactionDateLocalTime"), tx.get("transactionDate"), tx.get("lastModifiedDateUTC"))
+        employee = _first_nonempty(tx.get("completedByUser"), tx.get("employeeName"), tx.get("employeeId"), "Unknown")
+        customer_type = _first_nonempty(tx.get("customerTypeName"), tx.get("customerType"), tx.get("customerTypeId"), "")
+        is_return = bool(tx.get("isReturn"))
+        tx_total_before_tax = as_float(tx.get("totalBeforeTax"))
+
+        if not items:
+            gross = as_float(tx.get("subtotal"))
+            discount = as_float(tx.get("totalDiscount"))
+            net = as_float(tx.get("totalBeforeTax"), gross - discount)
+            if is_return and net > 0 and tx_total_before_tax >= 0:
+                gross = -abs(gross)
+                discount = -abs(discount)
+                net = -abs(net)
+
+            matched = [d for d in tx_discounts if _discount_matches(d, loyalty_discount_name)]
+            rows.append({
+                "Order ID": transaction_id,
+                "Order Time": tx_date,
+                "Transaction Date": tx_date,
+                "Budtender Name": employee,
+                "Completed By": employee,
+                "Customer ID": tx.get("customerId"),
+                "Customer Type": customer_type,
+                "Product Name": "Unknown Product",
+                "Brand": "Unknown",
+                "Major Category": "Unknown",
+                "Category": "Unknown",
+                "Product Category": "Unknown",
+                "Total Inventory Sold": as_float(tx.get("totalItems"), 1.0),
+                "Gross Sales": gross,
+                "Discounted Amount": discount,
+                "Loyalty as Discount": 0.0,
+                "Net Sales": net,
+                "Inventory Cost": 0.0,
+                "Order Profit": net,
+                "Return Date": tx.get("voidDate") if is_return else None,
+                "Total Weight Sold": 0.0,
+                "Store": store_code,
+                "Store Name": store_name,
+                "Discount Names": _discount_names(tx_discounts),
+                "Discount Reasons": _discount_reasons(tx_discounts),
+                "Loyalty Discount Names": _discount_names(matched),
+                "Loyalty Discount Reasons": _discount_reasons(matched),
+                "Loyalty Points Adjustment Discount": sum(_discount_amount(d) for d in matched),
+                "Discount Approved By": _first_person_from_records(matched + [tx], PERSON_FIELD_CANDIDATES) or API_FIELD_UNAVAILABLE,
+                "Points Added By": _first_person_from_records(matched + [tx], POINTS_ADDER_FIELD_CANDIDATES) or API_FIELD_UNAVAILABLE,
+                "Loyalty Earned": as_float(tx.get("loyaltyEarned")),
+                "Loyalty Spent": as_float(tx.get("loyaltySpent")),
+                "API Detail Note": "No item detail returned by API",
+            })
+            continue
+
+        for item in items:
+            product_id = item.get("productId")
+            catalog = product_lookup.get(str(product_id), {})
+            product_name = _first_nonempty(
+                catalog.get("productName"),
+                catalog.get("internalName"),
+                catalog.get("alternateName"),
+                item.get("productName"),
+                item.get("name"),
+                f"Product {product_id or 'Unknown'}",
+            )
+            brand_name = _first_nonempty(catalog.get("brandName"), catalog.get("brand"), item.get("brandName"), "")
+            category = _first_nonempty(catalog.get("masterCategory"), catalog.get("category"), item.get("masterCategory"), item.get("category"), "Unknown")
+            product_category = _first_nonempty(catalog.get("category"), category)
+
+            qty = as_float(item.get("quantity"), 1.0)
+            gross = as_float(item.get("totalPrice"), as_float(item.get("unitPrice")) * qty)
+            discount = as_float(item.get("totalDiscount"))
+            net = gross - discount
+            return_date = item.get("returnDate") or tx.get("voidDate")
+            row_is_return = is_return or bool(item.get("isReturned")) or bool(return_date)
+            if row_is_return and net > 0 and tx_total_before_tax >= 0:
+                gross = -abs(gross)
+                discount = -abs(discount)
+                net = -abs(net)
+                qty = -abs(qty)
+
+            cogs = as_float(item.get("unitCost")) * qty
+            item_discounts = [d for d in parse_api_nested(item.get("discounts")) if isinstance(d, dict)]
+            item_matches = [d for d in item_discounts if _discount_matches(d, loyalty_discount_name)]
+            tx_item_matches = tx_matches_by_item.get(_transaction_item_id(item.get("transactionItemId")), [])
+            direct_matches = item_matches + tx_item_matches
+            loyalty_amount = sum(_discount_amount(d) for d in direct_matches)
+            note = ""
+
+            if loyalty_amount == 0.0 and unassigned_total:
+                if item_discount_total:
+                    ratio = abs(as_float(item.get("totalDiscount"))) / item_discount_total
+                elif item_gross_total:
+                    ratio = abs(as_float(item.get("totalPrice"))) / item_gross_total
+                else:
+                    ratio = 1.0 / max(1, len(items))
+                loyalty_amount = unassigned_total * ratio
+                direct_matches = tx_unassigned_matches
+                note = "Allocated from transaction-level discount"
+
+            all_discounts = item_discounts + tx_discounts
+            rows.append({
+                "Order ID": transaction_id,
+                "Order Time": tx_date,
+                "Transaction Date": tx_date,
+                "Budtender Name": employee,
+                "Completed By": employee,
+                "Customer ID": tx.get("customerId"),
+                "Customer Type": customer_type,
+                "Vendor Name": _first_nonempty(item.get("vendor"), catalog.get("vendorName"), catalog.get("producerName"), ""),
+                "Product Name": normalize_api_product_label(product_name, brand_name),
+                "Brand": str(brand_name or parse_brand_from_product(product_name) or "Unknown").strip(),
+                "Major Category": category,
+                "Category": category,
+                "Product Category": product_category,
+                "Package ID": item.get("packageId"),
+                "Batch ID": _first_nonempty(item.get("batchName"), ""),
+                "External Package ID": _first_nonempty(item.get("sourcePackageId"), item.get("packageId"), ""),
+                "Inventory ID": item.get("inventoryId"),
+                "Product ID": product_id,
+                "Transaction Item ID": item.get("transactionItemId"),
+                "Total Inventory Sold": qty,
+                "Unit Weight Sold": as_float(item.get("unitWeight")),
+                "Total Weight Sold": as_float(item.get("unitWeight")) * abs(qty),
+                "Unit Price": as_float(_first_nonempty(item.get("unitPrice"), catalog.get("price"), catalog.get("recPrice"), catalog.get("medPrice"))),
+                "Gross Sales": gross,
+                "Inventory Cost": cogs,
+                "Discounted Amount": discount,
+                "Loyalty as Discount": 0.0,
+                "Net Sales": net,
+                "Order Profit": net - cogs,
+                "Return Date": return_date if row_is_return else None,
+                "Store": store_code,
+                "Store Name": store_name,
+                "Discount Names": _discount_names(all_discounts),
+                "Discount Reasons": _discount_reasons(all_discounts),
+                "Loyalty Discount Names": _discount_names(direct_matches),
+                "Loyalty Discount Reasons": _discount_reasons(direct_matches),
+                "Loyalty Points Adjustment Discount": loyalty_amount,
+                "Discount Approved By": _first_person_from_records(direct_matches + [tx], PERSON_FIELD_CANDIDATES) or API_FIELD_UNAVAILABLE,
+                "Points Added By": _first_person_from_records(direct_matches + [tx], POINTS_ADDER_FIELD_CANDIDATES) or API_FIELD_UNAVAILABLE,
+                "Loyalty Earned": as_float(tx.get("loyaltyEarned")),
+                "Loyalty Spent": as_float(tx.get("loyaltySpent")),
+                "API Detail Note": note or ("Approval/add-point user fields only populate if Dutchie sends them"),
+            })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=[
+            "Order ID", "Order Time", "Budtender Name", "Product Name", "Major Category",
+            "Category", "Total Inventory Sold", "Gross Sales", "Discounted Amount",
+            "Loyalty as Discount", "Net Sales", "Inventory Cost", "Order Profit",
+            "Return Date", "Total Weight Sold", "Store", "Loyalty Points Adjustment Discount",
+        ])
+
+    out = _clean_df(out)
+    for date_col in ["Order Time", "Transaction Date", "Return Date"]:
+        if date_col in out.columns:
+            out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    return out
+
+def compute_loyalty_points_adjustment_detail(
+    df: pd.DataFrame,
+    start: date,
+    end: date,
+    match_text: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+    customer_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+    register_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    tmp = _filter_df_date_range(df, start, end)
+    if tmp.empty:
+        return pd.DataFrame()
+
+    amount_col = find_col(tmp, COLUMN_CANDIDATES["loyalty_adjustment_discount"])
+    name_col = find_col(tmp, COLUMN_CANDIDATES["discount_name"])
+    reason_col = find_col(tmp, COLUMN_CANDIDATES["discount_reason"])
+    if amount_col:
+        amount = to_number(tmp[amount_col]).fillna(0.0).astype(float)
+    else:
+        amount = pd.Series(0.0, index=tmp.index)
+
+    text_match = pd.Series(False, index=tmp.index)
+    for col in [name_col, reason_col]:
+        if col:
+            text_match |= tmp[col].fillna("").astype(str).str.contains(re.escape(match_text), case=False, na=False)
+
+    detail = tmp[(amount.abs() > 1e-9) | text_match].copy()
+    if detail.empty:
+        return pd.DataFrame()
+
+    date_col = find_col(detail, COLUMN_CANDIDATES["date"])
+    tx_col = find_col(detail, COLUMN_CANDIDATES["transaction_id"])
+    product_col = find_col(detail, COLUMN_CANDIDATES["product"])
+    category_col = find_col(detail, COLUMN_CANDIDATES["category"])
+    qty_col = find_col(detail, COLUMN_CANDIDATES["quantity"])
+    gross_col = find_col(detail, COLUMN_CANDIDATES["gross_sales"])
+    net_col = find_col(detail, COLUMN_CANDIDATES["net_sales"])
+    disc_col = find_col(detail, COLUMN_CANDIDATES["discount_main"])
+    approved_col = find_col(detail, COLUMN_CANDIDATES["discount_approved_by"])
+    added_col = find_col(detail, COLUMN_CANDIDATES["points_added_by"])
+    completed_col = find_col(detail, COLUMN_CANDIDATES["completed_by"])
+    customer_col = find_col(detail, COLUMN_CANDIDATES["customer_id"])
+
+    out = pd.DataFrame({
+        "store": detail.get("Store", ""),
+        "store_name": detail.get("Store Name", ""),
+        "order_time": pd.to_datetime(detail[date_col], errors="coerce") if date_col else pd.NaT,
+        "order_id": detail[tx_col].astype(str) if tx_col else "",
+        "customer_id": detail[customer_col].astype(str) if customer_col else "",
+        "product": detail[product_col].astype(str) if product_col else "",
+        "category": detail[category_col].astype(str) if category_col else "",
+        "quantity": to_number(detail[qty_col]).fillna(0.0).astype(float) if qty_col else 0.0,
+        "gross_sales": to_number(detail[gross_col]).fillna(0.0).astype(float) if gross_col else 0.0,
+        "item_discount": to_number(detail[disc_col]).fillna(0.0).astype(float) if disc_col else 0.0,
+        "loyalty_adjustment_discount": amount.loc[detail.index].astype(float),
+        "net_sales": to_number(detail[net_col]).fillna(0.0).astype(float) if net_col else 0.0,
+        "discount_name": detail[name_col].astype(str) if name_col else match_text,
+        "discount_reason": detail[reason_col].astype(str) if reason_col else "",
+        "discount_approved_by": detail[approved_col].fillna(API_FIELD_UNAVAILABLE).astype(str) if approved_col else API_FIELD_UNAVAILABLE,
+        "points_added_by": detail[added_col].fillna(API_FIELD_UNAVAILABLE).astype(str) if added_col else API_FIELD_UNAVAILABLE,
+        "completed_by": detail[completed_col].fillna("").astype(str) if completed_col else "",
+        "loyalty_earned": to_number(detail["Loyalty Earned"]).fillna(0.0).astype(float) if "Loyalty Earned" in detail.columns else 0.0,
+        "loyalty_spent": to_number(detail["Loyalty Spent"]).fillna(0.0).astype(float) if "Loyalty Spent" in detail.columns else 0.0,
+        "api_note": detail["API Detail Note"].fillna("").astype(str) if "API Detail Note" in detail.columns else "",
+    })
+    out["store"] = out["store"].fillna("").astype(str)
+    if "Store" not in detail.columns:
+        out["store"] = ""
+
+    customer_lookup = customer_lookup or {}
+    register_lookup = register_lookup or {}
+
+    customer_names: List[str] = []
+    customer_phones: List[str] = []
+    customer_emails: List[str] = []
+    edited_by: List[str] = []
+    edited_by_employee_id: List[str] = []
+
+    for row in out.to_dict("records"):
+        customer_id = str(row.get("customer_id") or "").strip()
+        customer = customer_lookup.get(customer_id, {})
+        tx_id = str(row.get("order_id") or "").strip()
+        register = register_lookup.get(tx_id, {})
+        register_by = str(_first_nonempty(register.get("transactionBy"), register.get("adjustedBy"), "")).strip()
+        register_employee_id = str(_first_nonempty(register.get("transactionByEmployeeId"), register.get("adjustedByEmployeeId"), "")).strip()
+        points_added_by = str(row.get("points_added_by") or "").strip()
+        completed_by = str(row.get("completed_by") or "").strip()
+
+        customer_names.append(_customer_display_name(customer))
+        customer_phones.append(str(_first_nonempty(customer.get("phone"), customer.get("cellPhone"), "")).strip())
+        customer_emails.append(str(_first_nonempty(customer.get("emailAddress"), customer.get("email"), "")).strip())
+        if points_added_by and points_added_by != API_FIELD_UNAVAILABLE:
+            edited_by.append(points_added_by)
+        elif register_by:
+            edited_by.append(register_by)
+        elif completed_by:
+            edited_by.append(completed_by)
+        else:
+            edited_by.append(API_FIELD_UNAVAILABLE)
+        edited_by_employee_id.append(register_employee_id)
+
+    out["customer_name"] = customer_names
+    out["customer_phone"] = customer_phones
+    out["customer_email"] = customer_emails
+    out["edited_or_processed_by"] = edited_by
+    out["edited_or_processed_by_employee_id"] = edited_by_employee_id
+    out = out.sort_values(["order_time", "order_id", "product"], ascending=[True, True, True])
+    return out.reset_index(drop=True)
+
+def normalize_register_loyalty_adjustments(
+    store_code: str,
+    payload: Any,
+    match_text: str,
+    person_text: str = "",
+    customer_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+    sales_customer_by_transaction: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    needles = [match_text, "loyalty", "points"]
+    customer_lookup = customer_lookup or {}
+    sales_customer_by_transaction = sales_customer_by_transaction or {}
+
+    for row in api_payload_records(payload):
+        text = " ".join(str(v or "") for v in row.values() if not isinstance(v, (dict, list)))
+        if not any(_contains_text(text, needle) for needle in needles if needle):
+            continue
+        transaction_id = _first_nonempty(row.get("transactionId"), row.get("id"), row.get("globalId"), row.get("referenceId"))
+        customer_id = _first_nonempty(row.get("customerId"), sales_customer_by_transaction.get(str(transaction_id)), "")
+        customer = customer_lookup.get(str(customer_id), {})
+        employee = _first_nonempty(
+            row.get("transactionBy"),
+            row.get("adjustedBy"),
+            row.get("completedByUser"),
+            row.get("employeeName"),
+            row.get("createdByUser"),
+            row.get("userName"),
+            row.get("employeeId"),
+            API_FIELD_UNAVAILABLE,
+        )
+        rows.append({
+            "store": store_code,
+            "store_name": _store_name_from_abbr(store_code),
+            "transaction_id": transaction_id,
+            "receipt_number": transaction_id,
+            "customer_id": customer_id,
+            "customer_name": _customer_display_name(customer),
+            "customer_phone": _first_nonempty(customer.get("phone"), customer.get("cellPhone"), ""),
+            "date": _first_nonempty(
+                row.get("transactionDateLocalTime"),
+                row.get("transactionDate"),
+                row.get("transactionDateUTC"),
+                row.get("adjustedOn"),
+                row.get("lastModifiedDateUTC"),
+                row.get("createdDateUTC"),
+            ),
+            "type": _first_nonempty(row.get("transactionType"), row.get("adjustmentType"), row.get("type"), row.get("reason"), ""),
+            "description": _first_nonempty(row.get("description"), row.get("adjustmentReason"), row.get("reason"), row.get("memo"), row.get("note"), row.get("comment"), ""),
+            "points_delta": "",
+            "amount": as_float(_first_nonempty(row.get("amount"), row.get("transactionAmount"), row.get("total"), row.get("adjustmentAmount"))),
+            "adjusted_by": employee,
+            "points_added_by": employee,
+            "employee": employee,
+            "employee_id": _first_nonempty(row.get("transactionByEmployeeId"), row.get("adjustedByEmployeeId"), ""),
+            "source": "Dutchie API register activity",
+            "raw_match": text[:500],
+        })
+
+    out = pd.DataFrame(rows)
+    if not out.empty and "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    return out
+
+LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES = {
+    "date": [
+        "Adjustment Date", "Adjusted On", "Date", "Created Date", "Created On", "Order Time",
+        "Transaction Date", "Time", "Updated On",
+    ],
+    "receipt": [
+        "Receipt", "Receipt No", "Receipt Number", "Receipt #", "Transaction ID",
+        "Transaction Id", "Order ID", "Order Id", "Invoice", "Invoice Number",
+    ],
+    "customer_id": ["Customer ID", "Customer Id", "CustomerID", "Patient ID", "Patient Id"],
+    "customer": ["Customer", "Customer Name", "Patient", "Patient Name", "Name", "Member"],
+    "first_name": ["First Name", "Customer First Name", "Patient First Name"],
+    "last_name": ["Last Name", "Customer Last Name", "Patient Last Name"],
+    "phone": ["Phone", "Phone Number", "Customer Phone", "Patient Phone"],
+    "email": ["Email", "Email Address", "Customer Email"],
+    "points": [
+        "Points", "Point Adjustment", "Points Adjustment", "Adjustment", "Adjusted Points",
+        "Points Adjusted", "Loyalty Points", "Points Added", "Points Removed", "Delta",
+        "Change", "Amount", "Loyalty Adjustment", "LoyaltyAdjustment",
+    ],
+    "balance": ["Balance", "New Balance", "Loyalty Balance", "Ending Balance"],
+    "type": ["Type", "Adjustment Type", "Action", "Activity"],
+    "reason": ["Reason", "Adjustment Reason", "AdjustmentReason", "Description", "Comment", "Comments", "Note", "Notes"],
+    "adjusted_by": [
+        "Adjusted By", "Edited By", "Added By", "Points Added By", "Created By", "Transaction By", "TransactionBy",
+        "Employee", "Employee Name", "User", "User Name", "Performed By",
+    ],
+    "approved_by": ["Approved By", "Manager", "Manager Name", "Approving Manager", "ApprovingManager"],
+}
+
+def _normalized_col_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+def find_col_fuzzy(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    exact = find_col(df, candidates)
+    if exact:
+        return exact
+    normalized = {_normalized_col_key(c): c for c in df.columns}
+    for candidate in candidates:
+        key = _normalized_col_key(candidate)
+        if key in normalized:
+            return normalized[key]
+    for candidate in candidates:
+        key = _normalized_col_key(candidate)
+        for col_key, col in normalized.items():
+            if key and key in col_key:
+                return col
+    return None
+
+def _series_or_blank(df: pd.DataFrame, col: Optional[str]) -> pd.Series:
+    if col and col in df.columns:
+        return df[col].fillna("").astype(str)
+    return pd.Series([""] * len(df), index=df.index, dtype="object")
+
+def _combine_customer_name(df: pd.DataFrame, customer_col: Optional[str], first_col: Optional[str], last_col: Optional[str]) -> pd.Series:
+    customer = _series_or_blank(df, customer_col).str.strip()
+    if customer.str.len().gt(0).any():
+        return customer
+    first = _series_or_blank(df, first_col).str.strip()
+    last = _series_or_blank(df, last_col).str.strip()
+    return (first + " " + last).str.strip()
+
+def read_loyalty_adjustment_export(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return _clean_df(pd.read_csv(path))
+    if suffix in {".xlsx", ".xlsm", ".xls"}:
+        tokens = [
+            "Adjustment Date", "Adjusted On", "Customer", "Patient", "Points",
+            "Adjusted By", "Employee", "Reason", "Receipt",
+        ]
+        try:
+            header_row = guess_header_row(path, tokens=tokens, scan_rows=80)
+            df = pd.read_excel(path, header=header_row, engine="openpyxl")
+        except Exception:
+            df = pd.read_excel(path, header=0, engine="openpyxl")
+        return _clean_df(df).dropna(how="all").reset_index(drop=True)
+    raise ValueError(f"Unsupported loyalty adjustment export file type: {path}")
+
+def normalize_backoffice_loyalty_adjustments(
+    store_code: str,
+    data: pd.DataFrame,
+    start: date,
+    end: date,
+    source_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    df = _clean_df(data.copy()).dropna(how="all")
+    if df.empty:
+        return pd.DataFrame()
+
+    date_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["date"])
+    receipt_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["receipt"])
+    customer_id_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["customer_id"])
+    customer_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["customer"])
+    first_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["first_name"])
+    last_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["last_name"])
+    phone_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["phone"])
+    email_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["email"])
+    points_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["points"])
+    balance_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["balance"])
+    type_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["type"])
+    reason_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["reason"])
+    adjusted_by_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["adjusted_by"])
+    approved_by_col = find_col_fuzzy(df, LOYALTY_ADJUSTMENT_EXPORT_CANDIDATES["approved_by"])
+
+    if date_col:
+        dates = pd.to_datetime(df[date_col], errors="coerce")
+        mask = dates.dt.date.between(start, end)
+        df = df[mask | dates.isna()].copy()
+        dates = dates.loc[df.index]
+    else:
+        dates = pd.Series(pd.NaT, index=df.index)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    points = to_number(df[points_col]).astype(float) if points_col else pd.Series(np.nan, index=df.index)
+    balance = to_number(df[balance_col]).astype(float) if balance_col else pd.Series(np.nan, index=df.index)
+    adjusted_by = _series_or_blank(df, adjusted_by_col).str.strip()
+    approved_by = _series_or_blank(df, approved_by_col).str.strip()
+    display_adjusted_by = approved_by.where(approved_by.str.len() > 0, adjusted_by)
+    customer_name = _combine_customer_name(df, customer_col, first_col, last_col)
+
+    out = pd.DataFrame({
+        "store": store_code,
+        "store_name": _store_name_from_abbr(store_code),
+        "date": dates,
+        "receipt_number": _series_or_blank(df, receipt_col),
+        "transaction_id": _series_or_blank(df, receipt_col),
+        "customer_id": _series_or_blank(df, customer_id_col),
+        "customer_name": customer_name,
+        "customer_phone": _series_or_blank(df, phone_col),
+        "customer_email": _series_or_blank(df, email_col),
+        "type": _series_or_blank(df, type_col),
+        "description": _series_or_blank(df, reason_col),
+        "points_delta": points,
+        "ending_balance": balance,
+        "amount": np.nan,
+        "adjusted_by": display_adjusted_by.replace("", API_FIELD_UNAVAILABLE),
+        "approving_manager": approved_by.replace("", API_FIELD_UNAVAILABLE),
+        "transaction_by": adjusted_by.replace("", API_FIELD_UNAVAILABLE),
+        "points_added_by": display_adjusted_by.replace("", API_FIELD_UNAVAILABLE),
+        "discount_approved_by": approved_by.replace("", API_FIELD_UNAVAILABLE),
+        "employee": display_adjusted_by.replace("", API_FIELD_UNAVAILABLE),
+        "employee_id": "",
+        "source": "Dutchie Backoffice loyalty adjustment report",
+        "source_file": str(source_path or ""),
+    })
+    return out.sort_values(["date", "receipt_number"], na_position="last").reset_index(drop=True)
+
+DISCOUNT_DETAIL_EXPORT_CANDIDATES = {
+    "date": ["Order Time", "Transaction Date", "Date", "Sold At", "Created At"],
+    "order_id": [
+        "Order ID", "Order Number", "Order", "Receipt", "Receipt No",
+        "Receipt Number", "Transaction ID", "Transaction Id",
+    ],
+    "customer": ["Customer Name", "Customer", "Patient", "Patient Name"],
+    "product": ["Product Name", "Product", "Item Name", "Item"],
+    "amount": ["Discounted Amount", "Discount Amount", "Discount", "Total Discount"],
+    "discount_name": ["Discount Name", "Discount Names"],
+    "discount_description": ["Discount Description", "Discount Reason", "Reason"],
+    "approved_by": ["Discount Approved By", "ApprovingManager", "Approved By", "Manager", "Manager Name"],
+    "budtender": ["Budtender Name", "Budtender", "Employee", "Employee Name", "Cashier"],
+}
+
+def _clean_report_person(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return ""
+    if text.lower() in {"nan", "none", "api n/a", API_FIELD_UNAVAILABLE.lower()}:
+        return ""
+    return text
+
+def _approval_order_key(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return ""
+    try:
+        return str(int(float(text)))
+    except Exception:
+        return re.sub(r"\s+", "", text)
+
+def _approval_product_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+def _approval_amount_key(value: Any) -> str:
+    return f"{abs(as_float(value)):.2f}"
+
+def normalize_discount_detail_approvals(
+    store_code: str,
+    data: pd.DataFrame,
+    start: date,
+    end: date,
+    match_text: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+    source_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    df = _clean_df(data.copy()).dropna(how="all")
+    if df.empty:
+        return pd.DataFrame()
+
+    date_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["date"])
+    order_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["order_id"])
+    customer_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["customer"])
+    product_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["product"])
+    amount_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["amount"])
+    discount_name_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["discount_name"])
+    discount_desc_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["discount_description"])
+    approved_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["approved_by"])
+    budtender_col = find_col_fuzzy(df, DISCOUNT_DETAIL_EXPORT_CANDIDATES["budtender"])
+
+    if date_col:
+        dates = pd.to_datetime(df[date_col], errors="coerce")
+        mask = dates.dt.date.between(start, end)
+        df = df[mask].copy()
+        dates = dates.loc[df.index]
+    else:
+        dates = pd.Series(pd.NaT, index=df.index)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    name_series = _series_or_blank(df, discount_name_col)
+    desc_series = _series_or_blank(df, discount_desc_col)
+    match_mask = (
+        name_series.str.contains(re.escape(match_text), case=False, na=False)
+        | desc_series.str.contains(re.escape(match_text), case=False, na=False)
+    )
+    df = df[match_mask].copy()
+    dates = dates.loc[df.index]
+    if df.empty:
+        return pd.DataFrame()
+
+    out = pd.DataFrame({
+        "store": store_code,
+        "store_name": _store_name_from_abbr(store_code),
+        "order_time": dates,
+        "order_id": _series_or_blank(df, order_col),
+        "customer_name": _series_or_blank(df, customer_col),
+        "product": _series_or_blank(df, product_col),
+        "loyalty_adjustment_discount": to_number(df[amount_col]).fillna(0.0).astype(float) if amount_col else 0.0,
+        "discount_name": _series_or_blank(df, discount_name_col),
+        "discount_reason": _series_or_blank(df, discount_desc_col),
+        "discount_approved_by": _series_or_blank(df, approved_col).map(_clean_report_person) if approved_col else "",
+        "completed_by": _series_or_blank(df, budtender_col),
+        "approval_source": "Dutchie Backoffice Discount Detail Report",
+        "source_file": str(source_path or ""),
+    })
+    out = out[out["discount_approved_by"].astype(str).str.strip().ne("")]
+    return out.sort_values(["order_time", "order_id", "product"], na_position="last").reset_index(drop=True)
+
+def _add_unique_approval(lookup: Dict[Tuple[str, ...], str], key: Tuple[str, ...], approval: str) -> None:
+    if not all(key) or not approval:
+        return
+    existing = lookup.get(key)
+    if existing is None:
+        lookup[key] = approval
+    elif existing != approval:
+        lookup[key] = ""
+
+def _discount_approval_lookups(approval_df: pd.DataFrame) -> Dict[str, Dict[Tuple[str, ...], str]]:
+    lookups: Dict[str, Dict[Tuple[str, ...], str]] = {
+        "order_product_amount": {},
+        "order_product": {},
+        "order_amount": {},
+        "order": {},
+    }
+    if approval_df is None or approval_df.empty:
+        return lookups
+
+    for row in approval_df.to_dict("records"):
+        approval = _clean_report_person(row.get("discount_approved_by"))
+        if not approval:
+            continue
+        order_key = _approval_order_key(row.get("order_id"))
+        product_key = _approval_product_key(row.get("product"))
+        amount_key = _approval_amount_key(row.get("loyalty_adjustment_discount"))
+        _add_unique_approval(lookups["order_product_amount"], (order_key, product_key, amount_key), approval)
+        _add_unique_approval(lookups["order_product"], (order_key, product_key), approval)
+        _add_unique_approval(lookups["order_amount"], (order_key, amount_key), approval)
+        _add_unique_approval(lookups["order"], (order_key,), approval)
+    return lookups
+
+def enrich_loyalty_detail_with_discount_approvals(
+    detail_df: pd.DataFrame,
+    approval_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if detail_df is None or detail_df.empty or approval_df is None or approval_df.empty:
+        return detail_df
+
+    out = detail_df.copy()
+    if "discount_approved_by" not in out.columns:
+        out["discount_approved_by"] = API_FIELD_UNAVAILABLE
+    if "discount_approval_source" not in out.columns:
+        out["discount_approval_source"] = ""
+
+    lookups = _discount_approval_lookups(approval_df)
+    filled = 0
+    for idx, row in out.iterrows():
+        current = _clean_report_person(row.get("discount_approved_by"))
+        if current:
+            continue
+
+        order_key = _approval_order_key(row.get("order_id"))
+        product_key = _approval_product_key(row.get("product"))
+        amount_key = _approval_amount_key(row.get("loyalty_adjustment_discount"))
+        approval = (
+            lookups["order_product_amount"].get((order_key, product_key, amount_key))
+            or lookups["order_product"].get((order_key, product_key))
+            or lookups["order_amount"].get((order_key, amount_key))
+            or lookups["order"].get((order_key,))
+            or ""
+        )
+        approval = _clean_report_person(approval)
+        if not approval:
+            continue
+
+        out.at[idx, "discount_approved_by"] = approval
+        out.at[idx, "discount_approval_source"] = "Dutchie Backoffice Discount Detail Report"
+        if "api_note" in out.columns:
+            note = str(out.at[idx, "api_note"] or "").strip()
+            addition = "Discount Approved By filled from Backoffice Discount Detail Report"
+            out.at[idx, "api_note"] = f"{note}; {addition}" if note else addition
+        filled += 1
+
+    if filled:
+        print(f"[DISCOUNT DETAIL] Filled Discount Approved By for {filled:,} loyalty line item(s).")
+    return out
+
+def enrich_loyalty_detail_maps_with_discount_approvals(
+    detail_by_store: Dict[str, pd.DataFrame],
+    approvals_by_store: Dict[str, pd.DataFrame],
+) -> Dict[str, pd.DataFrame]:
+    if not detail_by_store or not approvals_by_store:
+        return detail_by_store
+    enriched: Dict[str, pd.DataFrame] = {}
+    for abbr, detail in detail_by_store.items():
+        enriched[abbr] = enrich_loyalty_detail_with_discount_approvals(detail, approvals_by_store.get(abbr, pd.DataFrame()))
+    return enriched
+
+def merge_discount_approval_maps(*maps: Optional[Dict[str, pd.DataFrame]]) -> Dict[str, pd.DataFrame]:
+    merged: Dict[str, pd.DataFrame] = {}
+    keys: List[str] = []
+    for mapping in maps:
+        for key in (mapping or {}).keys():
+            if key not in keys:
+                keys.append(key)
+
+    for key in keys:
+        frames = [
+            mapping[key]
+            for mapping in maps
+            if mapping and key in mapping and mapping[key] is not None and not mapping[key].empty
+        ]
+        if not frames:
+            continue
+        combined = pd.concat(frames, ignore_index=True)
+        subset = [
+            c for c in [
+                "store",
+                "order_id",
+                "product",
+                "loyalty_adjustment_discount",
+                "discount_approved_by",
+            ]
+            if c in combined.columns
+        ]
+        if subset:
+            combined = combined.drop_duplicates(subset=subset, keep="first")
+        merged[key] = combined.reset_index(drop=True)
+    return merged
+
+def _discount_detail_export_dirs(start_day: date, end_day: date, root: Path = DISCOUNT_DETAIL_EXPORT_ROOT) -> List[Path]:
+    candidates = [root / f"{start_day.isoformat()}_to_{end_day.isoformat()}"]
+    if start_day == end_day:
+        candidates.extend([
+            root / end_day.isoformat(),
+            root / f"{end_day.isoformat()}_to_{end_day.isoformat()}",
+        ])
+    out: List[Path] = []
+    seen = set()
+    for path in candidates:
+        key = str(path.resolve())
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+def _marker_date(value: Any) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except Exception:
+        return None
+
+def _valid_no_data_marker(
+    path: Path,
+    report_name: str,
+    store_code: str,
+    start_day: date,
+    end_day: date,
+) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if str(payload.get("status", "")).strip().lower() != "no_data":
+        return False
+    if str(payload.get("report", "")).strip() != report_name:
+        return False
+    if str(payload.get("store_code", "")).strip().upper() != store_code.upper():
+        return False
+    marker_start = _marker_date(payload.get("start_date"))
+    marker_end = _marker_date(payload.get("end_date"))
+    if not marker_start or not marker_end:
+        return False
+    return marker_start <= start_day and marker_end >= end_day
+
+def _no_data_marker_store_codes(
+    search_dirs: List[Path],
+    selected_store_codes: List[str],
+    report_name: str,
+    start_day: date,
+    end_day: date,
+) -> set[str]:
+    existing: set[str] = set()
+    for abbr in selected_store_codes:
+        for directory in search_dirs:
+            if not directory.exists():
+                continue
+            for marker in directory.glob(f"{abbr} - *{NO_DATA_MARKER_SUFFIX}"):
+                if _valid_no_data_marker(marker, report_name, abbr, start_day, end_day):
+                    existing.add(abbr)
+                    break
+            if abbr in existing:
+                break
+    return existing
+
+def existing_discount_detail_export_store_codes(
+    start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    root: Path = DISCOUNT_DETAIL_EXPORT_ROOT,
+) -> set[str]:
+    existing: set[str] = set()
+    search_dirs = [path for path in _discount_detail_export_dirs(start_day, end_day, root) if path.exists()]
+    for abbr in selected_store_codes:
+        for directory in search_dirs:
+            matches = [
+                p for p in directory.glob(f"{abbr} - Discount Detail Report -*")
+                if p.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".csv"}
+            ]
+            if matches:
+                existing.add(abbr)
+                break
+    return existing
+
+def existing_discount_detail_no_data_store_codes(
+    start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    root: Path = DISCOUNT_DETAIL_EXPORT_ROOT,
+) -> set[str]:
+    search_dirs = [path for path in _discount_detail_export_dirs(start_day, end_day, root) if path.exists()]
+    return _no_data_marker_store_codes(
+        search_dirs,
+        selected_store_codes,
+        "Discount Detail Report",
+        start_day,
+        end_day,
+    )
+
+def load_discount_detail_approvals_for_range(
+    start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    match_text: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+    root: Path = DISCOUNT_DETAIL_EXPORT_ROOT,
+) -> Dict[str, pd.DataFrame]:
+    try:
+        from getDiscountDetail import read_discount_detail_export
+    except Exception as exc:
+        print(f"[DISCOUNT DETAIL] WARN: Discount Detail reader is unavailable: {exc}")
+        return {}
+
+    out: Dict[str, pd.DataFrame] = {}
+    search_dirs = [path for path in _discount_detail_export_dirs(start_day, end_day, root) if path.exists()]
+    if not search_dirs:
+        return out
+
+    for abbr in selected_store_codes:
+        matches: List[Path] = []
+        for directory in search_dirs:
+            matches.extend([
+                p for p in directory.glob(f"{abbr} - Discount Detail Report -*")
+                if p.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".csv"}
+            ])
+        if not matches:
+            continue
+        latest = sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+        try:
+            raw = read_discount_detail_export(latest)
+            normalized = normalize_discount_detail_approvals(
+                abbr,
+                raw,
+                start_day,
+                end_day,
+                match_text=match_text,
+                source_path=latest,
+            )
+            if normalized is not None and not normalized.empty:
+                out[abbr] = normalized
+        except Exception as exc:
+            print(f"[DISCOUNT DETAIL] WARN: Could not read {latest}: {exc}")
+    return out
+
+def run_discount_detail_export_for_range(
+    start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    match_text: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+    required: bool = False,
+    workers: int = DEFAULT_DISCOUNT_DETAIL_BROWSER_WORKERS,
+) -> Dict[str, pd.DataFrame]:
+    range_dir = DISCOUNT_DETAIL_EXPORT_ROOT / f"{start_day.isoformat()}_to_{end_day.isoformat()}"
+    range_dir.mkdir(parents=True, exist_ok=True)
+    start_dt = datetime(start_day.year, start_day.month, start_day.day)
+    end_dt = datetime(end_day.year, end_day.month, end_day.day)
+
+    try:
+        from getDiscountDetail import read_discount_detail_export, run_discount_detail_report
+    except Exception as exc:
+        message = f"Dutchie Backoffice Discount Detail exporter is unavailable: {exc}"
+        if required:
+            raise RuntimeError(message) from exc
+        print(f"[DISCOUNT DETAIL] WARN: {message}")
+        return {}
+
+    try:
+        exported = run_discount_detail_report(
+            start_dt,
+            end_dt,
+            output_dir=range_dir,
+            stores=selected_store_codes,
+            fail_on_error=required,
+            workers=workers,
+        )
+    except Exception as exc:
+        if required:
+            raise
+        print(f"[DISCOUNT DETAIL] WARN: Backoffice Discount Detail export skipped: {exc}")
+        return {}
+
+    out: Dict[str, pd.DataFrame] = {}
+    for abbr, path in exported.items():
+        try:
+            raw = read_discount_detail_export(path)
+            normalized = normalize_discount_detail_approvals(
+                abbr,
+                raw,
+                start_day,
+                end_day,
+                match_text=match_text,
+                source_path=path,
+            )
+            if normalized is not None and not normalized.empty:
+                out[abbr] = normalized
+        except Exception as exc:
+            print(f"[DISCOUNT DETAIL] WARN: Could not normalize {path}: {exc}")
+    if out:
+        print(f"[DISCOUNT DETAIL] Approval rows loaded for: {', '.join(sorted(out))}")
+    else:
+        print("[DISCOUNT DETAIL] Discount Detail report returned no approval rows.")
+    return out
+
+def _loyalty_adjustment_export_dirs(start_day: date, end_day: date, root: Path = LOYALTY_ADJUSTMENT_ROOT) -> List[Path]:
+    candidates = [root / f"{start_day.isoformat()}_to_{end_day.isoformat()}"]
+    if start_day == end_day:
+        candidates.extend([
+            root / end_day.isoformat(),
+            root / f"{end_day.isoformat()}_to_{end_day.isoformat()}",
+        ])
+    out: List[Path] = []
+    seen = set()
+    for path in candidates:
+        key = str(path.resolve())
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+def existing_loyalty_adjustment_no_data_store_codes(
+    loyalty_start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    root: Path = LOYALTY_ADJUSTMENT_ROOT,
+    data_start_day: Optional[date] = None,
+) -> set[str]:
+    search_dirs = _loyalty_adjustment_export_dirs(loyalty_start_day, end_day, root)
+    if data_start_day and data_start_day != loyalty_start_day:
+        search_dirs.extend(_loyalty_adjustment_export_dirs(data_start_day, end_day, root))
+    return _no_data_marker_store_codes(
+        [path for path in search_dirs if path.exists()],
+        selected_store_codes,
+        "Loyalty Adjustment Report",
+        loyalty_start_day,
+        end_day,
+    )
+
+def load_backoffice_loyalty_adjustments_for_range(
+    start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    root: Path = LOYALTY_ADJUSTMENT_ROOT,
+) -> Dict[str, pd.DataFrame]:
+    range_dir = root / f"{start_day.isoformat()}_to_{end_day.isoformat()}"
+    out: Dict[str, pd.DataFrame] = {}
+    if not range_dir.exists():
+        return out
+
+    for abbr in selected_store_codes:
+        matches = sorted(
+            [
+                p for p in range_dir.glob(f"{abbr} - Loyalty Adjustment Report -*")
+                if p.suffix.lower() in {".xlsx", ".xlsm", ".xls", ".csv"}
+            ],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not matches:
+            continue
+        try:
+            raw = read_loyalty_adjustment_export(matches[0])
+            out[abbr] = normalize_backoffice_loyalty_adjustments(abbr, raw, start_day, end_day, source_path=matches[0])
+        except Exception as exc:
+            print(f"[LOYALTY] WARN: Could not read {matches[0]}: {exc}")
+    return out
+
+def load_cached_backoffice_loyalty_adjustments(
+    loyalty_start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    data_start_day: Optional[date] = None,
+) -> Dict[str, pd.DataFrame]:
+    cached = load_backoffice_loyalty_adjustments_for_range(
+        loyalty_start_day,
+        end_day,
+        selected_store_codes,
+    )
+    missing = [abbr for abbr in selected_store_codes if abbr not in cached]
+    if data_start_day and data_start_day != loyalty_start_day and missing:
+        wider_cached = load_backoffice_loyalty_adjustments_for_range(
+            data_start_day,
+            end_day,
+            missing,
+        )
+        if wider_cached:
+            cached = merge_loyalty_adjustment_maps(cached, wider_cached)
+    return {
+        abbr: filter_loyalty_adjustment_df(df, loyalty_start_day, end_day)
+        for abbr, df in cached.items()
+        if df is not None and not filter_loyalty_adjustment_df(df, loyalty_start_day, end_day).empty
+    }
+
+def run_backoffice_loyalty_adjustment_export_for_range(
+    start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    required: bool = False,
+    workers: int = DEFAULT_LOYALTY_BROWSER_WORKERS,
+) -> Dict[str, pd.DataFrame]:
+    range_dir = LOYALTY_ADJUSTMENT_ROOT / f"{start_day.isoformat()}_to_{end_day.isoformat()}"
+    range_dir.mkdir(parents=True, exist_ok=True)
+    start_dt = datetime(start_day.year, start_day.month, start_day.day)
+    end_dt = datetime(end_day.year, end_day.month, end_day.day)
+
+    try:
+        from getLoyaltyAdjustmentReport import run_loyalty_adjustment_report
+    except Exception as exc:
+        message = f"Dutchie Backoffice loyalty adjustment exporter is unavailable: {exc}"
+        if required:
+            raise RuntimeError(message) from exc
+        print(f"[LOYALTY] WARN: {message}")
+        return {}
+
+    try:
+        exported = run_loyalty_adjustment_report(
+            start_dt,
+            end_dt,
+            output_dir=range_dir,
+            stores=selected_store_codes,
+            fail_on_error=required,
+            workers=workers,
+        )
+    except Exception as exc:
+        if required:
+            raise
+        print(f"[LOYALTY] WARN: Backoffice loyalty adjustment export skipped: {exc}")
+        return {}
+
+    out: Dict[str, pd.DataFrame] = {}
+    for abbr, path in exported.items():
+        try:
+            raw = read_loyalty_adjustment_export(path)
+            out[abbr] = normalize_backoffice_loyalty_adjustments(abbr, raw, start_day, end_day, source_path=path)
+        except Exception as exc:
+            print(f"[LOYALTY] WARN: Could not normalize {path}: {exc}")
+    if out:
+        print(f"[LOYALTY] Backoffice adjustment report rows loaded for: {', '.join(sorted(out))}")
+    else:
+        print("[LOYALTY] Backoffice adjustment report returned no rows.")
+    return out
+
+def merge_loyalty_adjustment_maps(*maps: Optional[Dict[str, pd.DataFrame]]) -> Dict[str, pd.DataFrame]:
+    merged: Dict[str, pd.DataFrame] = {}
+    keys: List[str] = []
+    for mapping in maps:
+        for key in (mapping or {}).keys():
+            if key not in keys:
+                keys.append(key)
+    for key in keys:
+        frames = [mapping[key] for mapping in maps if mapping and key in mapping and mapping[key] is not None and not mapping[key].empty]
+        if not frames:
+            merged[key] = pd.DataFrame()
+            continue
+        combined = pd.concat(frames, ignore_index=True)
+        subset = [c for c in ["store", "date", "receipt_number", "customer_id", "customer_name", "points_delta", "amount", "adjusted_by", "source"] if c in combined.columns]
+        if subset:
+            combined = combined.drop_duplicates(subset=subset, keep="first")
+        merged[key] = combined.reset_index(drop=True)
+    return merged
+
+def _filter_date_column(df: pd.DataFrame, column: str, start: date, end: date) -> pd.DataFrame:
+    if df is None or df.empty or column not in df.columns:
+        return pd.DataFrame(columns=(df.columns if df is not None else []))
+    tmp = df.copy()
+    dates = pd.to_datetime(tmp[column], errors="coerce")
+    mask = dates.dt.date.between(start, end)
+    return tmp[mask].copy().reset_index(drop=True)
+
+def filter_loyalty_detail_df(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=(df.columns if df is not None else []))
+    for column in ("order_time", "date", "transaction_date"):
+        if column in df.columns:
+            return _filter_date_column(df, column, start, end)
+    return pd.DataFrame(columns=df.columns)
+
+def filter_loyalty_adjustment_df(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=(df.columns if df is not None else []))
+    for column in ("date", "order_time", "adjustment_date"):
+        if column in df.columns:
+            return _filter_date_column(df, column, start, end)
+    return pd.DataFrame(columns=df.columns)
+
+def filter_loyalty_maps_to_range(
+    detail_by_store: Dict[str, pd.DataFrame],
+    register_by_store: Dict[str, pd.DataFrame],
+    start: date,
+    end: date,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    detail_filtered = {
+        abbr: filter_loyalty_detail_df(df, start, end)
+        for abbr, df in (detail_by_store or {}).items()
+    }
+    register_filtered = {
+        abbr: filter_loyalty_adjustment_df(df, start, end)
+        for abbr, df in (register_by_store or {}).items()
+    }
+    return detail_filtered, register_filtered
+
+def write_loyalty_detail_workbook(
+    output_dir: Path,
+    start_day: date,
+    end_day: date,
+    detail_by_store: Dict[str, pd.DataFrame],
+    register_by_store: Optional[Dict[str, pd.DataFrame]] = None,
+    match_text: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+) -> Optional[Path]:
+    filtered_detail, filtered_register = filter_loyalty_maps_to_range(
+        detail_by_store or {},
+        register_by_store or {},
+        start_day,
+        end_day,
+    )
+    frames = [df for df in filtered_detail.values() if df is not None and not df.empty]
+    register_frames = [df for df in filtered_register.values() if df is not None and not df.empty]
+    if not frames and not register_frames:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / safe_filename(
+        f"Detailed Discount Report - {match_text} - {start_day.isoformat()}_to_{end_day.isoformat()}.xlsx"
+    )
+
+    all_detail = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    all_register = pd.concat(register_frames, ignore_index=True) if register_frames else pd.DataFrame()
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        if not all_detail.empty:
+            first_cols = [
+                "store",
+                "store_name",
+                "order_time",
+                "order_id",
+                "customer_id",
+                "customer_name",
+                "customer_phone",
+                "product",
+                "category",
+                "quantity",
+                "loyalty_adjustment_discount",
+                "edited_or_processed_by",
+                "edited_or_processed_by_employee_id",
+                "completed_by",
+                "discount_approved_by",
+                "discount_approval_source",
+                "points_added_by",
+            ]
+            ordered_cols = [c for c in first_cols if c in all_detail.columns] + [c for c in all_detail.columns if c not in first_cols]
+            all_detail = all_detail[ordered_cols]
+            all_detail.to_excel(writer, sheet_name="Line Items", index=False)
+            by_approver = all_detail.groupby("discount_approved_by", dropna=False).agg(
+                line_items=("order_id", "size"),
+                orders=("order_id", "nunique"),
+                loyalty_discount=("loyalty_adjustment_discount", "sum"),
+            ).reset_index().sort_values("loyalty_discount", ascending=False)
+            by_approver.to_excel(writer, sheet_name="By Approver", index=False)
+
+            by_added = all_detail.groupby("points_added_by", dropna=False).agg(
+                line_items=("order_id", "size"),
+                orders=("order_id", "nunique"),
+                loyalty_discount=("loyalty_adjustment_discount", "sum"),
+            ).reset_index().sort_values("loyalty_discount", ascending=False)
+            by_added.to_excel(writer, sheet_name="By Points Added By", index=False)
+
+            if "edited_or_processed_by" in all_detail.columns:
+                by_editor = all_detail.groupby("edited_or_processed_by", dropna=False).agg(
+                    line_items=("order_id", "size"),
+                    orders=("order_id", "nunique"),
+                    loyalty_discount=("loyalty_adjustment_discount", "sum"),
+                ).reset_index().sort_values("loyalty_discount", ascending=False)
+                by_editor.to_excel(writer, sheet_name="By Edited By", index=False)
+
+            by_store = all_detail.groupby("store", dropna=False).agg(
+                line_items=("order_id", "size"),
+                orders=("order_id", "nunique"),
+                loyalty_discount=("loyalty_adjustment_discount", "sum"),
+            ).reset_index().sort_values("loyalty_discount", ascending=False)
+            by_store.to_excel(writer, sheet_name="By Store", index=False)
+        else:
+            pd.DataFrame({"message": [f"No {match_text} line items found."]}).to_excel(writer, sheet_name="Line Items", index=False)
+
+        if not all_register.empty:
+            first_cols = [
+                "store",
+                "store_name",
+                "date",
+                "receipt_number",
+                "transaction_id",
+                "customer_id",
+                "customer_name",
+                "customer_phone",
+                "points_delta",
+                "ending_balance",
+                "approving_manager",
+                "adjusted_by",
+                "points_added_by",
+                "discount_approved_by",
+                "employee",
+                "employee_id",
+                "type",
+                "description",
+                "amount",
+                "source",
+                "source_file",
+            ]
+            ordered_cols = [c for c in first_cols if c in all_register.columns] + [c for c in all_register.columns if c not in first_cols]
+            all_register = all_register[ordered_cols]
+            all_register_export = all_register.rename(columns={"approving_manager": "ApprovingManager"})
+            all_register_export.to_excel(writer, sheet_name="Adjustment Audit", index=False)
+            user_col = (
+                "approving_manager"
+                if "approving_manager" in all_register.columns
+                else "adjusted_by"
+                if "adjusted_by" in all_register.columns
+                else "employee"
+            )
+            if user_col in all_register.columns:
+                summary = all_register.copy()
+                summary["_points_delta"] = to_number(summary["points_delta"]).fillna(0.0) if "points_delta" in summary.columns else 0.0
+                summary["_customer_id"] = summary["customer_id"].fillna("").astype(str) if "customer_id" in summary.columns else ""
+                by_user = summary.groupby(user_col, dropna=False).agg(
+                    adjustments=(user_col, "size"),
+                    customers=("_customer_id", "nunique"),
+                    points_delta=("_points_delta", "sum"),
+                ).reset_index()
+                if user_col == "approving_manager":
+                    by_user = by_user.rename(columns={user_col: "ApprovingManager"})
+                by_user.to_excel(writer, sheet_name="By ApprovingManager", index=False)
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(out_path)
+        for sheet in wb.worksheets:
+            sheet.freeze_panes = "A2"
+            for column_cells in sheet.columns:
+                letter = column_cells[0].column_letter
+                width = min(48, max(10, max(len(str(cell.value or "")) for cell in column_cells) + 2))
+                sheet.column_dimensions[letter].width = width
+        wb.save(out_path)
+    except Exception:
+        pass
+
+    return out_path
+
+def run_api_export_for_range(
+    start_day: date,
+    end_day: date,
+    selected_store_codes: List[str],
+    env_file: str,
+    workers: int,
+    loyalty_discount_name: str,
+    loyalty_person: str = "",
+    write_detail_workbook: bool = True,
+) -> Tuple[Path, Dict[str, Path], Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], Optional[Path]]:
+    range_dir = RAW_ROOT / f"{start_day.isoformat()}_to_{end_day.isoformat()}"
+    range_dir.mkdir(parents=True, exist_ok=True)
+    detail_dir = LOYALTY_DETAIL_ROOT / f"{start_day.isoformat()}_to_{end_day.isoformat()}"
+
+    env_map = dutchie_canonical_env_map(env_file)
+    store_keys = dutchie_resolve_store_keys(env_map, selected_store_codes)
+    integrator_key = dutchie_resolve_integrator_key(env_map)
+    missing = [abbr for abbr in selected_store_codes if abbr not in store_keys]
+    if missing:
+        raise SystemExit(
+            "Missing Dutchie API location key(s) for: "
+            f"{', '.join(missing)}. Add them to {env_file} using names like DUTCHIE_API_KEY_MV or MV."
+        )
+
+    chunks = _iter_api_date_chunks(start_day, end_day)
+    worker_count = dutchie_resolve_worker_count(workers, len(selected_store_codes))
+    worker_label = "serial mode" if worker_count == 1 else f"{worker_count} store worker threads"
+    print(f"[EXPORT API] Fetching Dutchie sales with {worker_label}")
+    loyalty_start_day = month_start(end_day)
+
+    def fetch_store(abbr: str) -> Tuple[str, Optional[Path], pd.DataFrame, pd.DataFrame, Optional[str]]:
+        session = dutchie_create_session(store_keys[abbr], integrator_key)
+        try:
+            products_payload = dutchie_request_json(session, "/reporting/products", timeout=240)
+            transactions_payload: List[Dict[str, Any]] = []
+            register_payload: List[Dict[str, Any]] = []
+
+            for idx, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+                from_utc, to_utc = dutchie_local_date_range_to_utc_strings(chunk_start.isoformat(), chunk_end.isoformat(), REPORT_TZ)
+                print(f"[EXPORT API] {abbr} sales chunk {idx}/{len(chunks)}: {chunk_start.isoformat()} -> {chunk_end.isoformat()}")
+                sales_payload = dutchie_request_json(
+                    session,
+                    "/reporting/transactions",
+                    params={
+                        "FromDateUTC": from_utc,
+                        "ToDateUTC": to_utc,
+                        "IncludeDetail": True,
+                        "IncludeTaxes": True,
+                        "IncludeOrderIds": True,
+                        "IncludeFeesAndDonations": True,
+                    },
+                    timeout=240,
+                )
+                transactions_payload.extend(api_payload_records(sales_payload))
+
+                try:
+                    register_response = dutchie_request_json(
+                        session,
+                        "/reporting/register-transactions",
+                        params={
+                            "fromLastModifiedDateUTC": from_utc,
+                            "toLastModifiedDateUTC": to_utc,
+                        },
+                        timeout=240,
+                        max_attempts=2,
+                    )
+                    register_payload.extend(api_payload_records(register_response))
+                except Exception as exc:
+                    print(f"[EXPORT API] WARN: {abbr} register-transactions lookup skipped: {exc}")
+
+                try:
+                    register_adjustment_response = dutchie_request_json(
+                        session,
+                        "/reporting/register-adjustments",
+                        params={
+                            "fromLastModifiedDateUTC": from_utc,
+                            "toLastModifiedDateUTC": to_utc,
+                        },
+                        timeout=240,
+                        max_attempts=2,
+                    )
+                    register_payload.extend(api_payload_records(register_adjustment_response))
+                except Exception as exc:
+                    print(f"[EXPORT API] WARN: {abbr} register-adjustments lookup skipped: {exc}")
+
+            df = normalize_api_sales_rows(abbr, transactions_payload, products_payload, loyalty_discount_name)
+            if df.empty:
+                return abbr, None, pd.DataFrame(), pd.DataFrame(), "no rows returned"
+
+            register_lookup = build_register_transaction_lookup(register_payload)
+            sales_customer_by_transaction = {
+                str(_first_nonempty(tx.get("transactionId"), tx.get("globalId"), tx.get("referenceId"))): tx.get("customerId")
+                for tx in transactions_payload
+                if _first_nonempty(tx.get("transactionId"), tx.get("globalId"), tx.get("referenceId")) not in (None, "")
+            }
+            loyalty_customer_ids: List[Any] = []
+            base_loyalty_detail = compute_loyalty_points_adjustment_detail(df, loyalty_start_day, end_day, loyalty_discount_name)
+            if not base_loyalty_detail.empty and "customer_id" in base_loyalty_detail.columns:
+                loyalty_customer_ids.extend(base_loyalty_detail["customer_id"].dropna().astype(str).tolist())
+
+            for register_row in register_payload:
+                tx_id = str(_first_nonempty(register_row.get("transactionId"), "")).strip()
+                if tx_id and tx_id in sales_customer_by_transaction:
+                    text = " ".join(str(v or "") for v in register_row.values() if not isinstance(v, (dict, list)))
+                    if any(_contains_text(text, needle) for needle in [loyalty_discount_name, "loyalty", "points"] if needle):
+                        loyalty_customer_ids.append(sales_customer_by_transaction.get(tx_id))
+
+            customer_lookup = fetch_customers_for_ids(session, loyalty_customer_ids)
+
+            dst_name = f"{abbr} - Sales API Export - {store_label(_store_name_from_abbr(abbr))} - {start_day.isoformat()}_to_{end_day.isoformat()}.xlsx"
+            dst = range_dir / safe_filename(dst_name)
+            with pd.ExcelWriter(dst, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Sales")
+
+            detail = compute_loyalty_points_adjustment_detail(
+                df,
+                loyalty_start_day,
+                end_day,
+                loyalty_discount_name,
+                customer_lookup=customer_lookup,
+                register_lookup=register_lookup,
+            )
+            register_detail = normalize_register_loyalty_adjustments(
+                abbr,
+                register_payload,
+                loyalty_discount_name,
+                loyalty_person,
+                customer_lookup=customer_lookup,
+                sales_customer_by_transaction=sales_customer_by_transaction,
+            )
+            return abbr, dst, detail, register_detail, None
+        except Exception as exc:
+            return abbr, None, pd.DataFrame(), pd.DataFrame(), str(exc)
+        finally:
+            session.close()
+
+    if worker_count == 1:
+        results = [fetch_store(abbr) for abbr in selected_store_codes]
+    else:
+        results = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {executor.submit(fetch_store, abbr): abbr for abbr in selected_store_codes}
+            for future in as_completed(future_map):
+                abbr = future_map[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append((abbr, None, pd.DataFrame(), pd.DataFrame(), str(exc)))
+
+    abbr_to_path: Dict[str, Path] = {}
+    detail_by_store: Dict[str, pd.DataFrame] = {}
+    register_by_store: Dict[str, pd.DataFrame] = {}
+    failures: List[str] = []
+
+    for abbr, path, detail, register_detail, error in sorted(results, key=lambda item: selected_store_codes.index(item[0]) if item[0] in selected_store_codes else 999):
+        if error:
+            failures.append(f"{abbr}: {error}")
+            print(f"[EXPORT API] WARN: {abbr}: {error}")
+            continue
+        if path is not None:
+            abbr_to_path[abbr] = path
+            print(f"[EXPORT API] {abbr}: {path}")
+        detail_by_store[abbr] = detail
+        register_by_store[abbr] = register_detail
+
+    if not abbr_to_path:
+        raise SystemExit("Dutchie API export completed, but no usable sales exports were created.")
+    if failures:
+        print("[EXPORT API] WARN: " + "; ".join(failures))
+
+    detail_workbook = None
+    if write_detail_workbook:
+        detail_workbook = write_loyalty_detail_workbook(
+            detail_dir,
+            loyalty_start_day,
+            end_day,
+            detail_by_store,
+            register_by_store,
+            match_text=loyalty_discount_name,
+        )
+        if detail_workbook:
+            print(f"[EXPORT API] Detailed discount report: {detail_workbook}")
+        else:
+            print(f"[EXPORT API] No {loyalty_discount_name} rows found for detailed discount workbook.")
+
+    return range_dir, abbr_to_path, detail_by_store, register_by_store, detail_workbook
+
 def find_latest_raw_folder() -> Optional[Path]:
     if not RAW_ROOT.exists():
         return None
@@ -1677,6 +3578,16 @@ def find_latest_raw_folder() -> Optional[Path]:
     if not folders:
         return None
     return sorted(folders, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+def is_valid_excel_export(path: Path) -> bool:
+    try:
+        if not path.exists() or path.stat().st_size <= 0:
+            return False
+        if path.suffix.lower() == ".xlsx":
+            return is_zipfile(path)
+        return True
+    except OSError:
+        return False
 
 
 ###############################################################################
@@ -1866,10 +3777,14 @@ def compute_daily_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return daily.sort_values("date")
 
 def slice_range(daily: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    return daily[(daily["date"] >= start) & (daily["date"] <= end)].copy()
+    if daily is None or daily.empty or "date" not in daily.columns:
+        return pd.DataFrame(columns=(daily.columns if daily is not None else []))
+    tmp = daily.copy()
+    cmp_dates = pd.to_datetime(tmp["date"], errors="coerce").dt.date
+    return tmp[(cmp_dates >= start) & (cmp_dates <= end)].copy()
 
 def metrics_for_day(daily: pd.DataFrame, day: date) -> Dict[str, float]:
-    row = daily[daily["date"] == day]
+    row = slice_range(daily, day, day)
     if row.empty:
         return {k: 0.0 for k in METRIC_KEYS}
     r = row.iloc[0]
@@ -1931,6 +3846,44 @@ def _filter_df_date_range(df: pd.DataFrame, start: date, end: date) -> pd.DataFr
     tmp = tmp[tmp[date_col].notna()]
     tmp["_date"] = tmp[date_col].dt.date
     return tmp[(tmp["_date"] >= start) & (tmp["_date"] <= end)].copy()
+
+def _customer_activity_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["_date", "_customer_id"])
+    date_col = find_col(df, COLUMN_CANDIDATES["date"])
+    customer_col = find_col(df, COLUMN_CANDIDATES["customer_id"])
+    if not date_col or not customer_col:
+        return pd.DataFrame(columns=["_date", "_customer_id"])
+
+    tmp = df[[date_col, customer_col]].copy()
+    tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+    tmp = tmp[tmp[date_col].notna()]
+    tmp["_date"] = tmp[date_col].dt.date
+    tmp["_customer_id"] = tmp[customer_col].fillna("").astype(str).str.strip()
+    invalid = {"", "0", "0.0", "nan", "none", "null", "anonymous"}
+    tmp = tmp[~tmp["_customer_id"].str.lower().isin(invalid)]
+    return tmp[["_date", "_customer_id"]].drop_duplicates()
+
+def compute_customer_counts(df: pd.DataFrame, start: date, end: date) -> Dict[str, int]:
+    activity = _customer_activity_frame(df)
+    if activity.empty:
+        return {"new": 0, "total": 0}
+
+    period = activity[(activity["_date"] >= start) & (activity["_date"] <= end)]
+    if period.empty:
+        return {"new": 0, "total": 0}
+
+    first_seen = activity.groupby("_customer_id")["_date"].min()
+    period_customers = set(period["_customer_id"].unique())
+    new_customers = {
+        customer_id
+        for customer_id in period_customers
+        if start <= first_seen.get(customer_id, end) <= end
+    }
+    return {"new": len(new_customers), "total": len(period_customers)}
+
+def fmt_new_total(counts: Dict[str, int]) -> str:
+    return f"{int(counts.get('new', 0)):,} / {int(counts.get('total', 0)):,}"
 
 def compute_breakdown_net(
     df: pd.DataFrame,
@@ -2864,6 +4817,174 @@ def build_table(headers: List[Any], rows: List[List[Any]], col_widths: Optional[
     ]))
     return t
 
+def _pdf_text(value: Any, style: ParagraphStyle) -> Paragraph:
+    text = str(value if value not in (None, "nan", "NaT") else "").strip()
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return Paragraph(text, style)
+
+def build_customer_counts_table(
+    styles,
+    today_counts: Dict[str, int],
+    mtd_counts: Dict[str, int],
+) -> Table:
+    rows = [
+        ["Today", f"{int(today_counts.get('new', 0)):,}", f"{int(today_counts.get('total', 0)):,}", fmt_new_total(today_counts)],
+        ["MTD", f"{int(mtd_counts.get('new', 0)):,}", f"{int(mtd_counts.get('total', 0)):,}", fmt_new_total(mtd_counts)],
+    ]
+    return build_table(
+        ["Customers", "New", "Total", "New / Total"],
+        rows,
+        [2.30 * inch, 1.25 * inch, 1.25 * inch, 2.50 * inch],
+    )
+
+def _clean_authorization_person(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.lower() in {"nan", "none", API_FIELD_UNAVAILABLE.lower(), "api n/a"}:
+        return ""
+    return text
+
+def loyalty_authorized_by(row: Dict[str, Any]) -> str:
+    authorized_by = _first_nonempty(
+        _clean_authorization_person(row.get("discount_approved_by")),
+        _clean_authorization_person(row.get("approved_by")),
+        _clean_authorization_person(row.get("approving_manager")),
+        _clean_authorization_person(row.get("adjusted_by")),
+    )
+    return str(authorized_by).strip() or "API n/a"
+
+def build_loyalty_detail_section(
+    styles,
+    detail_df: pd.DataFrame,
+    title: str,
+    include_store: bool = False,
+    max_rows: int = LOYALTY_PDF_MAX_ROWS,
+    match_text: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+) -> List[Any]:
+    if detail_df is None or detail_df.empty:
+        return []
+
+    d = detail_df.copy()
+    d = d.sort_values(["order_time", "order_id", "product"], ascending=[True, True, True])
+    total_rows = len(d)
+    total_discount = float(pd.to_numeric(d.get("loyalty_adjustment_discount", 0.0), errors="coerce").fillna(0.0).sum())
+    shown = d.head(max_rows)
+
+    headers = ["Date", "Order", "Customer", "Product", "Qty", "Disc", "Discount Approved By"]
+    widths = [0.92 * inch, 0.86 * inch, 1.28 * inch, 1.95 * inch, 0.34 * inch, 0.58 * inch, 1.67 * inch]
+    if include_store:
+        headers.insert(0, "Store")
+        widths = [0.40 * inch, 0.82 * inch, 0.78 * inch, 0.98 * inch, 1.70 * inch, 0.30 * inch, 0.54 * inch, 2.08 * inch]
+
+    rows: List[List[Any]] = []
+    for row in shown.to_dict("records"):
+        order_time = pd.to_datetime(row.get("order_time"), errors="coerce")
+        date_text = order_time.strftime("%m/%d %I:%M%p") if pd.notna(order_time) else ""
+        authorized_by = loyalty_authorized_by(row)
+        base = [
+            date_text,
+            str(row.get("order_id", "")),
+            _pdf_text(row.get("customer_name", row.get("customer_id", "")), styles["Tiny"]),
+            _pdf_text(row.get("product", ""), styles["Tiny"]),
+            f"{as_float(row.get('quantity')):,.1f}",
+            money2(as_float(row.get("loyalty_adjustment_discount"))),
+            _pdf_text(authorized_by, styles["Tiny"]),
+        ]
+        if include_store:
+            base.insert(0, str(row.get("store", "")))
+        rows.append(base)
+
+    section: List[Any] = [
+        CondPageBreak(2.5 * inch),
+        Paragraph(title, styles["TitleBig"]),
+        Paragraph(
+            f"{total_rows:,} line item(s) • Total {match_text}: {money2(total_discount)}"
+            + (f" • Showing first {len(shown):,}" if total_rows > len(shown) else ""),
+            styles["Tiny"],
+        ),
+        Spacer(1, SPACER["xs"]),
+        build_table(headers, rows, widths),
+    ]
+    return section
+
+def build_register_adjustment_section(
+    styles,
+    register_df: pd.DataFrame,
+    title: str,
+    include_store: bool = False,
+    max_rows: int = 40,
+) -> List[Any]:
+    if register_df is None or register_df.empty:
+        return []
+
+    d = register_df.copy()
+    if "date" in d.columns:
+        d = d.sort_values("date", na_position="last")
+    total_rows = len(d)
+    shown = d.head(max_rows)
+
+    points_total = float(to_number(d["points_delta"]).fillna(0.0).sum()) if "points_delta" in d.columns else 0.0
+    headers = ["Date", "Customer", "Points/$", "ApprovingManager", "Reason"]
+    widths = [0.95 * inch, 1.55 * inch, 0.65 * inch, 1.45 * inch, 2.70 * inch]
+    if include_store:
+        headers.insert(0, "Store")
+        widths = [0.42 * inch, 0.82 * inch, 1.25 * inch, 0.58 * inch, 1.30 * inch, 3.23 * inch]
+
+    rows: List[List[Any]] = []
+    for row in shown.to_dict("records"):
+        dt = pd.to_datetime(row.get("date"), errors="coerce")
+        date_text = dt.strftime("%m/%d %I:%M%p") if pd.notna(dt) else ""
+        points_value = row.get("points_delta", "")
+        points_missing = pd.isna(points_value) or str(points_value).strip() == ""
+        points_num = as_float(points_value, default=float("nan"))
+        if not points_missing and not np.isnan(points_num):
+            amount_text = f"{points_num:,.0f} pts"
+        elif not (pd.isna(row.get("amount", "")) or str(row.get("amount", "")).strip() == ""):
+            amount_text = money2(as_float(row.get("amount")))
+        else:
+            amount_text = ""
+        approving_manager = _first_nonempty(
+            row.get("approving_manager"),
+            row.get("discount_approved_by"),
+            row.get("adjusted_by"),
+            row.get("employee"),
+            row.get("points_added_by"),
+            API_FIELD_UNAVAILABLE,
+        )
+        customer = _first_nonempty(row.get("customer_name"), row.get("customer_id"), "")
+        reason = _first_nonempty(row.get("description"), row.get("type"), row.get("raw_match"), "")
+        base = [
+            date_text,
+            _pdf_text(customer, styles["Tiny"]),
+            amount_text,
+            _pdf_text(approving_manager, styles["Tiny"]),
+            _pdf_text(reason, styles["Tiny"]),
+        ]
+        if include_store:
+            base.insert(0, str(row.get("store", "")))
+        rows.append(base)
+
+    return [
+        Spacer(1, SPACER["sm"]),
+        Paragraph(title, styles["Section"]),
+        Paragraph(
+            f"{total_rows:,} adjustment row(s)"
+            + (f" • Net points: {points_total:,.0f}" if abs(points_total) > 1e-9 else "")
+            + (f" • Showing first {len(shown):,}" if total_rows > len(shown) else ""),
+            styles["Tiny"],
+        ),
+        Spacer(1, SPACER["xs"]),
+        build_table(headers, rows, widths),
+    ]
+
 def build_cart_distribution_strip(dist_df: pd.DataFrame, width: float = 7.3 * inch) -> Optional[Table]:
     if dist_df is None or dist_df.empty:
         return None
@@ -3129,6 +5250,9 @@ def build_store_pdf(
     daily: pd.DataFrame,
     start_day: date,
     end_day: date,
+    loyalty_detail: Optional[pd.DataFrame] = None,
+    register_loyalty_detail: Optional[pd.DataFrame] = None,
+    loyalty_discount_name: str = LOYALTY_DISCOUNT_MATCH_TEXT,
 ) -> None:
     styles = build_styles()
     label = store_label(store_name)
@@ -3142,6 +5266,8 @@ def build_store_pdf(
     last_week = metrics_for_day(daily, last_week_day)
     mtd = metrics_for_range(daily, mtd_start, end_day)
     last_mtd = metrics_for_range(daily, last_mtd_start, last_mtd_end)
+    customer_today = compute_customer_counts(df_raw, end_day, end_day)
+    customer_mtd = compute_customer_counts(df_raw, mtd_start, end_day)
 
     days_elapsed = (end_day - mtd_start).days + 1
     avg_per_day = (mtd["net_revenue"] / days_elapsed) if days_elapsed else 0.0
@@ -3297,6 +5423,8 @@ def build_store_pdf(
 
     story.append(build_kpi_grid(styles, kpis, cols=4))
     story.append(Spacer(1, SPACER["sm"]))
+    story.append(build_customer_counts_table(styles, customer_today, customer_mtd))
+    story.append(Spacer(1, SPACER["xs"]))
 
     story.append(Paragraph(
         f"<b>MTD Avg/Day:</b> {money(avg_per_day)}"
@@ -3494,6 +5622,25 @@ def build_store_pdf(
             [2.65*inch, 1.25*inch, 1.05*inch, 1.25*inch, 1.15*inch],
         ))
 
+    if loyalty_detail is None:
+        loyalty_detail = compute_loyalty_points_adjustment_detail(df_raw, mtd_start, end_day, loyalty_discount_name)
+    else:
+        loyalty_detail = filter_loyalty_detail_df(loyalty_detail, mtd_start, end_day)
+    register_loyalty_detail = filter_loyalty_adjustment_df(register_loyalty_detail, mtd_start, end_day)
+    story += build_loyalty_detail_section(
+        styles,
+        loyalty_detail,
+        f"{loyalty_discount_name} Detail — MTD ({mtd_start.isoformat()} to {end_day.isoformat()})",
+        include_store=False,
+        match_text=loyalty_discount_name,
+    )
+    story += build_register_adjustment_section(
+        styles,
+        register_loyalty_detail,
+        "Loyalty Adjustment Audit",
+        include_store=False,
+    )
+
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
     print(f"✅ PDF created: {out_pdf}")
 
@@ -3502,7 +5649,17 @@ def build_store_pdf(
 # PDF: All stores summary (kept simple but consistent)
 ###############################################################################
 
-def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.DataFrame], end_day: date, start_day: date, forecast_bundle: Optional[Dict[str, Any]] = None) -> None:
+def build_all_stores_summary_pdf(
+    out_pdf: Path,
+    store_daily_map: Dict[str, pd.DataFrame],
+    end_day: date,
+    start_day: date,
+    forecast_bundle: Optional[Dict[str, Any]] = None,
+    store_raw_df_map: Optional[Dict[str, pd.DataFrame]] = None,
+    loyalty_detail_by_store: Optional[Dict[str, pd.DataFrame]] = None,
+    register_loyalty_by_store: Optional[Dict[str, pd.DataFrame]] = None,
+    loyalty_discount_name: str = LOYALTY_DISCOUNT_MATCH_TEXT,
+) -> None:
     styles = build_styles()
     generated_at = datetime.now(ZoneInfo(REPORT_TZ)).strftime("%B %d, %Y at %I:%M %p %Z")
     mtd_start = month_start(end_day)
@@ -3539,6 +5696,7 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
     story.append(Spacer(1, SPACER["sm"]))
 
     rows = []
+    customer_rows = []
     totals_today_net = totals_today_tickets = totals_mtd_net = totals_mtd_tickets = 0.0
     store_rank = []
 
@@ -3559,6 +5717,13 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
 
         d_today = today["net_revenue"] - last_week["net_revenue"]
         d_mtd = mtd["net_revenue"] - last_mtd["net_revenue"]
+        raw_df = (store_raw_df_map or {}).get(abbr)
+        if raw_df is not None and not raw_df.empty:
+            customer_rows.append([
+                f"{abbr} - {store_label(store_name)}",
+                fmt_new_total(compute_customer_counts(raw_df, end_day, end_day)),
+                fmt_new_total(compute_customer_counts(raw_df, mtd_start, end_day)),
+            ])
 
         rows.append([
             f"{abbr} - {store_label(store_name)}",
@@ -3577,6 +5742,26 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
         styles["Muted"],
     ))
     story.append(Spacer(1, SPACER["sm"]))
+
+    if customer_rows:
+        raw_frames = [
+            df.dropna(axis=1, how="all") for df in (store_raw_df_map or {}).values()
+            if df is not None and not df.empty
+        ]
+        if raw_frames:
+            all_raw = pd.concat(raw_frames, ignore_index=True)
+            customer_rows.insert(0, [
+                "ALL STORES",
+                fmt_new_total(compute_customer_counts(all_raw, end_day, end_day)),
+                fmt_new_total(compute_customer_counts(all_raw, mtd_start, end_day)),
+            ])
+        story.append(Paragraph("Customer Counts", styles["Section"]))
+        story.append(build_table(
+            ["Store", "Today New / Total", "MTD New / Total"],
+            customer_rows,
+            [3.40 * inch, 1.90 * inch, 2.00 * inch],
+        ))
+        story.append(Spacer(1, SPACER["sm"]))
 
     if store_rank:
         rank_df = pd.DataFrame(store_rank, columns=["store", "net_revenue"]).sort_values("net_revenue", ascending=False)
@@ -3658,6 +5843,33 @@ def build_all_stores_summary_pdf(out_pdf: Path, store_daily_map: Dict[str, pd.Da
                 [0.50*inch, 0.90*inch, 0.90*inch, 1.1*inch, 0.90*inch, 0.90*inch, 0.7*inch, 0.9*inch],
             ))
 
+    loyalty_frames = [
+        df for df in (loyalty_detail_by_store or {}).values()
+        if df is not None and not df.empty
+    ]
+    if loyalty_frames:
+        all_loyalty = filter_loyalty_detail_df(pd.concat(loyalty_frames, ignore_index=True), mtd_start, end_day)
+        story += build_loyalty_detail_section(
+            styles,
+            all_loyalty,
+            f"All Stores {loyalty_discount_name} Detail — MTD ({mtd_start.isoformat()} to {end_day.isoformat()})",
+            include_store=True,
+            match_text=loyalty_discount_name,
+        )
+
+    register_frames = [
+        df for df in (register_loyalty_by_store or {}).values()
+        if df is not None and not df.empty
+    ]
+    if register_frames:
+        all_register = filter_loyalty_adjustment_df(pd.concat(register_frames, ignore_index=True), mtd_start, end_day)
+        story += build_register_adjustment_section(
+            styles,
+            all_register,
+            "All Stores Loyalty Adjustment Audit",
+            include_store=True,
+        )
+
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
     print(f"✅ All-stores summary PDF created: {out_pdf}")
 
@@ -3675,6 +5887,10 @@ def main():
     PDF_ROOT.mkdir(parents=True, exist_ok=True)
 
     abbr_to_file: Dict[str, Path] = {}
+    selected_store_codes = _selected_store_codes(args.stores)
+    loyalty_detail_by_store: Dict[str, pd.DataFrame] = {}
+    register_loyalty_by_store: Dict[str, pd.DataFrame] = {}
+    loyalty_detail_workbook: Optional[Path] = None
     run_export = RUN_EXPORT if args.run_export is None else bool(args.run_export)
 
     if args.backfill_days <= 0:
@@ -3702,9 +5918,22 @@ def main():
     print(f"[RANGE] {start_day.isoformat()} -> {end_day.isoformat()} (report day: {end_day.isoformat()})")
 
     if run_export:
-        print("⚠️ RUN_EXPORT=True → Running Selenium export")
-        run_export_for_range(start_day, end_day)
-        _, abbr_to_file = archive_exports(start_day, end_day)
+        if args.export_source == "api":
+            print("✅ RUN_EXPORT=True → Running Dutchie API export")
+            _, abbr_to_file, loyalty_detail_by_store, register_loyalty_by_store, loyalty_detail_workbook = run_api_export_for_range(
+                start_day=start_day,
+                end_day=end_day,
+                selected_store_codes=selected_store_codes,
+                env_file=args.api_env_file,
+                workers=args.workers,
+                loyalty_discount_name=args.loyalty_discount_name,
+                loyalty_person=args.loyalty_person,
+                write_detail_workbook=False,
+            )
+        else:
+            print("⚠️ RUN_EXPORT=True → Running Selenium export")
+            run_export_for_range(start_day, end_day)
+            _, abbr_to_file = archive_exports(start_day, end_day)
     else:
         print("✅ RUN_EXPORT=False → Reusing latest raw export folder")
         if forced_range:
@@ -3724,19 +5953,31 @@ def main():
                 start_day, end_day = parsed
                 print(f"[RANGE] Using folder window {start_day.isoformat()} -> {end_day.isoformat()}")
 
-        for store_name, abbr in store_abbr_map.items():
-            matches = list(raw_folder.glob(f"{abbr}*Sales Export*.xlsx"))
+        for store_name, abbr in _store_iter(selected_store_codes):
+            matches = []
+            invalid_matches = []
+            for pattern in (f"{abbr}*Sales Export*.xlsx", f"{abbr}*Sales API Export*.xlsx"):
+                for candidate in raw_folder.glob(pattern):
+                    if is_valid_excel_export(candidate):
+                        matches.append(candidate)
+                    else:
+                        invalid_matches.append(candidate)
+            for bad_path in sorted(invalid_matches):
+                print(f"[WARN] Skipping invalid cached export for {abbr}: {bad_path.name}")
             if matches:
-                abbr_to_file[abbr] = matches[0]
+                abbr_to_file[abbr] = sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+            else:
+                print(f"[WARN] No valid cached export found for {store_name} ({abbr}) in {raw_folder}")
 
     if not abbr_to_file:
         raise SystemExit("No store exports found. Check getSalesReport output /files or raw archive.")
 
+    loyalty_start_day = month_start(end_day)
     store_daily_map: Dict[str, pd.DataFrame] = {}
     store_raw_df_map: Dict[str, pd.DataFrame] = {}
 
 
-    for store_name, abbr in store_abbr_map.items():
+    for store_name, abbr in _store_iter(selected_store_codes):
         path = abbr_to_file.get(abbr)
         if not path:
             continue
@@ -3749,23 +5990,259 @@ def main():
             df = enrich_with_deal_kickbacks_by_brand(df, store_code=abbr)
 
         store_raw_df_map[abbr] = df
+        if abbr not in loyalty_detail_by_store:
+            loyalty_detail_by_store[abbr] = compute_loyalty_points_adjustment_detail(
+                df,
+                loyalty_start_day,
+                end_day,
+                args.loyalty_discount_name,
+            )
 
         daily = compute_daily_metrics(df)
         daily = daily[(daily["date"] >= start_day) & (daily["date"] <= end_day)]
         store_daily_map[abbr] = daily
+
+    if args.loyalty_adjustment_source != "none":
+        backoffice_adjustments: Dict[str, pd.DataFrame] = {}
+        loyalty_no_data_stores: set[str] = set()
+        if run_export:
+            required = args.loyalty_adjustment_source == "browser"
+            export_store_codes = selected_store_codes
+            if args.loyalty_adjustment_source == "auto":
+                cached_adjustments = load_cached_backoffice_loyalty_adjustments(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                    data_start_day=start_day,
+                )
+                if cached_adjustments:
+                    print(f"[LOYALTY] Reused archived Backoffice adjustment report rows for: {', '.join(sorted(cached_adjustments))}")
+                    backoffice_adjustments = merge_loyalty_adjustment_maps(backoffice_adjustments, cached_adjustments)
+                loyalty_no_data_stores = existing_loyalty_adjustment_no_data_store_codes(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                    data_start_day=start_day,
+                )
+                loyalty_no_data_stores -= set(backoffice_adjustments)
+                if loyalty_no_data_stores:
+                    print(f"[LOYALTY] Reused archived no-data markers for: {', '.join(sorted(loyalty_no_data_stores))}")
+                export_store_codes = [
+                    abbr for abbr in selected_store_codes
+                    if abbr not in backoffice_adjustments and abbr not in loyalty_no_data_stores
+                ]
+            if export_store_codes:
+                print(f"[LOYALTY] Pulling Backoffice loyalty adjustment report from {LOYALTY_ADJUSTMENT_REPORT_URL}")
+                backoffice_adjustments = merge_loyalty_adjustment_maps(
+                    backoffice_adjustments,
+                    run_backoffice_loyalty_adjustment_export_for_range(
+                        loyalty_start_day,
+                        end_day,
+                        export_store_codes,
+                        required=required,
+                        workers=args.loyalty_browser_workers,
+                    ),
+                )
+                updated_no_data_stores = existing_loyalty_adjustment_no_data_store_codes(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                    data_start_day=start_day,
+                )
+                loyalty_no_data_stores |= (updated_no_data_stores - set(backoffice_adjustments))
+            elif backoffice_adjustments or loyalty_no_data_stores:
+                print("[LOYALTY] All Backoffice adjustment rows reused from archive.")
+        else:
+            backoffice_adjustments = load_cached_backoffice_loyalty_adjustments(
+                loyalty_start_day,
+                end_day,
+                selected_store_codes,
+                data_start_day=start_day,
+            )
+            loyalty_no_data_stores = existing_loyalty_adjustment_no_data_store_codes(
+                loyalty_start_day,
+                end_day,
+                selected_store_codes,
+                data_start_day=start_day,
+            )
+            loyalty_no_data_stores -= set(backoffice_adjustments)
+            if backoffice_adjustments:
+                print(f"[LOYALTY] Reused archived Backoffice adjustment report rows for: {', '.join(sorted(backoffice_adjustments))}")
+            if loyalty_no_data_stores:
+                print(f"[LOYALTY] Reused archived no-data markers for: {', '.join(sorted(loyalty_no_data_stores))}")
+        if backoffice_adjustments:
+            counts = {
+                abbr: int(len(df))
+                for abbr, df in backoffice_adjustments.items()
+                if df is not None and not df.empty
+            }
+            if counts:
+                print("[LOYALTY] Backoffice adjustment row counts: " + ", ".join(f"{abbr}={count}" for abbr, count in sorted(counts.items())))
+            if loyalty_no_data_stores:
+                print("[LOYALTY] Confirmed no Backoffice point adjustment rows for: " + ", ".join(sorted(loyalty_no_data_stores)))
+            missing_adjustment_stores = [
+                abbr for abbr in selected_store_codes
+                if abbr not in counts and abbr not in loyalty_no_data_stores
+            ]
+            if missing_adjustment_stores:
+                print(
+                    "[LOYALTY] No Backoffice point adjustment rows found for: "
+                    + ", ".join(missing_adjustment_stores)
+                    + f" ({loyalty_start_day.isoformat()} to {end_day.isoformat()})."
+                )
+        elif loyalty_no_data_stores:
+            print("[LOYALTY] Confirmed no Backoffice point adjustment rows for: " + ", ".join(sorted(loyalty_no_data_stores)))
+        else:
+            print(
+                "[LOYALTY] WARN: No Backoffice point adjustment rows were loaded. "
+                "Use --loyalty-adjustment-source browser to require the browser export instead of silently continuing."
+            )
+        register_loyalty_by_store = merge_loyalty_adjustment_maps(register_loyalty_by_store, backoffice_adjustments)
+        if any(df is not None and not df.empty for df in backoffice_adjustments.values()):
+            loyalty_detail_workbook = None
+
+    if args.discount_detail_source != "none":
+        discount_approvals: Dict[str, pd.DataFrame] = {}
+        discount_no_data_stores: set[str] = set()
+        if run_export:
+            required = args.discount_detail_source == "browser"
+            export_store_codes = selected_store_codes
+            if args.discount_detail_source == "auto":
+                cached_file_stores = existing_discount_detail_export_store_codes(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                )
+                cached_approvals = load_discount_detail_approvals_for_range(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                    match_text=args.loyalty_discount_name,
+                )
+                if cached_file_stores:
+                    print(f"[DISCOUNT DETAIL] Reused archived Discount Detail files for: {', '.join(sorted(cached_file_stores))}")
+                if cached_approvals:
+                    discount_approvals = merge_discount_approval_maps(discount_approvals, cached_approvals)
+                discount_no_data_stores = existing_discount_detail_no_data_store_codes(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                )
+                discount_no_data_stores -= cached_file_stores
+                if discount_no_data_stores:
+                    print(f"[DISCOUNT DETAIL] Reused archived no-data markers for: {', '.join(sorted(discount_no_data_stores))}")
+                export_store_codes = [
+                    abbr for abbr in selected_store_codes
+                    if abbr not in cached_file_stores and abbr not in discount_no_data_stores
+                ]
+            if export_store_codes:
+                print(f"[DISCOUNT DETAIL] Pulling Backoffice Discount Detail report from {DISCOUNT_DETAIL_REPORT_URL}")
+                discount_approvals = merge_discount_approval_maps(
+                    discount_approvals,
+                    run_discount_detail_export_for_range(
+                        loyalty_start_day,
+                        end_day,
+                        export_store_codes,
+                        match_text=args.loyalty_discount_name,
+                        required=required,
+                        workers=args.discount_detail_browser_workers,
+                    ),
+                )
+                updated_no_data_stores = existing_discount_detail_no_data_store_codes(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                )
+                discount_no_data_stores |= (updated_no_data_stores - existing_discount_detail_export_store_codes(
+                    loyalty_start_day,
+                    end_day,
+                    selected_store_codes,
+                ))
+            elif discount_approvals or discount_no_data_stores:
+                print("[DISCOUNT DETAIL] All available Discount Detail files reused from archive.")
+        else:
+            discount_approvals = load_discount_detail_approvals_for_range(
+                loyalty_start_day,
+                end_day,
+                selected_store_codes,
+                match_text=args.loyalty_discount_name,
+            )
+            if not discount_approvals and loyalty_start_day != start_day:
+                discount_approvals = load_discount_detail_approvals_for_range(
+                    start_day,
+                    end_day,
+                    selected_store_codes,
+                    match_text=args.loyalty_discount_name,
+                )
+            if discount_approvals:
+                print(f"[DISCOUNT DETAIL] Reused archived approval rows for: {', '.join(sorted(discount_approvals))}")
+            discount_no_data_stores = existing_discount_detail_no_data_store_codes(
+                loyalty_start_day,
+                end_day,
+                selected_store_codes,
+            )
+            if discount_no_data_stores:
+                print(f"[DISCOUNT DETAIL] Reused archived no-data markers for: {', '.join(sorted(discount_no_data_stores))}")
+
+        if discount_approvals:
+            counts = {
+                abbr: int(len(df))
+                for abbr, df in discount_approvals.items()
+                if df is not None and not df.empty
+            }
+            if counts:
+                print("[DISCOUNT DETAIL] Approval row counts: " + ", ".join(f"{abbr}={count}" for abbr, count in sorted(counts.items())))
+                loyalty_detail_by_store = enrich_loyalty_detail_maps_with_discount_approvals(
+                    loyalty_detail_by_store,
+                    discount_approvals,
+                )
+                loyalty_detail_workbook = None
+            if discount_no_data_stores:
+                print("[DISCOUNT DETAIL] Confirmed no Discount Detail rows for: " + ", ".join(sorted(discount_no_data_stores)))
+        elif discount_no_data_stores:
+            print("[DISCOUNT DETAIL] Confirmed no Discount Detail rows for: " + ", ".join(sorted(discount_no_data_stores)))
+        else:
+            print(
+                "[DISCOUNT DETAIL] WARN: No Discount Detail approval rows were loaded. "
+                "Use --discount-detail-source browser to require the browser export instead of silently continuing."
+            )
+
+    loyalty_detail_by_store, register_loyalty_by_store = filter_loyalty_maps_to_range(
+        loyalty_detail_by_store,
+        register_loyalty_by_store,
+        loyalty_start_day,
+        end_day,
+    )
+    if loyalty_start_day != start_day:
+        loyalty_detail_workbook = None
+
     forecast_bundle = None
-    if FORECAST_ENABLED:
+    if FORECAST_ENABLED and not args.no_forecast:
         try:
             forecast_bundle = run_month_end_forecast_pipeline(store_daily_map, as_of=end_day)
             print_forecast_bundle(forecast_bundle)
         except Exception as e:
             print(f"[FORECAST] WARN: Forecast pipeline failed: {e}")
             forecast_bundle = None
+    elif args.no_forecast:
+        print("[FORECAST] Skipped (--no-forecast).")
+
+    if loyalty_detail_workbook is None:
+        loyalty_detail_workbook = write_loyalty_detail_workbook(
+            LOYALTY_DETAIL_ROOT / f"{start_day.isoformat()}_to_{end_day.isoformat()}",
+            loyalty_start_day,
+            end_day,
+            loyalty_detail_by_store,
+            register_loyalty_by_store,
+            match_text=args.loyalty_discount_name,
+        )
+        if loyalty_detail_workbook:
+            print(f"[LOYALTY] Detailed discount report: {loyalty_detail_workbook}")
 
     pdf_run_dir = PDF_ROOT / f"{start_day.isoformat()}_to_{end_day.isoformat()}"
     pdf_run_dir.mkdir(parents=True, exist_ok=True)
 
-    for store_name, abbr in store_abbr_map.items():
+    for store_name, abbr in _store_iter(selected_store_codes):
         daily = store_daily_map.get(abbr)
         df_raw = store_raw_df_map.get(abbr)
         if daily is None or daily.empty or df_raw is None:
@@ -3783,11 +6260,24 @@ def main():
             daily,
             start_day,
             end_day,
+            loyalty_detail=loyalty_detail_by_store.get(abbr),
+            register_loyalty_detail=register_loyalty_by_store.get(abbr),
+            loyalty_discount_name=args.loyalty_discount_name,
         )
 
     if GENERATE_ALL_STORES_SUMMARY_PDF:
         out_pdf = pdf_run_dir / safe_filename(f"ALL STORES - Owner Snapshot - {end_day.isoformat()}.pdf")
-        build_all_stores_summary_pdf(out_pdf, store_daily_map, end_day=end_day, start_day=start_day, forecast_bundle=forecast_bundle)
+        build_all_stores_summary_pdf(
+            out_pdf,
+            store_daily_map,
+            end_day=end_day,
+            start_day=start_day,
+            forecast_bundle=forecast_bundle,
+            store_raw_df_map=store_raw_df_map,
+            loyalty_detail_by_store=loyalty_detail_by_store,
+            register_loyalty_by_store=register_loyalty_by_store,
+            loyalty_discount_name=args.loyalty_discount_name,
+        )
 
 
     pdfs = sorted(str(p) for p in pdf_run_dir.glob("*.pdf"))
@@ -3798,7 +6288,7 @@ def main():
         mtd_start = month_start(end_day)
         fc_stores = (forecast_bundle or {}).get("stores", {})
 
-        for store_name, abbr in store_abbr_map.items():
+        for store_name, abbr in _store_iter(selected_store_codes):
             daily = store_daily_map.get(abbr)
             if daily is None or daily.empty:
                 continue
@@ -3853,14 +6343,7 @@ def main():
     if args.no_email:
         print("[EMAIL] Skipped (--no-email).")
     else:
-        send_owner_snapshot_email(
-            pdf_paths=pdfs,
-            report_day=end_day,
-            data_start=start_day,
-            data_end=end_day,
-            executive_summary=executive_summary,
-            store_summaries=store_summaries,
-            to_email=[
+        email_recipients = parse_email_recipients(args.email) or [
             "anthony@buzzcannabis.com",
             "ray@buzzcannabis.com",
             "kevin@buzzcannabis.com",
@@ -3868,7 +6351,15 @@ def main():
             "stevei@buzzcannabis.com",
             "andyhirmez@yahoo.com",
             "stevegabbo@hotmail.com"
-        ],
+        ]
+        send_owner_snapshot_email(
+            pdf_paths=pdfs,
+            report_day=end_day,
+            data_start=start_day,
+            data_end=end_day,
+            executive_summary=executive_summary,
+            store_summaries=store_summaries,
+            to_email=email_recipients,
         )
     print("\nDone ✅")
 #python owner_snapshot.py --report-day 2026-01-31 --run-export

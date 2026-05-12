@@ -391,19 +391,6 @@ def _build_plain_text_email(
     ]
     if intro_override:
         lines += [str(intro_override), ""]
-    if executive_summary:
-        lines += [
-            "Executive Snapshot:",
-            f"- Today Net: {_fmt_money(executive_summary.get('today_net'))}",
-            f"- Today Tickets: {_fmt_int(executive_summary.get('today_tickets'))}",
-            f"- MTD Net: {_fmt_money(executive_summary.get('mtd_net'))}",
-            f"- MTD Tickets: {_fmt_int(executive_summary.get('mtd_tickets'))}",
-            f"- Projected Month Net: {_fmt_money(executive_summary.get('proj_month_net'))}",
-            f"- Projected Month Profit: {_fmt_money(executive_summary.get('proj_month_profit'))}",
-            f"- Projected Margin: {_fmt_pct(executive_summary.get('proj_margin'))}",
-            f"- Remaining Days: {_fmt_int(executive_summary.get('remaining_days'))}",
-            "",
-        ]
     if store_summaries:
         lines += [
             "Store KPI Preview:",
@@ -446,50 +433,6 @@ def _build_html_email(
         intro_block = (
             f"<tr><td style=\"padding:14px 20px 10px 20px;\">"
             f"<div style=\"font-size:13px;line-height:1.6;color:#111827;\">{intro_html}</div>"
-            f"</td></tr>"
-        )
-
-    perf_block = ""
-    if executive_summary:
-        perf_cells: List[str] = []
-
-        def _add_perf_cell(label: str, value: str) -> None:
-            perf_cells.append(
-                f"<td width=\"50%\" style=\"padding:10px;border:1px solid {BUZZ['border']};background:#FFFFFF;\">"
-                f"<div style=\"font-size:11px;color:{BUZZ['muted2']};font-weight:700;\">{_esc(label)}</div>"
-                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(value)}</div>"
-                f"</td>"
-            )
-
-        _add_perf_cell("Today Net", _fmt_money(executive_summary.get("today_net")))
-        _add_perf_cell("Today Tickets", _fmt_int(executive_summary.get("today_tickets")))
-        _add_perf_cell("Today Avg Ticket", _fmt_money(executive_summary.get("today_basket")))
-        _add_perf_cell("Today Discount Rate", _fmt_pct(executive_summary.get("today_discount_rate")))
-        _add_perf_cell("MTD Net", _fmt_money(executive_summary.get("mtd_net")))
-        _add_perf_cell("MTD Tickets", _fmt_int(executive_summary.get("mtd_tickets")))
-        _add_perf_cell("MTD Avg Ticket", _fmt_money(executive_summary.get("mtd_basket")))
-        _add_perf_cell("MTD Margin", _fmt_pct(executive_summary.get("mtd_margin")))
-        _add_perf_cell("Projected Month Net", _fmt_money(executive_summary.get("proj_month_net")))
-        _add_perf_cell("Projected Month Profit", _fmt_money(executive_summary.get("proj_month_profit")))
-        _add_perf_cell("Projected Margin", _fmt_pct(executive_summary.get("proj_margin")))
-        _add_perf_cell("Remaining Days", _fmt_int(executive_summary.get("remaining_days")))
-
-        perf_rows = ""
-        for i in range(0, len(perf_cells), 2):
-            row_cells = perf_cells[i:i + 2]
-            if len(row_cells) < 2:
-                row_cells.append(
-                    f"<td width=\"50%\" style=\"padding:10px;border:1px solid {BUZZ['border']};background:#FFFFFF;\"></td>"
-                )
-            perf_rows += f"<tr>{''.join(row_cells)}</tr>"
-
-        perf_block = (
-            f"<tr><td style=\"padding:0 20px 6px 20px;\">"
-            f"<div style=\"font-size:14px;font-weight:900;color:#111827;\">Performance Snapshot</div>"
-            f"<div style=\"margin-top:3px;font-size:12px;color:{BUZZ['muted2']};\">All-store day, MTD, avg-ticket, and month-end projection highlights.</div>"
-            f"</td></tr>"
-            f"<tr><td style=\"padding:8px 20px 12px 20px;\">"
-            f"<table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse;\">{perf_rows}</table>"
             f"</td></tr>"
         )
 
@@ -576,7 +519,6 @@ def _build_html_email(
                 <td style="height:5px;background:linear-gradient(90deg,{BUZZ['yellow']} 0%,{BUZZ['green']} 55%,{BUZZ['yellow']} 100%);"></td>
               </tr>
               {intro_block}
-              {perf_block}
               {store_kpi_block}
 
               <tr>
