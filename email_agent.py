@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import datetime as dt
 import email.utils
 import html
@@ -36,6 +37,7 @@ GMAIL_SCOPES = [
 INTENTS = [
     "deal_report_request",
     "inventory_report_request",
+    "pricing_analysis_request",
     "headset",
     "important_human",
     "routine_answerable",
@@ -130,6 +132,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default_age_days": 90,
         "inventory_full_update": True,
         "create_failure_drafts": True,
+    },
+    "pricing_drafts": {
+        "auto_generate": True,
+        "default_discount_rate": 0.50,
+        "use_deals_config": True,
+        "deals_config_csv": "deals_brand_config.csv",
+        "kickback_fallbacks": [
+            {"discount_rate": 0.50, "kickback_rate": 0.30}
+        ],
     },
     "routing": {
         "headset_keywords": ["headset", "head set", "headphones", "earpiece", "radio", "walkie"],
@@ -246,6 +257,40 @@ def compact_text(value: str, max_chars: int = 12000) -> str:
     if len(value) <= max_chars:
         return value
     return value[:max_chars] + "\n\n[trimmed]"
+
+
+def plain_text_to_basic_html(body_text: str) -> str:
+    html_parts = ['<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111827;">']
+    in_list = False
+
+    def close_list() -> None:
+        nonlocal in_list
+        if in_list:
+            html_parts.append("</ul>")
+            in_list = False
+
+    for raw_line in str(body_text or "").strip().splitlines():
+        line = raw_line.strip()
+        if not line:
+            close_list()
+            continue
+
+        if line.startswith("- "):
+            if not in_list:
+                html_parts.append('<ul style="margin:8px 0 12px 20px;padding:0;">')
+                in_list = True
+            html_parts.append(f"<li>{html.escape(line[2:].strip())}</li>")
+            continue
+
+        close_list()
+        if line.endswith(":") and len(line) <= 48:
+            html_parts.append(f'<p style="margin:12px 0 4px;"><strong>{html.escape(line[:-1])}</strong></p>')
+        else:
+            html_parts.append(f'<p style="margin:0 0 10px;">{html.escape(line)}</p>')
+
+    close_list()
+    html_parts.append("</div>")
+    return "".join(html_parts)
 
 
 def extract_payload_text(payload: dict[str, Any]) -> str:
@@ -381,7 +426,7 @@ class GmailClient:
             body={"addLabelIds": add_label_ids, "removeLabelIds": remove_label_ids},
         ).execute()
 
-    def create_reply_draft(self, email_record: EmailRecord, body_text: str) -> str | None:
+    def create_reply_draft(self, email_record: EmailRecord, body_text: str, html_body: str | None = None) -> str | None:
         if not body_text.strip():
             return None
 
@@ -394,11 +439,15 @@ class GmailClient:
             references = email_record.references_header.strip()
             message["References"] = f"{references} {email_record.gmail_message_id_header}".strip()
         message.set_content(body_text.strip())
+        html_version = html_body.strip() if html_body and html_body.strip() else plain_text_to_basic_html(body_text)
+        if html_version:
+            message.add_alternative(html_version, subtype="html")
 
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         body = {"message": {"raw": raw, "threadId": email_record.thread_id}}
         if self.dry_run:
             print(f"[DRY-RUN] Would create draft reply for {email_record.message_id}:\n{body_text.strip()}\n")
+            print("[DRY-RUN] Draft also includes a formatted HTML version for Gmail.\n")
             return None
 
         draft = self.service.users().drafts().create(userId="me", body=body).execute()
@@ -430,6 +479,9 @@ class EmailClassifier:
             "radio, earpiece, or staff equipment messages. Use deal_report_request when the sender "
             "asks for brand deal, kickback, or weekly deals reports. Use inventory_report_request "
             "when the sender asks for brand inventory, reorder, availability, stock, or inventory links. "
+            "Use pricing_analysis_request when the sender asks to check retail/wholesale pricing math, "
+            "compare proposed pricing, or determine whether Buzz will be cheaper or competitive. "
+            "Pricing analysis should be moved to needs_human, but it may create a draft when the math is clear. "
             "Extract requested_brand when the sender asks for a report for a specific brand. "
             "Use requested_report='aging_inventory' for aged/aging/old flower inventory requests, "
             "requested_report='inventory' for standard brand inventory, and requested_report='both' "
@@ -527,6 +579,12 @@ class EmailClassifier:
             move_to = "report_requests"
             requested_report = "deals"
             job_key = "weekly_deals"
+            should_create_draft = True
+        elif looks_like_pricing_analysis_text(text):
+            intent = "pricing_analysis_request"
+            move_to = "needs_human"
+            requested_report = "unknown"
+            job_key = "none"
             should_create_draft = True
         elif has_any(routing.get("important_keywords", [])):
             intent = "important_human"
@@ -656,6 +714,519 @@ def aged_inventory_links_path(today: str) -> Path:
     return BASE_DIR / "reports" / "aged_inventory" / today / "drive_links.txt"
 
 
+@dataclass
+class PricingLine:
+    key: str
+    name: str
+    current_retail: float | None = None
+    proposed_retail: float | None = None
+    wholesale: float | None = None
+
+
+@dataclass
+class PricingDealContext:
+    brand: str | None = None
+    discount_rate: float | None = None
+    kickback_rate: float | None = None
+    source: str = ""
+
+
+PRICE_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?P<name>[A-Za-z0-9][A-Za-z0-9 /&().+]*?)\s*(?:[-–—:]+)\s*(?P<price>\$?\s*\d+(?:\.\d+)?|TBD)\s*$",
+    re.IGNORECASE,
+)
+
+
+def looks_like_pricing_analysis_text(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    pricing_terms = ("pricing", "retail", "wholesale", "cheaper", "competitive", "discount", "margin")
+    request_terms = ("can you check", "check the pricing", "see if", "will be cheaper", "proposed change", "offset")
+    return any(term in lowered for term in pricing_terms) and any(term in lowered for term in request_terms)
+
+
+def pricing_section_key(line: str) -> str | None:
+    lowered = line.casefold()
+    if "current retail" in lowered and "discount" in lowered:
+        return "current_retail"
+    if "proposed retail" in lowered and "discount" in lowered:
+        return "proposed_retail"
+    if "current wholesale" in lowered or lowered.strip() == "wholesale pricing:":
+        return "wholesale"
+    return None
+
+
+def parse_pricing_value(value: str) -> float | None:
+    cleaned = str(value or "").strip()
+    if cleaned.casefold() == "tbd":
+        return None
+    cleaned = cleaned.replace("$", "").replace(",", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def parse_rate_value(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    is_percent = text.endswith("%")
+    text = text.rstrip("%").strip()
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    if is_percent or parsed > 1:
+        parsed = parsed / 100.0
+    return max(0.0, min(parsed, 1.0))
+
+
+def parse_price_line(line: str) -> tuple[str, float | None] | None:
+    match = PRICE_LINE_RE.match(line.strip())
+    if not match:
+        return None
+    name = re.sub(r"\s+", " ", match.group("name").strip())
+    return name, parse_pricing_value(match.group("price"))
+
+
+def extract_pricing_lines(text: str) -> list[PricingLine]:
+    rows: dict[str, PricingLine] = {}
+    order: list[str] = []
+    active_section: str | None = None
+
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        section = pricing_section_key(line)
+        if section:
+            active_section = section
+            continue
+
+        if not active_section:
+            continue
+
+        parsed = parse_price_line(line)
+        if not parsed:
+            if line.endswith(":"):
+                active_section = None
+            continue
+
+        name, value = parsed
+        key = normalize_for_alias(name)
+        if not key:
+            continue
+        if key not in rows:
+            rows[key] = PricingLine(key=key, name=name)
+            order.append(key)
+        setattr(rows[key], active_section, value)
+
+    return [rows[key] for key in order]
+
+
+def extract_discount_rate(text: str, default_rate: float) -> float:
+    lowered = str(text or "").casefold()
+    match = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:discount|promo|promotion|off)", lowered)
+    if match:
+        return max(0.0, min(float(match.group(1)) / 100.0, 0.95))
+    return max(0.0, min(float(default_rate), 0.95))
+
+
+def split_semicolon_values(value: Any) -> list[str]:
+    values: list[str] = []
+    for piece in str(value or "").replace(",", ";").split(";"):
+        cleaned = piece.strip()
+        if cleaned:
+            values.append(cleaned)
+    return values
+
+
+def load_deals_pricing_rules(csv_path_value: str | os.PathLike[str] | None = None) -> list[dict[str, Any]]:
+    rules: list[dict[str, Any]] = []
+    csv_path = resolved_path(csv_path_value or "deals_brand_config.csv")
+
+    if csv_path.exists():
+        try:
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    enabled = str(row.get("enabled", "true")).strip().casefold()
+                    if enabled in {"0", "false", "no", "off"}:
+                        continue
+                    brand = str(row.get("brand") or "").strip()
+                    if not brand:
+                        continue
+                    discount = parse_rate_value(row.get("discount"))
+                    kickback = parse_rate_value(row.get("kickback"))
+                    if discount is None or kickback is None:
+                        continue
+                    aliases = [brand, *split_semicolon_values(row.get("brands"))]
+                    rules.append(
+                        {
+                            "brand": brand,
+                            "aliases": aliases,
+                            "discount_rate": discount,
+                            "kickback_rate": kickback,
+                            "source": csv_path.name,
+                        }
+                    )
+        except Exception as exc:
+            print(f"[WARN] Could not read pricing context from {csv_path}: {exc}", file=sys.stderr)
+
+    if rules:
+        return rules
+
+    try:
+        from deals import DEFAULT_BRAND_CRITERIA
+    except Exception as exc:
+        print(f"[WARN] Could not import deals.py pricing context: {exc}", file=sys.stderr)
+        return rules
+
+    for brand, config in DEFAULT_BRAND_CRITERIA.items():
+        if not isinstance(config, dict):
+            continue
+        base_discount = parse_rate_value(config.get("discount"))
+        base_kickback = parse_rate_value(config.get("kickback"))
+        aliases = [str(brand), *[str(item) for item in config.get("brands", []) or []]]
+        raw_rules = config.get("rules") if isinstance(config.get("rules"), list) else [config]
+        for raw_rule in raw_rules:
+            if not isinstance(raw_rule, dict):
+                continue
+            discount = parse_rate_value(raw_rule.get("discount"))
+            kickback = parse_rate_value(raw_rule.get("kickback"))
+            if discount is None:
+                discount = base_discount
+            if kickback is None:
+                kickback = base_kickback
+            if discount is None or kickback is None:
+                continue
+            rule_aliases = aliases + [str(item) for item in raw_rule.get("brands", []) or []]
+            rules.append(
+                {
+                    "brand": str(brand),
+                    "aliases": rule_aliases,
+                    "discount_rate": discount,
+                    "kickback_rate": kickback,
+                    "source": "deals.py",
+                }
+            )
+
+    return rules
+
+
+def resolve_pricing_deal_context(
+    text: str,
+    requested_brand: str | None,
+    discount_rate: float,
+    pricing_cfg: dict[str, Any],
+) -> PricingDealContext:
+    if pricing_cfg.get("use_deals_config", True):
+        rules = load_deals_pricing_rules(pricing_cfg.get("deals_config_csv", "deals_brand_config.csv"))
+        text_key = normalize_for_alias(text)
+        requested_key = normalize_for_alias(requested_brand or "")
+        matches: list[dict[str, Any]] = []
+        for rule in rules:
+            alias_keys = {normalize_for_alias(alias) for alias in rule.get("aliases", []) if normalize_for_alias(alias)}
+            if requested_key and requested_key not in alias_keys and requested_key != normalize_for_alias(rule.get("brand", "")):
+                continue
+            if not requested_key and not any(alias_key and alias_key in text_key for alias_key in alias_keys):
+                continue
+            if abs(float(rule["discount_rate"]) - discount_rate) > 0.005:
+                continue
+            matches.append(rule)
+
+        if matches:
+            match = matches[0]
+            return PricingDealContext(
+                brand=str(match.get("brand") or requested_brand or ""),
+                discount_rate=float(match["discount_rate"]),
+                kickback_rate=float(match["kickback_rate"]),
+                source=str(match.get("source") or "deals config"),
+            )
+
+    for item in pricing_cfg.get("kickback_fallbacks", []) or []:
+        if not isinstance(item, dict):
+            continue
+        fallback_discount = parse_rate_value(item.get("discount_rate"))
+        fallback_kickback = parse_rate_value(item.get("kickback_rate"))
+        if fallback_discount is None or fallback_kickback is None:
+            continue
+        if abs(fallback_discount - discount_rate) <= 0.005:
+            return PricingDealContext(
+                brand=requested_brand,
+                discount_rate=fallback_discount,
+                kickback_rate=fallback_kickback,
+                source="email_agent_config fallback",
+            )
+
+    return PricingDealContext(brand=requested_brand, discount_rate=discount_rate)
+
+
+def discounted_price(retail: float | None, discount_rate: float) -> float | None:
+    if retail is None:
+        return None
+    return round(retail * (1.0 - discount_rate), 2)
+
+
+def format_money(value: float | None) -> str:
+    if value is None:
+        return "TBD"
+    return f"${value:,.2f}"
+
+
+def format_delta(value: float | None) -> str:
+    if value is None:
+        return "TBD"
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):,.2f}"
+
+
+def format_margin(sell_price: float | None, wholesale: float | None) -> str:
+    if sell_price is None or wholesale is None:
+        return "TBD"
+    profit = round(sell_price - wholesale, 2)
+    margin_pct = (profit / sell_price * 100.0) if sell_price else 0.0
+    return f"{format_money(profit)} ({margin_pct:.1f}%)"
+
+
+def net_cost_after_kickback(wholesale: float | None, kickback_rate: float | None) -> float | None:
+    if wholesale is None:
+        return None
+    if kickback_rate is None:
+        return wholesale
+    return round(wholesale * (1.0 - kickback_rate), 2)
+
+
+def kickback_amount(wholesale: float | None, kickback_rate: float | None) -> float | None:
+    if wholesale is None or kickback_rate is None:
+        return None
+    return round(wholesale * kickback_rate, 2)
+
+
+def format_price_move(before: float | None, after: float | None) -> str:
+    if before is None and after is None:
+        return "TBD"
+    if after is None:
+        return f"{format_money(before)} -> TBD"
+    if before is None:
+        return f"TBD -> {format_money(after)}"
+    return f"{format_money(before)} -> {format_money(after)}"
+
+
+def recipient_first_name(sender: str) -> str:
+    display_name, sender_email = email.utils.parseaddr(sender)
+    source = display_name or sender_email.split("@", 1)[0]
+    source = re.sub(r"[^A-Za-z]+", " ", source).strip()
+    return source.split()[0] if source else ""
+
+
+def pricing_row_values(
+    row: PricingLine,
+    discount_rate: float,
+    deal_context: PricingDealContext | None = None,
+) -> dict[str, Any]:
+    current_after = discounted_price(row.current_retail, discount_rate)
+    proposed_after = discounted_price(row.proposed_retail, discount_rate)
+    kickback_rate = deal_context.kickback_rate if deal_context else None
+    net_cost = net_cost_after_kickback(row.wholesale, kickback_rate)
+    change = None
+    if current_after is not None and proposed_after is not None:
+        change = round(proposed_after - current_after, 2)
+    return {
+        "current_after": current_after,
+        "proposed_after": proposed_after,
+        "change": change,
+        "kickback_amount": kickback_amount(row.wholesale, kickback_rate),
+        "net_cost": net_cost,
+        "current_margin": format_margin(current_after, net_cost),
+        "proposed_margin": format_margin(proposed_after, net_cost),
+    }
+
+
+def build_pricing_analysis_draft(
+    email_record: EmailRecord,
+    default_discount_rate: float,
+    deal_context: PricingDealContext | None = None,
+) -> tuple[str, str] | None:
+    text = f"{email_record.subject}\n{email_record.snippet}\n{email_record.body}"
+    rows = extract_pricing_lines(text)
+    if not rows:
+        return None
+
+    discount_rate = extract_discount_rate(text, default_discount_rate)
+    discount_label = f"{discount_rate * 100:.0f}%"
+    name = recipient_first_name(email_record.sender)
+    greeting = f"Hi {name}," if name else "Hi,"
+
+    priced_rows = [(row, pricing_row_values(row, discount_rate, deal_context)) for row in rows]
+    proposed_breakpoints = [
+        f"{row.name} {format_money(values['proposed_after'])}"
+        for row, values in priced_rows
+        if values["proposed_after"] is not None
+    ]
+    tbd_items = [row.name for row in rows if row.proposed_retail is None and row.current_retail is not None]
+
+    priced_changes = [
+        values["change"]
+        for _, values in priced_rows
+        if values["change"] is not None
+    ]
+    if priced_changes and all(abs(change - priced_changes[0]) < 0.005 for change in priced_changes):
+        short_answer = (
+            f"The proposed retail change moves the customer price by {format_delta(priced_changes[0])} "
+            f"at {discount_label} off, and improves margin by the same amount on those SKUs."
+        )
+    elif priced_changes:
+        short_answer = (
+            f"The proposed retail changes move customer prices by {format_delta(min(priced_changes))} "
+            f"to {format_delta(max(priced_changes))} at {discount_label} off."
+        )
+    else:
+        short_answer = f"I found the current pricing, but the proposed prices are still TBD at {discount_label} off."
+    cheaper_note = (
+        "I do not see the outside/Distro shelf price in the forwarded email, so I cannot fully confirm "
+        "we are cheaper from this thread alone."
+    )
+    deal_note = ""
+    if deal_context and deal_context.kickback_rate is not None:
+        brand_text = f" for {deal_context.brand}" if deal_context.brand else ""
+        deal_note = (
+            f"Assumption{brand_text}: {discount_label} off with "
+            f"{deal_context.kickback_rate * 100:.0f}% kickback on inventory cost"
+        )
+        if deal_context.source:
+            deal_note += f" ({deal_context.source})"
+        deal_note += "."
+        short_answer += f" This includes the {deal_context.kickback_rate * 100:.0f}% inventory-cost kickback."
+
+    lines: list[str] = [
+        greeting,
+        "",
+        "Short answer:",
+        short_answer,
+    ]
+    if deal_note:
+        lines.extend(["", "Deal context:", deal_note])
+    lines.extend(["", f"Pricing math at {discount_label} off:"])
+
+    for row, values in priced_rows:
+        customer_price = format_price_move(values["current_after"], values["proposed_after"])
+        if values["change"] is not None:
+            customer_price += f" ({format_delta(values['change'])})"
+        cost_line = f"Wholesale: {format_money(row.wholesale)}"
+        margin_label = "Margin"
+        if deal_context and deal_context.kickback_rate is not None:
+            cost_line += (
+                f" | Kickback: {format_money(values['kickback_amount'])}"
+                f" | Net cost: {format_money(values['net_cost'])}"
+            )
+            margin_label = "Margin after kickback"
+        lines.extend(
+            [
+                f"- {row.name}",
+                f"  Customer price: {customer_price}",
+                f"  {cost_line}",
+                f"  {margin_label}: {values['current_margin']} -> {values['proposed_margin']}",
+            ]
+        )
+
+    if proposed_breakpoints:
+        lines.extend(
+            [
+                "",
+                "Cheaper check:",
+                cheaper_note,
+                "Buzz is cheaper if their final customer price is above: "
+                + ", ".join(proposed_breakpoints)
+                + ".",
+            ]
+        )
+    if tbd_items:
+        lines.extend(
+            [
+                "",
+                "Next step:",
+                "I would hold off on "
+                + ", ".join(tbd_items)
+                + " until Jeeter gives us the proposed retail, because those are the only items where the customer price and margin are not final yet.",
+            ]
+        )
+
+    lines.extend(["", "Thanks,", "Anthony"])
+    plain_text = "\n".join(lines)
+
+    html_rows = []
+    for row, values in priced_rows:
+        html_change = format_delta(values["change"]) if values["change"] is not None else ""
+        html_rows.append(
+            "<tr>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;font-weight:600;\">{html.escape(row.name)}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(row.current_retail))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(row.proposed_retail))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_price_move(values['current_after'], values['proposed_after']))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(html_change)}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(row.wholesale))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(values['kickback_amount']))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(values['net_cost']))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(values['current_margin'])} -> {html.escape(values['proposed_margin'])}</td>"
+            "</tr>"
+        )
+
+    next_step_html = ""
+    if tbd_items:
+        next_step_html = (
+            "<p><strong>Next step:</strong> Hold off on "
+            + html.escape(", ".join(tbd_items))
+            + " until Jeeter gives the proposed retail, since those customer prices and margins are still TBD.</p>"
+        )
+
+    cheaper_html = ""
+    if proposed_breakpoints:
+        cheaper_html = (
+            "<p><strong>Cheaper check:</strong> "
+            + html.escape(cheaper_note)
+            + " Buzz is cheaper if their final customer price is above "
+            + html.escape(", ".join(proposed_breakpoints))
+            + ".</p>"
+        )
+
+    html_body = f"""
+<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111827;">
+  <p>{html.escape(greeting)}</p>
+  <div style="border-left:4px solid #0f766e;background:#f0fdfa;padding:12px 14px;margin:12px 0;">
+    <div style="font-weight:700;margin-bottom:4px;">Short answer</div>
+    <div>{html.escape(short_answer)}</div>
+  </div>
+  {f'<p><strong>Deal context:</strong> {html.escape(deal_note)}</p>' if deal_note else ''}
+  <p><strong>Pricing math at {html.escape(discount_label)} off</strong></p>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;">
+    <thead>
+      <tr style="background:#f3f4f6;text-align:left;">
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">SKU</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Current retail</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Proposed retail</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Customer price</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Change</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Wholesale</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Kickback</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Net cost</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Margin after kickback</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(html_rows)}
+    </tbody>
+  </table>
+  {cheaper_html}
+  {next_step_html}
+  <p>Thanks,<br>Anthony</p>
+</div>
+"""
+    return plain_text, html_body
+
+
 class ReviewQueue:
     def __init__(self, path: Path):
         self.path = path
@@ -733,6 +1304,7 @@ def popup_approve_draft(email_record: EmailRecord, action: dict[str, Any]) -> bo
 
     def approve() -> None:
         action["draft_reply"] = text.get("1.0", "end").strip()
+        action.pop("draft_reply_html", None)
         result["approved"] = True
         root.destroy()
 
@@ -784,6 +1356,14 @@ def show_review_queue(cfg: dict[str, Any], limit: int) -> int:
     return 0
 
 
+def build_cli_query(cfg: dict[str, Any], sender: str | None = None, gmail_query: str | None = None) -> str:
+    query = str(gmail_query or cfg.get("gmail", {}).get("search_query", "")).strip()
+    sender = str(sender or "").strip()
+    if sender:
+        query = f"from:{sender} {query}".strip()
+    return query
+
+
 class EmailAgent:
     def __init__(self, cfg: dict[str, Any], dry_run_override: bool | None = None):
         self.cfg = cfg
@@ -791,6 +1371,7 @@ class EmailAgent:
         self.safety_cfg = cfg["safety"]
         self.review_cfg = cfg.get("review", {})
         self.report_drafts_cfg = cfg.get("report_drafts", {})
+        self.pricing_drafts_cfg = cfg.get("pricing_drafts", {})
         self.dry_run = self.safety_cfg.get("dry_run", True) if dry_run_override is None else dry_run_override
         self.state_path = resolved_path(cfg["state_file"])
         self.state = load_state(self.state_path)
@@ -801,28 +1382,58 @@ class EmailAgent:
         self.runner = ReportRunner(cfg.get("jobs", {}), dry_run=self.dry_run)
         self.review_queue = ReviewQueue(resolved_path(self.review_cfg.get("queue_file", ".email_agent_review_queue.jsonl")))
         self.processed_label_id = self.gmail.ensure_label(self.gmail_cfg["processed_label"])
+        self.force_draft = False
 
-    def process_once(self) -> int:
-        query = self.gmail_cfg["search_query"]
-        max_results = int(self.gmail_cfg.get("max_messages_per_poll", 10))
+    def process_once(
+        self,
+        query_override: str | None = None,
+        max_results_override: int | None = None,
+        include_processed: bool = False,
+        force_draft: bool = False,
+    ) -> int:
+        query = query_override or self.gmail_cfg["search_query"]
+        max_results = max_results_override or int(self.gmail_cfg.get("max_messages_per_poll", 10))
         message_ids = self.gmail.list_message_ids(query, max_results=max_results)
         processed = 0
         skipped = 0
+        processed_label_skipped = 0
         print(f"[SCAN] Found {len(message_ids)} candidate message(s).")
 
-        for message_id in message_ids:
-            email_record = self.gmail.get_message(message_id)
-            if self.processed_label_id in email_record.label_ids:
-                continue
-            if self.should_skip_email(email_record):
-                print(f"[SKIP] {email_record.sender_email or email_record.sender} | {email_record.subject!r}")
-                skipped += 1
-                continue
-            self.process_message(email_record)
-            processed += 1
+        old_force_draft = self.force_draft
+        self.force_draft = force_draft
+        try:
+            for message_id in message_ids:
+                email_record = self.gmail.get_message(message_id)
+                if self.processed_label_id in email_record.label_ids and not include_processed:
+                    processed_label_skipped += 1
+                    continue
+                if self.should_skip_email(email_record):
+                    print(f"[SKIP] {email_record.sender_email or email_record.sender} | {email_record.subject!r}")
+                    skipped += 1
+                    continue
+                self.process_message(email_record)
+                processed += 1
+        finally:
+            self.force_draft = old_force_draft
 
-        print(f"[SCAN] Processed {processed} new message(s), skipped {skipped}.")
+        print(
+            f"[SCAN] Processed {processed} message(s), skipped {skipped}, "
+            f"already-processed skipped {processed_label_skipped}."
+        )
         return processed
+
+    def process_message_id(self, message_id: str, force_draft: bool = False) -> int:
+        email_record = self.gmail.get_message(message_id)
+        if self.should_skip_email(email_record):
+            print(f"[SKIP] {email_record.sender_email or email_record.sender} | {email_record.subject!r}")
+            return 0
+        old_force_draft = self.force_draft
+        self.force_draft = force_draft
+        try:
+            self.process_message(email_record)
+        finally:
+            self.force_draft = old_force_draft
+        return 1
 
     def should_skip_email(self, email_record: EmailRecord) -> bool:
         sender_email = (email_record.sender_email or "").casefold()
@@ -845,6 +1456,43 @@ class EmailAgent:
                 return True
 
         return False
+
+    def maybe_prepare_pricing_draft(self, email_record: EmailRecord, action: dict[str, Any]) -> dict[str, Any]:
+        if not self.pricing_drafts_cfg.get("auto_generate", True):
+            return action
+        if not self.safety_cfg.get("create_drafts", True):
+            return action
+        if not self.should_create_draft(email_record):
+            return action
+
+        text = f"{email_record.sender} {email_record.subject} {email_record.snippet} {email_record.body}"
+        if action.get("intent") != "pricing_analysis_request" and not looks_like_pricing_analysis_text(text):
+            return action
+
+        default_discount_rate = float(self.pricing_drafts_cfg.get("default_discount_rate", 0.50))
+        discount_rate = extract_discount_rate(text, default_discount_rate)
+        deal_context = resolve_pricing_deal_context(
+            text=text,
+            requested_brand=action.get("requested_brand"),
+            discount_rate=discount_rate,
+            pricing_cfg=self.pricing_drafts_cfg,
+        )
+        draft = build_pricing_analysis_draft(email_record, default_discount_rate, deal_context=deal_context)
+        if not draft:
+            return action
+        draft_body, draft_html = draft
+
+        action = dict(action)
+        action["intent"] = "pricing_analysis_request"
+        action["move_to"] = "needs_human"
+        action["should_archive"] = False
+        action["should_create_draft"] = True
+        action["draft_reply"] = draft_body
+        action["draft_reply_html"] = draft_html
+        action["should_run_job"] = False
+        action["job_key"] = "none"
+        action["reason"] = f"{action.get('reason', '')} Pricing math draft generated for human review.".strip()
+        return action
 
     def maybe_prepare_report_draft(self, email_record: EmailRecord, action: dict[str, Any]) -> dict[str, Any]:
         if not self.report_drafts_cfg.get("auto_generate", False):
@@ -990,6 +1638,7 @@ class EmailAgent:
     def process_message(self, email_record: EmailRecord) -> None:
         action = self.classifier.classify(email_record)
         action = self.apply_safety(email_record, action)
+        action = self.maybe_prepare_pricing_draft(email_record, action)
         action = self.maybe_prepare_report_draft(email_record, action)
         labels = self.labels_for_action(action)
         remove_labels = ["INBOX"] if action.get("should_archive") else []
@@ -1021,7 +1670,11 @@ class EmailAgent:
                         skip_draft = True
 
                 if not skip_draft:
-                    draft_id = self.gmail.create_reply_draft(email_record, action["draft_reply"])
+                    draft_id = self.gmail.create_reply_draft(
+                        email_record,
+                        action["draft_reply"],
+                        html_body=action.get("draft_reply_html"),
+                    )
                     if draft_id:
                         self.remember_drafted_thread(email_record.thread_id)
                         print(f"[DRAFT] Created Gmail draft {draft_id}")
@@ -1081,6 +1734,8 @@ class EmailAgent:
     def should_create_draft(self, email_record: EmailRecord) -> bool:
         if not self.gmail_cfg.get("draft_replies", True):
             return False
+        if self.force_draft:
+            return True
         return email_record.thread_id not in set(self.state.get("drafted_threads", []))
 
     def remember_drafted_thread(self, thread_id: str) -> None:
@@ -1167,6 +1822,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode for this invocation.")
     parser.add_argument("--live", action="store_true", help="Force live mode for this invocation.")
+    parser.add_argument(
+        "--process-message-id",
+        metavar="GMAIL_ID",
+        help="Process one Gmail message ID even if it already has the processed label.",
+    )
+    parser.add_argument(
+        "--from-sender",
+        metavar="EMAIL",
+        help="Process messages from one sender, e.g. donna@buzzcannabis.com.",
+    )
+    parser.add_argument(
+        "--gmail-query",
+        metavar="QUERY",
+        help="Override the configured Gmail search query for this run.",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        metavar="N",
+        help="Override gmail.max_messages_per_poll for this run.",
+    )
+    parser.add_argument(
+        "--include-processed",
+        action="store_true",
+        help="Also process messages that already have the processed label.",
+    )
+    parser.add_argument(
+        "--force-draft",
+        action="store_true",
+        help="Create a new draft even if this thread already has one recorded.",
+    )
     return parser.parse_args()
 
 
@@ -1193,11 +1879,23 @@ def main() -> int:
         return ReportRunner(cfg.get("jobs", {}), dry_run=dry_run).run_job(args.run_job)
 
     agent = EmailAgent(cfg, dry_run_override=dry_run_override)
+    if args.process_message_id:
+        agent.process_message_id(args.process_message_id, force_draft=args.force_draft)
+        return 0
     if args.watch:
         agent.watch()
         return 0
-    if args.once or not args.watch:
-        agent.process_once()
+    if args.once or args.from_sender or args.gmail_query or not args.watch:
+        query_override = None
+        if args.from_sender or args.gmail_query:
+            query_override = build_cli_query(cfg, sender=args.from_sender, gmail_query=args.gmail_query)
+            print(f"[SCAN] Query override: {query_override}")
+        agent.process_once(
+            query_override=query_override,
+            max_results_override=args.max_results,
+            include_processed=args.include_processed,
+            force_draft=args.force_draft,
+        )
         agent.run_due_jobs()
         return 0
     return 0

@@ -49,6 +49,18 @@
     "inventory_full_update": true,
     "create_failure_drafts": true
   },
+  "pricing_drafts": {
+    "auto_generate": true,
+    "default_discount_rate": 0.5,
+    "use_deals_config": true,
+    "deals_config_csv": "deals_brand_config.csv",
+    "kickback_fallbacks": [
+      {
+        "discount_rate": 0.5,
+        "kickback_rate": 0.3
+      }
+    ]
+  },
   "routing": {
     "headset_keywords": [
       "headset",

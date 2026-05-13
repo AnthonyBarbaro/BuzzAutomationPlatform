@@ -26,6 +26,7 @@ The Gmail token for the older email scripts only has send permission. This agent
 
 - Deal report requests get labeled `AI Agent/Report Requests`.
 - Inventory report requests get labeled `AI Agent/Report Requests`.
+- Pricing/math requests get labeled `AI Agent/Needs Human` and can get a draft with the retail/discount/wholesale math.
 - Headset/radio emails get labeled `AI Agent/Headset`.
 - Important or sensitive messages get labeled `AI Agent/Needs Human`.
 - Low-confidence classifications get labeled `AI Agent/Review`.
@@ -58,6 +59,34 @@ With that setup:
 - "Can you send Hashish inventory and aging report?" creates both the full inventory workbook and the aged flower inventory report, then drafts one reply with both links.
 - "710Labs products older than three months" becomes a 90-day aged flower report.
 - If the brand is missing, the agent drafts a quick reply asking for the brand name.
+
+## Pricing Math Drafts
+
+If someone forwards pricing like current retail, proposed retail, wholesale, and a promo discount, the agent keeps the email in human review but drafts the math response. It pulls discount/kickback context from `deals_brand_config.csv` / `deals.py` when it can, then puts the short answer first and uses a formatted Gmail table for customer price, wholesale, kickback, net cost, and margin movement.
+
+For example, Jeeter is configured as 50% off with a 30% inventory-cost kickback, so the draft treats the effective cost as wholesale minus 30%.
+
+Example:
+
+```bash
+.venv/bin/python email_agent.py --config email_agent_config.json --process-message-id 19e1e657940aaa9a
+```
+
+Use `--dry-run` with the same command to preview the draft in the terminal instead of creating a Gmail draft.
+
+To process the latest matching email from one sender:
+
+```bash
+.venv/bin/python email_agent.py --config email_agent_config.json --from-sender donna@buzzcannabis.com --max-results 1
+```
+
+If that thread was already labeled/drafted and you want a fresh draft anyway:
+
+```bash
+.venv/bin/python email_agent.py --config email_agent_config.json --from-sender donna@buzzcannabis.com --include-processed --force-draft --max-results 1
+```
+
+Add `--dry-run` to preview it in the terminal first.
 
 ## Semi-Automatic Review
 
