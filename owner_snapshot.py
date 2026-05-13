@@ -145,6 +145,11 @@ DEFAULT_API_ENV_FILE = DUTCHIE_DEFAULT_ENV_FILE
 DEFAULT_OWNER_API_WORKERS = 6
 API_EXPORT_MAX_WINDOW_DAYS = 31
 
+# Reporting exclusions. Dutchie can show store-to-store transfers as sold Retailer
+# transactions. API exports may send that same type as numeric customerType 5.
+EXCLUDE_REPORTING_CUSTOMER_TYPES = True
+REPORTING_EXCLUDED_CUSTOMER_TYPES = {"retailer", "5"}
+
 # Loyalty detail audit appended at the bottom of PDFs and exported as XLSX
 LOYALTY_DISCOUNT_MATCH_TEXT = "Loyalty Points Adjustment"
 LOYALTY_DETAIL_ROOT = REPORTS_ROOT / "discount_details"
@@ -190,6 +195,9 @@ FORECAST_DIR = REPORTS_ROOT / "forecast"
 FORECAST_HISTORY_PATH = FORECAST_DIR / "daily_history.csv.gz"
 FORECAST_MODEL_PATH = FORECAST_DIR / "month_end_forecaster.joblib"
 FORECAST_META_PATH = FORECAST_DIR / "month_end_forecaster_meta.json"
+FORECAST_BACKTEST_DIR = FORECAST_DIR / "backtests"
+FORECAST_BACKTEST_DETAIL_PATH = FORECAST_BACKTEST_DIR / "latest_detail.csv"
+FORECAST_BACKTEST_SUMMARY_PATH = FORECAST_BACKTEST_DIR / "latest_summary.csv"
 
 # Training / data rules
 FORECAST_MIN_ASOF_DAY = 4                  # don’t train/predict on day 1-3 (too noisy)
@@ -202,6 +210,14 @@ FORECAST_WEEKDAY_WINDOW_DAYS = 56          # last 8 weeks weekday profile
 
 # If sklearn is available, also train P10/P90 bands for net & profit
 FORECAST_USE_QUANTILES = True
+
+# Live forecast selection/range rules
+FORECAST_ML_NET_IMPROVEMENT_THRESHOLD = 0.10
+FORECAST_MIN_BACKTEST_ROWS_FOR_RANGE = 3
+FORECAST_MIN_BACKTEST_ROWS_FOR_ML_GATE = 5
+FORECAST_RANGE_LOW_Q = 0.10
+FORECAST_RANGE_HIGH_Q = 0.90
+FORECAST_POOLED_STORE_CODE = "*"
 ###############################################################################
 # Column candidates
 ###############################################################################
@@ -375,6 +391,53 @@ def money2(x: float) -> str:
     except Exception:
         return "$0.00"
 
+def money_range(low: Any, high: Any, fallback: Any = 0.0) -> str:
+    try:
+        lo = float(low)
+        hi = float(high)
+    except Exception:
+        return money(fallback)
+    if abs(hi - lo) < 0.5:
+        return money((lo + hi) / 2.0)
+    return f"{money(lo)} - {money(hi)}"
+
+def forecast_money_range(fc: Dict[str, Any], metric: str) -> str:
+    return money_range(
+        fc.get(f"{metric}_pred_low", fc.get(f"{metric}_pred", 0.0)),
+        fc.get(f"{metric}_pred_high", fc.get(f"{metric}_pred", 0.0)),
+        fc.get(f"{metric}_pred", 0.0),
+    )
+
+def forecast_remaining_money_range(fc: Dict[str, Any], metric: str) -> str:
+    return money_range(
+        fc.get(f"remaining_{metric}_low", fc.get(f"remaining_{metric}", 0.0)),
+        fc.get(f"remaining_{metric}_high", fc.get(f"remaining_{metric}", 0.0)),
+        fc.get(f"remaining_{metric}", 0.0),
+    )
+
+def forecast_backtest_error_label(fc: Dict[str, Any]) -> str:
+    mape = fc.get("backtest_net_mape")
+    n = int(fc.get("backtest_net_n", 0) or 0)
+    try:
+        if mape is None or not np.isfinite(float(mape)):
+            return "n/a"
+        return f"{pct1(float(mape))} avg net miss ({n} samples)"
+    except Exception:
+        return "n/a"
+
+def forecast_backtest_short_label(fc: Dict[str, Any]) -> str:
+    mape = fc.get("backtest_net_mape")
+    n = int(fc.get("backtest_net_n", 0) or 0)
+    try:
+        if mape is None or not np.isfinite(float(mape)):
+            return "n/a"
+        return f"{pct1(float(mape))} ({n})"
+    except Exception:
+        return "n/a"
+
+def forecast_method_label(fc: Dict[str, Any]) -> str:
+    return "ML + pace" if str(fc.get("model_key", "")).lower() == "ml" else "Weekday pace"
+
 def pct1(x: float) -> str:
     try:
         return f"{x*100:,.1f}%"
@@ -426,6 +489,57 @@ def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
         if key in cols:
             return cols[key]
     return None
+
+def filter_reporting_customer_types(df: pd.DataFrame, store_code: str = "") -> pd.DataFrame:
+    if df is None or df.empty or not EXCLUDE_REPORTING_CUSTOMER_TYPES:
+        return df
+
+    type_col = find_col(df, COLUMN_CANDIDATES["customer_type"])
+    if not type_col:
+        return df
+
+    normalized_type = (
+        df[type_col]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+    transfer_line_mask = normalized_type.isin(REPORTING_EXCLUDED_CUSTOMER_TYPES)
+    if not transfer_line_mask.any():
+        return df
+
+    tx_col = find_col(df, COLUMN_CANDIDATES["transaction_id"])
+    if tx_col:
+        transfer_ids = set(
+            df.loc[transfer_line_mask, tx_col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
+        transfer_ids.discard("")
+        if transfer_ids:
+            exclude_mask = df[tx_col].fillna("").astype(str).str.strip().isin(transfer_ids)
+        else:
+            exclude_mask = transfer_line_mask
+    else:
+        exclude_mask = transfer_line_mask
+
+    excluded = df.loc[exclude_mask]
+    net_col = find_col(df, COLUMN_CANDIDATES["net_sales"])
+    gross_col = find_col(df, COLUMN_CANDIDATES["gross_sales"])
+
+    order_count = int(excluded[tx_col].nunique()) if tx_col else int(len(excluded))
+    net_total = float(to_number(excluded[net_col]).fillna(0.0).sum()) if net_col else 0.0
+    gross_total = float(to_number(excluded[gross_col]).fillna(0.0).sum()) if gross_col else 0.0
+    prefix = f"{store_code}: " if store_code else ""
+    print(
+        f"[FILTER] {prefix}Excluded {len(excluded):,} transfer/retailer line(s), "
+        f"{order_count:,} order(s), net={money2(net_total)}, gross={money2(gross_total)}."
+    )
+
+    return df.loc[~exclude_mask].copy()
 
 def dow_short(d: date) -> str:
     return d.strftime("%a")  # Sun, Mon...
@@ -820,10 +934,13 @@ def _aggregate_all_stores_daily(store_daily_map: Dict[str, pd.DataFrame]) -> pd.
     agg = agg.fillna(0.0)
     return agg[_history_keep_cols()].copy()
 
-def forecast_upsert_history(store_daily_map: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def forecast_upsert_history(
+    store_daily_map: Dict[str, pd.DataFrame],
+    include_all_stores: bool = True,
+) -> pd.DataFrame:
     """
     Appends current run daily data into the long-term history and dedupes.
-    Also writes an ALL store_code row per day so the model can learn ALL STORES directly.
+    Writes an ALL store_code row only for complete all-store runs.
     Returns the updated history DF.
     """
     hist = _load_history()
@@ -834,10 +951,10 @@ def forecast_upsert_history(store_daily_map: Dict[str, pd.DataFrame]) -> pd.Data
             continue
         new_rows.append(_daily_to_history_rows(abbr, daily))
 
-    # Add ALL STORES aggregate rows
-    all_daily = _aggregate_all_stores_daily(store_daily_map)
-    if all_daily is not None and not all_daily.empty:
-        new_rows.append(_daily_to_history_rows("ALL", all_daily))
+    if include_all_stores:
+        all_daily = _aggregate_all_stores_daily(store_daily_map)
+        if all_daily is not None and not all_daily.empty:
+            new_rows.append(_daily_to_history_rows("ALL", all_daily))
 
     if not new_rows:
         return hist
@@ -851,7 +968,7 @@ def forecast_upsert_history(store_daily_map: Dict[str, pd.DataFrame]) -> pd.Data
             continue
         add[c] = pd.to_numeric(add[c], errors="coerce").fillna(0.0)
 
-    combined = pd.concat([hist, add], ignore_index=True)
+    combined = add if hist is None or hist.empty else pd.concat([hist, add], ignore_index=True)
     combined["date"] = _normalize_dt(combined["date"])
     combined["store_code"] = combined["store_code"].fillna("").astype(str)
 
@@ -1049,6 +1166,49 @@ def _complete_month_groups(hist: pd.DataFrame) -> List[Tuple[str, pd.Period, pd.
         out.append((str(store), ym, g))
 
     return out
+
+def _forecast_asof_bucket(day_of_month: int) -> str:
+    day = int(day_of_month or 0)
+    if day <= 7:
+        return "D04-D07"
+    if day <= 14:
+        return "D08-D14"
+    if day <= 21:
+        return "D15-D21"
+    return "D22-EOM"
+
+def _configured_store_codes() -> List[str]:
+    return list(dict.fromkeys(store_abbr_map.values()))
+
+def _forecast_is_full_store_run(
+    store_daily_map: Dict[str, pd.DataFrame],
+    selected_store_codes: Optional[List[str]] = None,
+) -> bool:
+    configured = set(_configured_store_codes())
+    selected = set(selected_store_codes or _configured_store_codes())
+    present = {
+        str(abbr)
+        for abbr, daily in (store_daily_map or {}).items()
+        if daily is not None and not daily.empty
+    }
+    return bool(configured) and selected == configured and configured.issubset(present)
+
+def _forecast_month_targets(g: pd.DataFrame) -> Dict[str, float]:
+    return {
+        "net": float(g["net_revenue"].sum()) if "net_revenue" in g.columns else 0.0,
+        "profit": float(g["profit"].sum()) if "profit" in g.columns else 0.0,
+        "tickets": float(g["tickets"].sum()) if "tickets" in g.columns else 0.0,
+        "discount": float(g["discount"].sum()) if "discount" in g.columns else 0.0,
+    }
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    try:
+        denom = float(denominator)
+        if denom == 0:
+            return float("nan")
+        return float(numerator) / denom
+    except Exception:
+        return float("nan")
 
 def _build_training_data(hist: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, pd.Series], Dict[str, Any]]:
     """
@@ -1274,6 +1434,77 @@ def _weekday_profile_baseline(hist: pd.DataFrame, store_code: str, as_of: date) 
         "discount_pred": max((pattern_weight * weekday_discount) + ((1.0 - pattern_weight) * pace_discount), mtd_discount),
     }
 
+def _forecast_result_from_predictions(
+    hist: pd.DataFrame,
+    store_code: str,
+    as_of: date,
+    predictions: Dict[str, float],
+    model_name: str,
+    model_key: str,
+    *,
+    net_p10: Optional[float] = None,
+    net_p90: Optional[float] = None,
+    profit_p10: Optional[float] = None,
+    profit_p90: Optional[float] = None,
+) -> Dict[str, Any]:
+    store = str(store_code)
+    as_of_ts = pd.Timestamp(as_of)
+    mtd_start = pd.Timestamp(date(as_of.year, as_of.month, 1))
+    h_store = hist[(hist["store_code"] == store) & (hist["date"] >= mtd_start) & (hist["date"] <= as_of_ts)]
+
+    mtd_net = float(h_store["net_revenue"].sum()) if not h_store.empty else 0.0
+    mtd_profit = float(h_store["profit"].sum()) if not h_store.empty else 0.0
+    mtd_tickets = float(h_store["tickets"].sum()) if not h_store.empty else 0.0
+    mtd_discount = float(h_store["discount"].sum()) if not h_store.empty else 0.0
+
+    net_pred = max(float(predictions.get("net_pred", 0.0) or 0.0), mtd_net)
+    profit_pred = max(float(predictions.get("profit_pred", 0.0) or 0.0), mtd_profit)
+    tickets_pred = max(float(predictions.get("tickets_pred", 0.0) or 0.0), mtd_tickets)
+    discount_pred = max(float(predictions.get("discount_pred", 0.0) or 0.0), mtd_discount)
+
+    margin_pred = (profit_pred / net_pred) if net_pred else 0.0
+    basket_pred = (net_pred / tickets_pred) if tickets_pred else 0.0
+
+    last_dom = _last_day_of_month(as_of)
+    remaining_days = max((last_dom - as_of).days, 0)
+    remaining_net = net_pred - mtd_net
+    remaining_profit = profit_pred - mtd_profit
+
+    req_net_per_day = (remaining_net / remaining_days) if remaining_days else 0.0
+    req_profit_per_day = (remaining_profit / remaining_days) if remaining_days else 0.0
+
+    return {
+        "store_code": store,
+        "as_of": as_of.isoformat(),
+        "asof_bucket": _forecast_asof_bucket(as_of.day),
+        "model": model_name,
+        "model_key": model_key,
+
+        "mtd_net": mtd_net,
+        "mtd_profit": mtd_profit,
+        "mtd_tickets": mtd_tickets,
+        "mtd_discount": mtd_discount,
+
+        "net_pred": net_pred,
+        "profit_pred": profit_pred,
+        "tickets_pred": tickets_pred,
+        "discount_pred": discount_pred,
+
+        "margin_pred": margin_pred,
+        "basket_pred": basket_pred,
+
+        "remaining_days": int(remaining_days),
+        "remaining_net": float(remaining_net),
+        "remaining_profit": float(remaining_profit),
+        "req_net_per_day": float(req_net_per_day),
+        "req_profit_per_day": float(req_profit_per_day),
+
+        "net_p10": net_p10,
+        "net_p90": net_p90,
+        "profit_p10": profit_p10,
+        "profit_p90": profit_p90,
+    }
+
 class MonthEndForecaster:
     """
     Trains & predicts month-end totals.
@@ -1392,121 +1623,378 @@ class MonthEndForecaster:
             print(f"[FORECAST] WARN: Could not load model: {e}")
             return False
 
-    def predict(self, hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, Any]:
-        """
-        Predict month-end totals as-of a given date.
-        Always clamps predicted totals >= MTD actual totals.
-        """
-        store = str(store_code)
+    def predict_baseline(self, hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, Any]:
+        base = _weekday_profile_baseline(hist, str(store_code), as_of)
+        return _forecast_result_from_predictions(
+            hist,
+            str(store_code),
+            as_of,
+            base,
+            "weekday_pace_baseline",
+            "baseline",
+        )
 
-        # Build current feature row
+    def predict_ml_adaptive(self, hist: pd.DataFrame, store_code: str, as_of: date) -> Optional[Dict[str, Any]]:
+        if not self.models:
+            return None
+
+        store = str(store_code)
         feats = _build_asof_features(hist, store, as_of)
         X1 = pd.DataFrame([feats])
 
-        # Pull MTD actual (for clamping + reporting)
-        as_of_ts = pd.Timestamp(as_of)
-        mtd_start = pd.Timestamp(date(as_of.year, as_of.month, 1))
-        h_store = hist[(hist["store_code"] == store) & (hist["date"] >= mtd_start) & (hist["date"] <= as_of_ts)]
-        mtd_net = float(h_store["net_revenue"].sum()) if not h_store.empty else 0.0
-        mtd_profit = float(h_store["profit"].sum()) if not h_store.empty else 0.0
-        mtd_tickets = float(h_store["tickets"].sum()) if not h_store.empty else 0.0
-        mtd_discount = float(h_store["discount"].sum()) if not h_store.empty else 0.0
+        net_pred = float(self.models["net"].predict(X1)[0])
+        profit_pred = float(self.models["profit"].predict(X1)[0])
+        tickets_pred = float(self.models["tickets"].predict(X1)[0])
+        discount_pred = float(self.models["discount"].predict(X1)[0])
 
-        # If ML model exists, use it; else baseline.
-        if not self.models:
-            base = _weekday_profile_baseline(hist, store, as_of)
-            net_pred = float(base["net_pred"])
-            profit_pred = float(base["profit_pred"])
-            tickets_pred = float(base["tickets_pred"])
-            discount_pred = float(base["discount_pred"])
-            p10_net = p90_net = None
-            p10_profit = p90_profit = None
-            model_name = self.meta.get("model_name", "baseline_weekday_profile")
-        else:
-            net_pred = float(self.models["net"].predict(X1)[0])
-            profit_pred = float(self.models["profit"].predict(X1)[0])
-            tickets_pred = float(self.models["tickets"].predict(X1)[0])
-            discount_pred = float(self.models["discount"].predict(X1)[0])
+        p10_net = p90_net = None
+        p10_profit = p90_profit = None
+        if self.q_models.get("net"):
+            p10_net = float(self.q_models["net"]["p10"].predict(X1)[0])
+            p90_net = float(self.q_models["net"]["p90"].predict(X1)[0])
+        if self.q_models.get("profit"):
+            p10_profit = float(self.q_models["profit"]["p10"].predict(X1)[0])
+            p90_profit = float(self.q_models["profit"]["p90"].predict(X1)[0])
 
-            # Quantiles if available
-            p10_net = p90_net = None
-            p10_profit = p90_profit = None
-            if self.q_models.get("net"):
-                p10_net = float(self.q_models["net"]["p10"].predict(X1)[0])
-                p90_net = float(self.q_models["net"]["p90"].predict(X1)[0])
-            if self.q_models.get("profit"):
-                p10_profit = float(self.q_models["profit"]["p10"].predict(X1)[0])
-                p90_profit = float(self.q_models["profit"]["p90"].predict(X1)[0])
+        base = _weekday_profile_baseline(hist, store, as_of)
+        pct_elapsed = float(np.clip(feats.get("pct_elapsed", 0.0), 0.0, 1.0))
+        data_w = 0.45 + (0.30 * pct_elapsed)   # 45% early month -> 75% late month
+        ml_w = 1.0 - data_w
 
-            model_name = f"{self.meta.get('model_name', 'ML')} + adaptive pace"
-
-            # Anchor ML outputs to current observed pace so projections stay responsive.
-            base = _weekday_profile_baseline(hist, store, as_of)
-            pct_elapsed = float(np.clip(feats.get("pct_elapsed", 0.0), 0.0, 1.0))
-            data_w = 0.45 + (0.30 * pct_elapsed)   # 45% early month -> 75% late month
-            ml_w = 1.0 - data_w
-
-            net_pred = (ml_w * net_pred) + (data_w * float(base["net_pred"]))
-            profit_pred = (ml_w * profit_pred) + (data_w * float(base["profit_pred"]))
-            tickets_pred = (ml_w * tickets_pred) + (data_w * float(base["tickets_pred"]))
-            discount_pred = (ml_w * discount_pred) + (data_w * float(base["discount_pred"]))
-
-        # Clamp totals >= MTD actuals
-        net_pred = max(net_pred, mtd_net)
-        profit_pred = max(profit_pred, mtd_profit)
-        tickets_pred = max(tickets_pred, mtd_tickets)
-        discount_pred = max(discount_pred, mtd_discount)
-
-        # Derived
-        margin_pred = (profit_pred / net_pred) if net_pred else 0.0
-        basket_pred = (net_pred / tickets_pred) if tickets_pred else 0.0
-
-        last_dom = _last_day_of_month(as_of)
-        remaining_days = max((last_dom - as_of).days, 0)
-        remaining_net = net_pred - mtd_net
-        remaining_profit = profit_pred - mtd_profit
-
-        req_net_per_day = (remaining_net / remaining_days) if remaining_days else 0.0
-        req_profit_per_day = (remaining_profit / remaining_days) if remaining_days else 0.0
-
-        return {
-            "store_code": store,
-            "as_of": as_of.isoformat(),
-            "model": model_name,
-
-            "mtd_net": mtd_net,
-            "mtd_profit": mtd_profit,
-            "mtd_tickets": mtd_tickets,
-            "mtd_discount": mtd_discount,
-
-            "net_pred": net_pred,
-            "profit_pred": profit_pred,
-            "tickets_pred": tickets_pred,
-            "discount_pred": discount_pred,
-
-            "margin_pred": margin_pred,
-            "basket_pred": basket_pred,
-
-            "remaining_days": int(remaining_days),
-            "remaining_net": float(remaining_net),
-            "remaining_profit": float(remaining_profit),
-            "req_net_per_day": float(req_net_per_day),
-            "req_profit_per_day": float(req_profit_per_day),
-
-            "net_p10": p10_net,
-            "net_p90": p90_net,
-            "profit_p10": p10_profit,
-            "profit_p90": p90_profit,
+        predictions = {
+            "net_pred": (ml_w * net_pred) + (data_w * float(base["net_pred"])),
+            "profit_pred": (ml_w * profit_pred) + (data_w * float(base["profit_pred"])),
+            "tickets_pred": (ml_w * tickets_pred) + (data_w * float(base["tickets_pred"])),
+            "discount_pred": (ml_w * discount_pred) + (data_w * float(base["discount_pred"])),
         }
+        return _forecast_result_from_predictions(
+            hist,
+            store,
+            as_of,
+            predictions,
+            f"{self.meta.get('model_name', 'ML')} + adaptive pace",
+            "ml",
+            net_p10=p10_net,
+            net_p90=p90_net,
+            profit_p10=p10_profit,
+            profit_p90=p90_profit,
+        )
 
-def run_month_end_forecast_pipeline(store_daily_map: Dict[str, pd.DataFrame], as_of: date) -> Dict[str, Any]:
+    def predict(self, hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, Any]:
+        return self.predict_ml_adaptive(hist, store_code, as_of) or self.predict_baseline(hist, store_code, as_of)
+
+def _forecast_backtest_empty_detail() -> pd.DataFrame:
+    return pd.DataFrame(columns=[
+        "store_code", "month", "as_of", "asof_day", "asof_bucket",
+        "model_key", "model", "metric", "actual", "pred",
+        "error", "abs_error", "ape", "actual_to_pred_ratio",
+    ])
+
+def _forecast_backtest_empty_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=[
+        "scope", "store_code", "model_key", "model", "metric", "asof_bucket",
+        "n", "mae", "mape", "median_ape",
+        "actual_to_pred_p10", "actual_to_pred_p90",
+    ])
+
+def _forecast_backtest_rows_for_prediction(
+    fc: Dict[str, Any],
+    actuals: Dict[str, float],
+    month: str,
+    as_of: date,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for metric in ["net", "profit", "tickets"]:
+        actual = float(actuals.get(metric, 0.0) or 0.0)
+        pred = float(fc.get(f"{metric}_pred", 0.0) or 0.0)
+        error = pred - actual
+        ape = abs(error) / actual if actual else float("nan")
+        rows.append({
+            "store_code": fc.get("store_code", ""),
+            "month": month,
+            "as_of": as_of.isoformat(),
+            "asof_day": int(as_of.day),
+            "asof_bucket": _forecast_asof_bucket(as_of.day),
+            "model_key": fc.get("model_key", ""),
+            "model": fc.get("model", ""),
+            "metric": metric,
+            "actual": actual,
+            "pred": pred,
+            "error": error,
+            "abs_error": abs(error),
+            "ape": ape,
+            "actual_to_pred_ratio": _safe_ratio(actual, pred),
+        })
+    return rows
+
+def summarize_forecast_backtest(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail is None or detail.empty:
+        return _forecast_backtest_empty_summary()
+
+    work = detail.copy()
+    for col in ["actual", "pred", "abs_error", "ape", "actual_to_pred_ratio"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    records: List[Dict[str, Any]] = []
+    group_defs = [
+        ("store", ["store_code", "model_key", "model", "metric", "asof_bucket"]),
+        ("pooled", ["model_key", "model", "metric", "asof_bucket"]),
+    ]
+    for scope, group_cols in group_defs:
+        source = work
+        if scope == "pooled":
+            source = work[work["store_code"].astype(str) != "ALL"].copy()
+            if source.empty:
+                source = work
+        for keys, g in source.groupby(group_cols, dropna=False):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            row = dict(zip(group_cols, keys))
+            ratios = g["actual_to_pred_ratio"].replace([np.inf, -np.inf], np.nan).dropna()
+            ape = g["ape"].replace([np.inf, -np.inf], np.nan).dropna()
+            record = {
+                "scope": scope,
+                "store_code": row.get("store_code", FORECAST_POOLED_STORE_CODE),
+                "model_key": row.get("model_key", ""),
+                "model": row.get("model", ""),
+                "metric": row.get("metric", ""),
+                "asof_bucket": row.get("asof_bucket", ""),
+                "n": int(len(g)),
+                "mae": float(g["abs_error"].mean()) if not g.empty else float("nan"),
+                "mape": float(ape.mean()) if not ape.empty else float("nan"),
+                "median_ape": float(ape.median()) if not ape.empty else float("nan"),
+                "actual_to_pred_p10": float(ratios.quantile(FORECAST_RANGE_LOW_Q)) if not ratios.empty else float("nan"),
+                "actual_to_pred_p90": float(ratios.quantile(FORECAST_RANGE_HIGH_Q)) if not ratios.empty else float("nan"),
+            }
+            records.append(record)
+
+    return pd.DataFrame(records, columns=_forecast_backtest_empty_summary().columns)
+
+def build_forecast_backtest(
+    hist: pd.DataFrame,
+    include_ml: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if hist is None or hist.empty:
+        return _forecast_backtest_empty_detail(), _forecast_backtest_empty_summary()
+
+    hist = hist.copy()
+    hist["date"] = _normalize_dt(hist["date"])
+    hist["store_code"] = hist["store_code"].fillna("").astype(str)
+
+    groups = _complete_month_groups(hist)
+    if not groups:
+        return _forecast_backtest_empty_detail(), _forecast_backtest_empty_summary()
+
+    rows: List[Dict[str, Any]] = []
+    ml_engine_by_month: Dict[str, MonthEndForecaster] = {}
+    baseline_engine = MonthEndForecaster()
+
+    for store, ym, g in groups:
+        actuals = _forecast_month_targets(g)
+        month_key = str(ym)
+        dates = sorted(g["date"].dt.date.unique().tolist())
+
+        ml_engine: Optional[MonthEndForecaster] = None
+        if include_ml:
+            if month_key not in ml_engine_by_month:
+                month_start_ts = pd.Timestamp(date(int(ym.year), int(ym.month), 1))
+                prior_hist = hist[hist["date"] < month_start_ts].copy()
+                engine = MonthEndForecaster()
+                engine.train(prior_hist)
+                ml_engine_by_month[month_key] = engine
+            ml_engine = ml_engine_by_month.get(month_key)
+
+        for as_of_day in dates:
+            if as_of_day.day < FORECAST_MIN_ASOF_DAY:
+                continue
+            if as_of_day == _last_day_of_month(as_of_day):
+                continue
+
+            baseline_fc = baseline_engine.predict_baseline(hist, store, as_of_day)
+            rows.extend(_forecast_backtest_rows_for_prediction(baseline_fc, actuals, month_key, as_of_day))
+
+            if ml_engine is not None and ml_engine.models:
+                ml_fc = ml_engine.predict_ml_adaptive(hist, store, as_of_day)
+                if ml_fc:
+                    rows.extend(_forecast_backtest_rows_for_prediction(ml_fc, actuals, month_key, as_of_day))
+
+    detail = pd.DataFrame(rows, columns=_forecast_backtest_empty_detail().columns)
+    summary = summarize_forecast_backtest(detail)
+    return detail, summary
+
+def _save_forecast_backtest_outputs(detail: pd.DataFrame, summary: pd.DataFrame) -> Tuple[Path, Path]:
+    FORECAST_BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(ZoneInfo(REPORT_TZ)).strftime("%Y%m%d_%H%M%S")
+    detail_path = FORECAST_BACKTEST_DIR / f"forecast_backtest_detail_{stamp}.csv"
+    summary_path = FORECAST_BACKTEST_DIR / f"forecast_backtest_summary_{stamp}.csv"
+    detail.to_csv(detail_path, index=False)
+    summary.to_csv(summary_path, index=False)
+    detail.to_csv(FORECAST_BACKTEST_DETAIL_PATH, index=False)
+    summary.to_csv(FORECAST_BACKTEST_SUMMARY_PATH, index=False)
+    return detail_path, summary_path
+
+def print_forecast_backtest_summary(summary: pd.DataFrame) -> None:
+    print("\n================ FORECAST BACKTEST ================")
+    if summary is None or summary.empty:
+        print("No complete historical months were available for backtesting.")
+        print("===================================================\n")
+        return
+
+    pooled = summary[
+        (summary["scope"] == "pooled")
+        & (summary["metric"] == "net")
+        & (summary["asof_bucket"].astype(str).str.len() > 0)
+    ].copy()
+    if pooled.empty:
+        print("Backtest summary is empty after filtering.")
+    else:
+        for _, row in pooled.sort_values(["asof_bucket", "model_key"]).iterrows():
+            print(
+                f"{row['asof_bucket']} • {row['model_key']}: "
+                f"MAPE {pct1(float(row['mape']))} over {int(row['n'])} net-sales samples"
+            )
+    print("===================================================\n")
+
+def run_forecast_backtest_cli(include_ml: bool = True) -> Dict[str, Any]:
+    hist = _load_history()
+    detail, summary = build_forecast_backtest(hist, include_ml=include_ml)
+    detail_path, summary_path = _save_forecast_backtest_outputs(detail, summary)
+    print_forecast_backtest_summary(summary)
+    print(f"[FORECAST] Backtest detail CSV: {detail_path}")
+    print(f"[FORECAST] Backtest summary CSV: {summary_path}")
+    return {"detail": detail, "summary": summary, "detail_path": detail_path, "summary_path": summary_path}
+
+def load_forecast_backtest_summary() -> pd.DataFrame:
+    if not FORECAST_BACKTEST_SUMMARY_PATH.exists():
+        return _forecast_backtest_empty_summary()
+    try:
+        df = pd.read_csv(FORECAST_BACKTEST_SUMMARY_PATH)
+        return df
+    except Exception as e:
+        print(f"[FORECAST] WARN: Could not load backtest summary: {e}")
+        return _forecast_backtest_empty_summary()
+
+def _forecast_summary_row(
+    summary: pd.DataFrame,
+    store_code: str,
+    model_key: str,
+    metric: str,
+    asof_bucket: str,
+    min_rows: int,
+) -> Optional[pd.Series]:
+    if summary is None or summary.empty:
+        return None
+    work = summary.copy()
+    work["n"] = pd.to_numeric(work.get("n", 0), errors="coerce").fillna(0)
+    filters = [
+        (work["scope"] == "store") & (work["store_code"].astype(str) == str(store_code)),
+        (work["scope"] == "pooled") & (work["store_code"].astype(str) == FORECAST_POOLED_STORE_CODE),
+    ]
+    for scope_filter in filters:
+        cand = work[
+            scope_filter
+            & (work["model_key"].astype(str) == str(model_key))
+            & (work["metric"].astype(str) == str(metric))
+            & (work["asof_bucket"].astype(str) == str(asof_bucket))
+            & (work["n"] >= int(min_rows))
+        ].copy()
+        if not cand.empty:
+            return cand.iloc[0]
+    return None
+
+def forecast_ml_beats_baseline(
+    summary: pd.DataFrame,
+    store_code: str,
+    as_of: date,
+    threshold: float = FORECAST_ML_NET_IMPROVEMENT_THRESHOLD,
+) -> bool:
+    bucket = _forecast_asof_bucket(as_of.day)
+    baseline = _forecast_summary_row(
+        summary, store_code, "baseline", "net", bucket, FORECAST_MIN_BACKTEST_ROWS_FOR_ML_GATE
+    )
+    ml = _forecast_summary_row(
+        summary, store_code, "ml", "net", bucket, FORECAST_MIN_BACKTEST_ROWS_FOR_ML_GATE
+    )
+    if baseline is None or ml is None:
+        return False
+    try:
+        baseline_mape = float(baseline.get("mape", np.nan))
+        ml_mape = float(ml.get("mape", np.nan))
+    except Exception:
+        return False
+    if not np.isfinite(baseline_mape) or not np.isfinite(ml_mape) or baseline_mape <= 0:
+        return False
+    return ml_mape <= baseline_mape * (1.0 - float(threshold))
+
+def apply_backtest_forecast_range(fc: Dict[str, Any], summary: pd.DataFrame) -> Dict[str, Any]:
+    out = dict(fc)
+    bucket = str(out.get("asof_bucket") or _forecast_asof_bucket(parse_iso_date(str(out.get("as_of"))).day))
+    model_key = str(out.get("model_key", "baseline"))
+    store_code = str(out.get("store_code", ""))
+    net_row: Optional[pd.Series] = None
+
+    for metric in ["net", "profit", "tickets", "discount"]:
+        pred_key = f"{metric}_pred"
+        mtd_key = f"mtd_{metric}"
+        low_key = f"{metric}_pred_low"
+        high_key = f"{metric}_pred_high"
+        pred = float(out.get(pred_key, 0.0) or 0.0)
+        mtd_actual = float(out.get(mtd_key, 0.0) or 0.0)
+        row = _forecast_summary_row(
+            summary, store_code, model_key, metric, bucket, FORECAST_MIN_BACKTEST_ROWS_FOR_RANGE
+        )
+        if row is None:
+            out[low_key] = max(pred, mtd_actual)
+            out[high_key] = max(pred, mtd_actual)
+            continue
+        if metric == "net":
+            net_row = row
+        low_factor = float(row.get("actual_to_pred_p10", np.nan))
+        high_factor = float(row.get("actual_to_pred_p90", np.nan))
+        if not np.isfinite(low_factor) or low_factor <= 0:
+            low_factor = 1.0
+        if not np.isfinite(high_factor) or high_factor <= 0:
+            high_factor = 1.0
+        lo_factor, hi_factor = sorted([low_factor, high_factor])
+        low = max(pred * lo_factor, mtd_actual)
+        high = max(pred * hi_factor, low, mtd_actual)
+        out[low_key] = float(low)
+        out[high_key] = float(high)
+
+    out["remaining_net_low"] = max(float(out.get("net_pred_low", out.get("net_pred", 0.0))) - float(out.get("mtd_net", 0.0)), 0.0)
+    out["remaining_net_high"] = max(float(out.get("net_pred_high", out.get("net_pred", 0.0))) - float(out.get("mtd_net", 0.0)), 0.0)
+    out["remaining_profit_low"] = max(float(out.get("profit_pred_low", out.get("profit_pred", 0.0))) - float(out.get("mtd_profit", 0.0)), 0.0)
+    out["remaining_profit_high"] = max(float(out.get("profit_pred_high", out.get("profit_pred", 0.0))) - float(out.get("mtd_profit", 0.0)), 0.0)
+    if net_row is not None:
+        out["range_source"] = str(net_row.get("scope", "backtest"))
+        out["backtest_net_mape"] = float(net_row.get("mape", np.nan))
+        out["backtest_net_n"] = int(float(net_row.get("n", 0)))
+    else:
+        out["range_source"] = "none"
+        out["backtest_net_mape"] = None
+        out["backtest_net_n"] = 0
+    return out
+
+def _live_forecast_backtest_summary(hist: pd.DataFrame) -> pd.DataFrame:
+    summary = load_forecast_backtest_summary()
+    if summary is not None and not summary.empty:
+        return summary
+    _, baseline_summary = build_forecast_backtest(hist, include_ml=False)
+    return baseline_summary
+
+def run_month_end_forecast_pipeline(
+    store_daily_map: Dict[str, pd.DataFrame],
+    as_of: date,
+    selected_store_codes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
     1) Upsert latest run data into history
     2) Train / load model (retrain every run if configured)
-    3) Predict ALL + each store
+    3) Predict selected stores; ALL only for complete all-store runs
     Returns a bundle safe to print / embed in PDFs.
     """
-    hist = forecast_upsert_history(store_daily_map)
+    include_all = _forecast_is_full_store_run(store_daily_map, selected_store_codes)
+    hist = forecast_upsert_history(store_daily_map, include_all_stores=include_all)
 
     engine = MonthEndForecaster()
     loaded = engine.load()
@@ -1515,17 +2003,31 @@ def run_month_end_forecast_pipeline(store_daily_map: Dict[str, pd.DataFrame], as
         engine.train(hist)
         engine.save()
 
-    # Predict ALL + stores
-    by_store = {}
-    by_store["ALL"] = engine.predict(hist, "ALL", as_of)
+    backtest_summary = _live_forecast_backtest_summary(hist)
+    selected_codes = list(dict.fromkeys(selected_store_codes or _configured_store_codes()))
+    present_codes = [
+        abbr for abbr in selected_codes
+        if store_daily_map.get(abbr) is not None and not store_daily_map.get(abbr).empty
+    ]
 
-    for store_name, abbr in store_abbr_map.items():
-        by_store[abbr] = engine.predict(hist, abbr, as_of)
+    by_store = {}
+    if include_all:
+        baseline_all = engine.predict_baseline(hist, "ALL", as_of)
+        use_ml_all = forecast_ml_beats_baseline(backtest_summary, "ALL", as_of)
+        all_fc = engine.predict_ml_adaptive(hist, "ALL", as_of) if use_ml_all else None
+        by_store["ALL"] = apply_backtest_forecast_range(all_fc or baseline_all, backtest_summary)
+
+    for abbr in present_codes:
+        baseline_fc = engine.predict_baseline(hist, abbr, as_of)
+        use_ml = forecast_ml_beats_baseline(backtest_summary, abbr, as_of)
+        ml_fc = engine.predict_ml_adaptive(hist, abbr, as_of) if use_ml else None
+        by_store[abbr] = apply_backtest_forecast_range(ml_fc or baseline_fc, backtest_summary)
 
     bundle = {
         "as_of": as_of.isoformat(),
         "meta": engine.meta,
         "stores": by_store,
+        "include_all": include_all,
     }
     return bundle
 
@@ -1539,17 +2041,18 @@ def print_forecast_bundle(bundle: Dict[str, Any]) -> None:
     print(f"As of: {bundle.get('as_of')} • Model: {meta.get('model_name','')} • "
           f"Complete months: {meta.get('n_complete_months',0)} • Samples: {meta.get('n_samples',0)}")
 
-    all_fc = stores.get("ALL", {})
-    if all_fc:
-        print("\n[ALL STORES]")
-        print(f"  MTD Net: {money(all_fc['mtd_net'])}  ->  Projected Month Net: {money(all_fc['net_pred'])}")
-        print(f"  MTD Profit: {money(all_fc['mtd_profit'])}  ->  Projected Month Profit: {money(all_fc['profit_pred'])}")
-        if all_fc.get("net_p10") is not None and all_fc.get("net_p90") is not None:
-            print(f"  Net Band (P10–P90): {money(all_fc['net_p10'])} – {money(all_fc['net_p90'])}")
-        if all_fc.get("profit_p10") is not None and all_fc.get("profit_p90") is not None:
-            print(f"  Profit Band (P10–P90): {money(all_fc['profit_p10'])} – {money(all_fc['profit_p90'])}")
-        print(f"  Margin (proj): {pct1(all_fc['margin_pred'])} • Remaining days: {all_fc['remaining_days']} • "
-              f"Req Net/Day: {money(all_fc['req_net_per_day'])}")
+    display_keys = ["ALL"] if stores.get("ALL") else sorted(stores)
+    for key in display_keys:
+        fc = stores.get(key, {})
+        if not fc:
+            continue
+        label = "ALL STORES" if key == "ALL" else str(key)
+        print(f"\n[{label}]")
+        print(f"  Method: {fc.get('model', 'baseline')} • Backtest: {forecast_backtest_error_label(fc)}")
+        print(f"  MTD Net: {money(fc['mtd_net'])}  ->  Projected Month Net: {forecast_money_range(fc, 'net')}")
+        print(f"  MTD Profit: {money(fc['mtd_profit'])}  ->  Projected Month Profit: {forecast_money_range(fc, 'profit')}")
+        print(f"  Margin (proj): {pct1(fc['margin_pred'])} • Remaining days: {fc['remaining_days']} • "
+              f"Req Net/Day: {money(fc['req_net_per_day'])}")
 
     print("======================================================\n")
 ###############################################################################
@@ -1753,6 +2256,11 @@ def parse_cli_args() -> argparse.Namespace:
         "--no-forecast",
         action="store_true",
         help="Skip the month-end forecast step for faster test runs.",
+    )
+    parser.add_argument(
+        "--forecast-backtest",
+        action="store_true",
+        help="Run forecast backtests from saved daily history, write CSVs, then exit.",
     )
     parser.set_defaults(run_export=RUN_EXPORT)
     return parser.parse_args()
@@ -5940,11 +6448,12 @@ def build_all_stores_summary_pdf(
             # Summary table
             rows = [
                 ["Projection Method", str(all_fc.get("model", "adaptive pace"))],
+                ["Backtested Net Error", forecast_backtest_error_label(all_fc)],
                 ["MTD Net Revenue", money(all_fc["mtd_net"])],
-                ["Projected Month Net Revenue", money(all_fc["net_pred"])],
-                ["Projected Remaining Net", money(all_fc["remaining_net"])],
+                ["Projected Month Net Revenue", forecast_money_range(all_fc, "net")],
+                ["Projected Remaining Net", forecast_remaining_money_range(all_fc, "net")],
                 ["MTD Net Profit", money(all_fc["mtd_profit"])],
-                ["Projected Month Net Profit", money(all_fc["profit_pred"])],
+                ["Projected Month Net Profit", forecast_money_range(all_fc, "profit")],
                 ["Projected Month Margin", pct1(all_fc["margin_pred"])],
                 ["Remaining Days", str(all_fc["remaining_days"])],
                 ["Projected Net / Day (remaining)", money(all_fc["req_net_per_day"])],
@@ -5952,9 +6461,9 @@ def build_all_stores_summary_pdf(
             ]
 
             if all_fc.get("net_p10") is not None and all_fc.get("net_p90") is not None:
-                rows.insert(2, ["Net Revenue Band (P10–P90)", f"{money(all_fc['net_p10'])} – {money(all_fc['net_p90'])}"])
+                rows.insert(3, ["ML Net Quantile Band", money_range(all_fc["net_p10"], all_fc["net_p90"], all_fc["net_pred"])])
             if all_fc.get("profit_p10") is not None and all_fc.get("profit_p90") is not None:
-                rows.insert(5, ["Net Profit Band (P10–P90)", f"{money(all_fc['profit_p10'])} – {money(all_fc['profit_p90'])}"])
+                rows.insert(7, ["ML Profit Quantile Band", money_range(all_fc["profit_p10"], all_fc["profit_p90"], all_fc["profit_pred"])])
 
             story.append(build_table(["Metric", "Projection"], rows, [3.3*inch, 3.9*inch]))
             story.append(Spacer(1, SPACER["sm"]))
@@ -5967,21 +6476,20 @@ def build_all_stores_summary_pdf(
                 continue
             proj_rows.append([
                 abbr,
+                forecast_method_label(fc),
                 money(fc["mtd_net"]),
-                money(fc["net_pred"]),
-                money(fc["remaining_net"]),
-                money(fc["profit_pred"]),
-                pct1(fc["margin_pred"]),
-                str(fc["remaining_days"]),
+                forecast_money_range(fc, "net"),
+                forecast_money_range(fc, "profit"),
+                forecast_backtest_short_label(fc),
                 money(fc["req_net_per_day"]),
             ])
 
         if proj_rows:
             story.append(Paragraph("Store Projections", styles["Section"]))
             story.append(build_table(
-                ["Store", "MTD Net", "Proj Net", "Remaining Net", "Proj Profit", "Proj Margin", "Days Left", "Req Net/Day"],
+                ["Store", "Method", "MTD Net", "Proj Net", "Proj Profit", "Net Err", "Req/Day"],
                 proj_rows,
-                [0.50*inch, 0.90*inch, 0.90*inch, 1.1*inch, 0.90*inch, 0.90*inch, 0.7*inch, 0.9*inch],
+                [0.45*inch, 1.05*inch, 0.85*inch, 1.50*inch, 1.50*inch, 0.80*inch, 0.85*inch],
             ))
 
     loyalty_frames = [
@@ -6021,6 +6529,10 @@ def build_all_stores_summary_pdf(
 
 def main():
     args = parse_cli_args()
+    if args.forecast_backtest:
+        run_forecast_backtest_cli()
+        return
+
     setup_fonts()
 
     REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -6125,6 +6637,7 @@ def main():
 
         print(f"[PARSE] {abbr}: {path.name}")
         df = read_export(path)
+        df = filter_reporting_customer_types(df, store_code=abbr)
 
         # ✅ APPLY brand-based kickback adjustments BEFORE metrics
         if APPLY_DEAL_KICKBACKS:
@@ -6360,7 +6873,11 @@ def main():
     forecast_bundle = None
     if FORECAST_ENABLED and not args.no_forecast:
         try:
-            forecast_bundle = run_month_end_forecast_pipeline(store_daily_map, as_of=end_day)
+            forecast_bundle = run_month_end_forecast_pipeline(
+                store_daily_map,
+                as_of=end_day,
+                selected_store_codes=selected_store_codes,
+            )
             print_forecast_bundle(forecast_bundle)
         except Exception as e:
             print(f"[FORECAST] WARN: Forecast pipeline failed: {e}")
@@ -6449,8 +6966,14 @@ def main():
                 "mtd_margin": float(s_mtd.get("margin", 0.0)),
                 "mtd_margin_real": float(s_mtd.get("margin_real", 0.0)),
                 "proj_month_net": float(s_fc.get("net_pred", 0.0)) if s_fc else 0.0,
+                "proj_month_net_low": float(s_fc.get("net_pred_low", s_fc.get("net_pred", 0.0))) if s_fc else 0.0,
+                "proj_month_net_high": float(s_fc.get("net_pred_high", s_fc.get("net_pred", 0.0))) if s_fc else 0.0,
                 "proj_month_profit": float(s_fc.get("profit_pred", 0.0)) if s_fc else 0.0,
+                "proj_month_profit_low": float(s_fc.get("profit_pred_low", s_fc.get("profit_pred", 0.0))) if s_fc else 0.0,
+                "proj_month_profit_high": float(s_fc.get("profit_pred_high", s_fc.get("profit_pred", 0.0))) if s_fc else 0.0,
                 "proj_margin": float(s_fc.get("margin_pred", 0.0)) if s_fc else 0.0,
+                "forecast_method": str(s_fc.get("model", "")) if s_fc else "",
+                "forecast_backtest_net_mape": float(s_fc.get("backtest_net_mape", 0.0) or 0.0) if s_fc else 0.0,
             })
 
         all_daily = _aggregate_all_stores_daily(store_daily_map)
@@ -6473,9 +6996,15 @@ def main():
         if all_fc:
             executive_summary.update({
                 "proj_month_net": float(all_fc.get("net_pred", 0.0)),
+                "proj_month_net_low": float(all_fc.get("net_pred_low", all_fc.get("net_pred", 0.0))),
+                "proj_month_net_high": float(all_fc.get("net_pred_high", all_fc.get("net_pred", 0.0))),
                 "proj_month_profit": float(all_fc.get("profit_pred", 0.0)),
+                "proj_month_profit_low": float(all_fc.get("profit_pred_low", all_fc.get("profit_pred", 0.0))),
+                "proj_month_profit_high": float(all_fc.get("profit_pred_high", all_fc.get("profit_pred", 0.0))),
                 "proj_margin": float(all_fc.get("margin_pred", 0.0)),
                 "remaining_days": int(all_fc.get("remaining_days", 0)),
+                "forecast_method": str(all_fc.get("model", "")),
+                "forecast_backtest_net_mape": float(all_fc.get("backtest_net_mape", 0.0) or 0.0),
             })
     except Exception as e:
         print(f"[EMAIL] WARN: Could not build executive summary: {e}")

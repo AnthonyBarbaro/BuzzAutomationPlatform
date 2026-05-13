@@ -168,12 +168,18 @@ Runs fresh Dutchie API exports by default with 6 workers:
 
 Dutchie API scripts fetch stores concurrently with 6 workers by default. Tune that with `--workers`; use `--workers 1` if you need serial requests because of rate limits.
 
-### 2b) Inventory order reports (7d / 14d / 30d)
+### 2b) Forecast backtest only
+Checks historical month-end forecast accuracy and writes CSVs under `reports/forecast/backtests`:
+```bash
+.venv/bin/python owner_snapshot.py --forecast-backtest
+```
+
+### 2c) Inventory order reports (7d / 14d / 30d)
 ```bash
 .venv/bin/python getInventoryOrderReport_api.py --workers 6
 ```
 
-### 2c) Pull API sales, catalog, and inventory exports
+### 2d) Pull API sales, catalog, and inventory exports
 ```bash
 .venv/bin/python dutchie_api_reports.py --stores mv lg --reports sales catalog inventory --from-date 2026-03-01 --to-date 2026-03-24 --workers 2
 ```

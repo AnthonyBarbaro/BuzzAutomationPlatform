@@ -158,6 +158,23 @@ def _fmt_money(value: Any) -> str:
     except Exception:
         return "$0"
 
+def _fmt_money_range(low: Any, high: Any, fallback: Any = None) -> str:
+    try:
+        lo = float(low)
+        hi = float(high)
+    except Exception:
+        return _fmt_money(fallback)
+    if abs(hi - lo) < 0.5:
+        return _fmt_money((lo + hi) / 2.0)
+    return f"{_fmt_money(lo)} - {_fmt_money(hi)}"
+
+def _summary_projected_net(summary: Dict[str, Any]) -> str:
+    return _fmt_money_range(
+        summary.get("proj_month_net_low", summary.get("proj_month_net")),
+        summary.get("proj_month_net_high", summary.get("proj_month_net")),
+        summary.get("proj_month_net"),
+    )
+
 
 def _fmt_pct(value: Any) -> str:
     try:
@@ -407,7 +424,7 @@ def _build_plain_text_email(
                 f"Tix {_fmt_int(s.get('mtd_tickets'))} | "
                 f"Avg {_fmt_money(s.get('mtd_basket'))} | "
                 f"Margin {_fmt_pct(s.get('mtd_margin'))} | "
-                f"Proj {_fmt_money(s.get('proj_month_net'))}"
+                f"Proj {_summary_projected_net(s)}"
             )
     lines += ["", "This email was generated automatically."]
     return "\n".join(lines)
@@ -487,7 +504,7 @@ def _build_html_email(
                 f"</td>"
                 f"<td width=\"50%\" style=\"padding:9px 10px;\">"
                 f"<div style=\"font-size:10px;color:{BUZZ['muted2']};font-weight:700;\">Projected Month Net</div>"
-                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_fmt_money(s.get('proj_month_net')))}</div>"
+                f"<div style=\"margin-top:3px;font-size:13px;color:#111827;font-weight:900;\">{_esc(_summary_projected_net(s))}</div>"
                 f"</td>"
                 f"</tr>"
                 f"</table>"

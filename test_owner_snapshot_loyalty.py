@@ -1,7 +1,9 @@
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import date
 from pathlib import Path
 
@@ -328,6 +330,94 @@ class OwnerSnapshotLoyaltyTests(unittest.TestCase):
         self.assertEqual(args.stores, ["MV", "LG", "LM", "WP", "SV", "NC"])
         self.assertEqual(args.workers, 6)
         self.assertEqual(args.export_source, "api")
+
+    def test_reporting_filter_excludes_entire_retailer_order(self):
+        raw = osnap.pd.DataFrame(
+            [
+                {
+                    "Order Time": "2026-05-07 11:21",
+                    "Order ID": "transfer-1",
+                    "Customer Type": "Retailer",
+                    "Product Name": "Flower A",
+                    "Total Inventory Sold": 347,
+                    "Gross Sales": 15626.0,
+                    "Net Sales": 15626.0,
+                    "Discounted Amount": 0.0,
+                    "Inventory Cost": 5106.18,
+                    "Order Profit": 10519.82,
+                },
+                {
+                    "Order Time": "2026-05-07 11:21",
+                    "Order ID": "transfer-1",
+                    "Customer Type": "Adult Use",
+                    "Product Name": "Flower B",
+                    "Total Inventory Sold": 1,
+                    "Gross Sales": 50.0,
+                    "Net Sales": 50.0,
+                    "Discounted Amount": 0.0,
+                    "Inventory Cost": 20.0,
+                    "Order Profit": 30.0,
+                },
+                {
+                    "Order Time": "2026-05-07 12:30",
+                    "Order ID": "sale-1",
+                    "Customer Type": "Adult Use",
+                    "Product Name": "Regular Sale",
+                    "Total Inventory Sold": 2,
+                    "Gross Sales": 120.0,
+                    "Net Sales": 100.0,
+                    "Discounted Amount": 20.0,
+                    "Inventory Cost": 40.0,
+                    "Order Profit": 60.0,
+                },
+            ]
+        )
+
+        with redirect_stdout(io.StringIO()):
+            filtered = osnap.filter_reporting_customer_types(raw, store_code="SV")
+
+        self.assertEqual(filtered["Order ID"].tolist(), ["sale-1"])
+        self.assertAlmostEqual(float(filtered["Net Sales"].sum()), 100.0)
+
+    def test_reporting_filter_keeps_data_without_customer_type_column(self):
+        raw = osnap.pd.DataFrame(
+            [
+                {
+                    "Order Time": "2026-05-07 12:30",
+                    "Order ID": "sale-1",
+                    "Net Sales": 100.0,
+                }
+            ]
+        )
+
+        filtered = osnap.filter_reporting_customer_types(raw, store_code="SV")
+
+        self.assertIs(filtered, raw)
+
+    def test_reporting_filter_excludes_api_retailer_type_id(self):
+        raw = osnap.pd.DataFrame(
+            [
+                {
+                    "Order Time": "2026-05-07 11:21",
+                    "Order ID": "transfer-1",
+                    "Customer Type": 5,
+                    "Gross Sales": 15626.0,
+                    "Net Sales": 15626.0,
+                },
+                {
+                    "Order Time": "2026-05-07 12:30",
+                    "Order ID": "sale-1",
+                    "Customer Type": 2,
+                    "Gross Sales": 120.0,
+                    "Net Sales": 100.0,
+                },
+            ]
+        )
+
+        with redirect_stdout(io.StringIO()):
+            filtered = osnap.filter_reporting_customer_types(raw, store_code="SV")
+
+        self.assertEqual(filtered["Order ID"].tolist(), ["sale-1"])
 
     def test_owner_snapshot_defaults_run_api_export_with_six_workers(self):
         original_argv = sys.argv[:]
