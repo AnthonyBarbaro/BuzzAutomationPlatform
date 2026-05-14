@@ -15,6 +15,7 @@ import datetime as dt
 import email.utils
 import html
 import json
+import math
 import os
 import re
 import subprocess
@@ -724,6 +725,15 @@ class PricingLine:
 
 
 @dataclass
+class CostRetailLine:
+    key: str
+    name: str
+    cost: float
+    retail: float
+    group: str | None = None
+
+
+@dataclass
 class PricingDealContext:
     brand: str | None = None
     discount_rate: float | None = None
@@ -736,12 +746,27 @@ PRICE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+COST_RETAIL_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?"
+    r"(?P<name>[A-Za-z0-9][A-Za-z0-9 /&().+]*?)\s*[-–—:]+\s*"
+    r"(?P<cost>\$?\s*[\d,]+(?:\.\d+)?)\s*"
+    r"\(\s*(?:sell\s*price\s*)?(?P<retail>\$?\s*[\d,]+(?:\.\d+)?)\s*\)\s*$",
+    re.IGNORECASE,
+)
+
 
 def looks_like_pricing_analysis_text(text: str) -> bool:
     lowered = str(text or "").casefold()
     pricing_terms = ("pricing", "retail", "wholesale", "cheaper", "competitive", "discount", "margin")
     request_terms = ("can you check", "check the pricing", "see if", "will be cheaper", "proposed change", "offset")
     return any(term in lowered for term in pricing_terms) and any(term in lowered for term in request_terms)
+
+
+def looks_like_cost_retail_pricing_text(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    if not any(term in lowered for term in ("discount", "margin", "% off")):
+        return False
+    return bool(extract_cost_retail_lines(text))
 
 
 def pricing_section_key(line: str) -> str | None:
@@ -827,12 +852,91 @@ def extract_pricing_lines(text: str) -> list[PricingLine]:
     return [rows[key] for key in order]
 
 
+def pricing_group_heading(line: str) -> str | None:
+    cleaned = re.sub(r"\s+", " ", str(line or "").strip().strip(":")).strip()
+    if not cleaned or len(cleaned) > 40:
+        return None
+    lowered = cleaned.casefold()
+    if any(char.isdigit() for char in cleaned) or "$" in cleaned:
+        return None
+    if any(token in lowered for token in ("discount", "margin", "price", "cost", "sell", "off", "thanks")):
+        return None
+    if not re.search(r"[a-z]", lowered):
+        return None
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def cost_retail_display_name(group: str | None, name: str) -> str:
+    cleaned_name = re.sub(r"\s+", " ", str(name or "").strip())
+    cleaned_name = re.sub(r"\bnon infused\b", "non-infused", cleaned_name, flags=re.IGNORECASE)
+    cleaned_name = re.sub(r"\bpre roll\b", "preroll", cleaned_name, flags=re.IGNORECASE)
+    if cleaned_name:
+        cleaned_name = cleaned_name[:1].upper() + cleaned_name[1:]
+    cleaned_group = re.sub(r"\s+", " ", str(group or "").strip())
+    if cleaned_group:
+        cleaned_group = cleaned_group[:1].upper() + cleaned_group[1:]
+    if cleaned_group and normalize_for_alias(cleaned_group) not in normalize_for_alias(cleaned_name):
+        return f"{cleaned_group} {cleaned_name}".strip()
+    return cleaned_name
+
+
+def extract_cost_retail_lines(text: str) -> list[CostRetailLine]:
+    rows: list[CostRetailLine] = []
+    seen: set[str] = set()
+    active_group: str | None = None
+
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        match = COST_RETAIL_LINE_RE.match(line)
+        if match:
+            cost = parse_pricing_value(match.group("cost"))
+            retail = parse_pricing_value(match.group("retail"))
+            if cost is None or retail is None:
+                continue
+            name = cost_retail_display_name(active_group, match.group("name"))
+            key = normalize_for_alias(f"{active_group or ''} {match.group('name')} {cost} {retail}")
+            if key and key not in seen:
+                seen.add(key)
+                rows.append(
+                    CostRetailLine(
+                        key=key,
+                        name=name,
+                        cost=cost,
+                        retail=retail,
+                        group=active_group,
+                    )
+                )
+            continue
+
+        heading = pricing_group_heading(line)
+        if heading:
+            active_group = heading
+
+    return rows
+
+
 def extract_discount_rate(text: str, default_rate: float) -> float:
     lowered = str(text or "").casefold()
     match = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:discount|promo|promotion|off)", lowered)
     if match:
         return max(0.0, min(float(match.group(1)) / 100.0, 0.95))
     return max(0.0, min(float(default_rate), 0.95))
+
+
+def extract_target_margin_rate(text: str) -> float | None:
+    lowered = str(text or "").casefold()
+    patterns = [
+        r"margin\s*(?:at|target|of|=|:)?\s*(\d+(?:\.\d+)?)\s*%",
+        r"(\d+(?:\.\d+)?)\s*%\s*(?:margin|gm)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return max(0.0, min(float(match.group(1)) / 100.0, 0.95))
+    return None
 
 
 def split_semicolon_values(value: Any) -> list[str]:
@@ -991,6 +1095,12 @@ def format_margin(sell_price: float | None, wholesale: float | None) -> str:
     return f"{format_money(profit)} ({margin_pct:.1f}%)"
 
 
+def format_percent(value: float | None, digits: int = 1) -> str:
+    if value is None:
+        return "TBD"
+    return f"{value * 100:.{digits}f}%"
+
+
 def net_cost_after_kickback(wholesale: float | None, kickback_rate: float | None) -> float | None:
     if wholesale is None:
         return None
@@ -1045,6 +1155,207 @@ def pricing_row_values(
     }
 
 
+def cost_retail_row_values(
+    row: CostRetailLine,
+    discount_rate: float,
+    target_margin_rate: float | None,
+) -> dict[str, Any]:
+    sale_price = discounted_price(row.retail, discount_rate)
+    profit = round(sale_price - row.cost, 2) if sale_price is not None else None
+    margin_rate = (profit / sale_price) if sale_price else None
+    target_sale = None
+    target_retail = None
+    target_gap = None
+    if target_margin_rate is not None and target_margin_rate < 1:
+        target_sale = round(row.cost / (1.0 - target_margin_rate), 2)
+        target_retail = round(target_sale / (1.0 - discount_rate), 2) if discount_rate < 1 else None
+        target_gap = round(sale_price - target_sale, 2) if sale_price is not None else None
+    return {
+        "sale_price": sale_price,
+        "profit": profit,
+        "margin_rate": margin_rate,
+        "target_sale": target_sale,
+        "target_retail": target_retail,
+        "target_gap": target_gap,
+        "passes_target": (
+            margin_rate is not None
+            and target_margin_rate is not None
+            and margin_rate + 0.00001 >= target_margin_rate
+        ),
+    }
+
+
+def build_cost_retail_pricing_draft(
+    email_record: EmailRecord,
+    text: str,
+    default_discount_rate: float,
+) -> tuple[str, str] | None:
+    rows = extract_cost_retail_lines(text)
+    if not rows:
+        return None
+
+    discount_rate = extract_discount_rate(text, default_discount_rate)
+    target_margin_rate = extract_target_margin_rate(text)
+    discount_label = f"{discount_rate * 100:.0f}%"
+    target_label = f"{target_margin_rate * 100:.0f}%" if target_margin_rate is not None else None
+    name = recipient_first_name(email_record.sender)
+    greeting = f"Hi {name}," if name else "Hi,"
+    priced_rows = [(row, cost_retail_row_values(row, discount_rate, target_margin_rate)) for row in rows]
+
+    short_answer = (
+        f"Using {discount_label} off the listed sell prices, here is the gross margin math."
+    )
+    target_summary = ""
+    if target_margin_rate is not None:
+        passing = [row for row, values in priced_rows if values["passes_target"]]
+        failing = [row for row, values in priced_rows if not values["passes_target"]]
+        target_summary = f"{len(passing)} of {len(rows)} items are at or above the {target_label} margin target."
+        if failing:
+            fail_text = ", ".join(
+                f"{row.name} ({format_percent(values['margin_rate'])})"
+                for row, values in priced_rows
+                if not values["passes_target"]
+            )
+            target_summary += f" Below target: {fail_text}."
+        close_passes = [
+            (row, values)
+            for row, values in priced_rows
+            if values["passes_target"]
+            and values["margin_rate"] is not None
+            and values["margin_rate"] - target_margin_rate <= 0.025
+        ]
+        if close_passes:
+            close_text = ", ".join(
+                f"{row.name} ({format_percent(values['margin_rate'])})"
+                for row, values in close_passes
+            )
+            target_summary += f" Tight but passing: {close_text}."
+        short_answer = target_summary
+
+    lines: list[str] = [
+        greeting,
+        "",
+        "Short answer:",
+        short_answer,
+        "",
+        "Assumptions:",
+        "- The first number is cost, and the number in parentheses is the retail sell price.",
+        f"- Sale price is retail after {discount_label} off.",
+    ]
+    if target_label:
+        lines.append(f"- Target retail is the minimum pre-discount retail needed to hit {target_label} margin at {discount_label} off.")
+
+    lines.extend(["", f"Pricing math at {discount_label} off:"])
+
+    for row, values in priced_rows:
+        status = ""
+        if target_margin_rate is not None:
+            if values["passes_target"]:
+                status = "Clears target."
+                if values["target_gap"] is not None:
+                    status += f" Sale-price cushion: {format_money(values['target_gap'])}."
+            else:
+                target_retail = values["target_retail"]
+                rounded_retail = math.ceil(target_retail) if target_retail is not None else None
+                status = f"Below target. Minimum retail is {format_money(target_retail)}"
+                if rounded_retail is not None:
+                    status += f"; I would round to at least {format_money(float(rounded_retail))}."
+                else:
+                    status += "."
+
+        lines.extend(
+            [
+                f"- {row.name}",
+                f"  Retail: {format_money(row.retail)} | Sale: {format_money(values['sale_price'])} | Cost: {format_money(row.cost)}",
+                f"  Profit: {format_money(values['profit'])} | Margin: {format_percent(values['margin_rate'])}",
+            ]
+        )
+        if target_margin_rate is not None:
+            lines.append(f"  {target_label} target retail: {format_money(values['target_retail'])} | {status}")
+
+    if target_margin_rate is not None:
+        failing = [(row, values) for row, values in priced_rows if not values["passes_target"]]
+        close_passes = [
+            (row, values)
+            for row, values in priced_rows
+            if values["passes_target"]
+            and values["margin_rate"] is not None
+            and values["margin_rate"] - target_margin_rate <= 0.025
+        ]
+        lines.extend(["", "Recommendation:"])
+        if failing:
+            lines.append(
+                "- Raise "
+                + ", ".join(row.name for row, _ in failing)
+                + f" or keep those items out of the {discount_label} promo if {target_label} margin is firm."
+            )
+        if close_passes:
+            lines.append(
+                "- "
+                + ", ".join(row.name for row, _ in close_passes)
+                + " passes, but it is close enough that I would add a little price cushion if we want room for fees/rounding."
+            )
+        clear_items = [
+            row.name
+            for row, values in priced_rows
+            if values["passes_target"] and all(row.key != close_row.key for close_row, _ in close_passes)
+        ]
+        if clear_items:
+            lines.append("- The remaining items clear the target at the listed prices.")
+
+    lines.extend(["", "Thanks,", "Anthony"])
+    plain_text = "\n".join(lines)
+
+    html_rows = []
+    for row, values in priced_rows:
+        status = "Review"
+        if target_margin_rate is not None:
+            status = "OK" if values["passes_target"] else "Below target"
+        html_rows.append(
+            "<tr>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;font-weight:600;\">{html.escape(row.name)}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(row.retail))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(values['sale_price']))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(row.cost))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(values['profit']))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_percent(values['margin_rate']))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(format_money(values['target_retail']))}</td>"
+            f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">{html.escape(status)}</td>"
+            "</tr>"
+        )
+
+    html_body = f"""
+<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111827;">
+  <p>{html.escape(greeting)}</p>
+  <div style="border-left:4px solid #0f766e;background:#f0fdfa;padding:12px 14px;margin:12px 0;">
+    <div style="font-weight:700;margin-bottom:4px;">Short answer</div>
+    <div>{html.escape(short_answer)}</div>
+  </div>
+  <p><strong>Assumptions:</strong> First number is cost; number in parentheses is retail sell price. Sale price is retail after {html.escape(discount_label)} off.</p>
+  <p><strong>Pricing math at {html.escape(discount_label)} off</strong></p>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;">
+    <thead>
+      <tr style="background:#f3f4f6;text-align:left;">
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Item</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Retail</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Sale</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Cost</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Profit</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Margin</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Target retail</th>
+        <th style="padding:8px;border-bottom:1px solid #d1d5db;">Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(html_rows)}
+    </tbody>
+  </table>
+  <p>Thanks,<br>Anthony</p>
+</div>
+"""
+    return plain_text, html_body
+
+
 def build_pricing_analysis_draft(
     email_record: EmailRecord,
     default_discount_rate: float,
@@ -1053,7 +1364,7 @@ def build_pricing_analysis_draft(
     text = f"{email_record.subject}\n{email_record.snippet}\n{email_record.body}"
     rows = extract_pricing_lines(text)
     if not rows:
-        return None
+        return build_cost_retail_pricing_draft(email_record, text, default_discount_rate)
 
     discount_rate = extract_discount_rate(text, default_discount_rate)
     discount_label = f"{discount_rate * 100:.0f}%"
@@ -1466,7 +1777,11 @@ class EmailAgent:
             return action
 
         text = f"{email_record.sender} {email_record.subject} {email_record.snippet} {email_record.body}"
-        if action.get("intent") != "pricing_analysis_request" and not looks_like_pricing_analysis_text(text):
+        if (
+            action.get("intent") != "pricing_analysis_request"
+            and not looks_like_pricing_analysis_text(text)
+            and not looks_like_cost_retail_pricing_text(text)
+        ):
             return action
 
         default_discount_rate = float(self.pricing_drafts_cfg.get("default_discount_rate", 0.50))
