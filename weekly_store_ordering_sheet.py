@@ -91,7 +91,11 @@ SUMMARY_FIELD_ORDER = [
     "Week Of",
     "Snapshot Generated At",
     "Total Inventory Value",
+    "Total Cannabis Inventory Value",
+    "Total Accessories Inventory Value",
 ]
+
+ACCESSORY_CATEGORY_PATTERN = re.compile(r"\baccessor(?:y|ies)\b", flags=re.IGNORECASE)
 
 
 def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
@@ -1132,7 +1136,7 @@ def sort_ordering_rows(metrics_df: pd.DataFrame) -> pd.DataFrame:
 def build_auto_sheet_df(metrics_df: pd.DataFrame) -> pd.DataFrame:
     if metrics_df is None or metrics_df.empty:
         return pd.DataFrame(columns=AUTO_COLUMNS)
-    return metrics_df[AUTO_COLUMNS].copy()
+    return _blank_sheet_par_levels(metrics_df[AUTO_COLUMNS].copy())
 
 
 def build_review_sheet_df(metrics_df: pd.DataFrame, config: Mapping[str, Any]) -> pd.DataFrame:
@@ -1142,9 +1146,16 @@ def build_review_sheet_df(metrics_df: pd.DataFrame, config: Mapping[str, Any]) -
         return pd.DataFrame(columns=review_columns)
 
     work = metrics_df[AUTO_COLUMNS].copy()
+    work = _blank_sheet_par_levels(work)
     for column in manual_columns:
         work[column] = ""
     return work[review_columns].copy()
+
+
+def _blank_sheet_par_levels(sheet_df: pd.DataFrame) -> pd.DataFrame:
+    if "Par Level" in sheet_df.columns:
+        sheet_df["Par Level"] = ""
+    return sheet_df
 
 
 def build_store_summary(
@@ -1154,25 +1165,86 @@ def build_store_summary(
     snapshot_generated_at: datetime,
 ) -> OrderedDict[str, Any]:
     store_name = bmp._store_name_from_abbr(store_code)
+    value_breakdown = compute_inventory_value_breakdown(inventory_prepared)
     summary_values = {
         "Store": f"{store_code} - {store_name}",
         "Week Of": week_of.isoformat(),
-        "Snapshot Generated At": snapshot_generated_at.astimezone(ZoneInfo(bmp.REPORT_TZ)).strftime("%Y-%m-%d %H:%M %Z"),
-        "Total Inventory Value": compute_total_inventory_value(inventory_prepared),
+        "Snapshot Generated At": snapshot_generated_at.astimezone(ZoneInfo(bmp.REPORT_TZ)).strftime(
+            "%Y-%m-%d %H:%M %Z"
+        ),
+        **value_breakdown,
     }
     return OrderedDict((field, summary_values[field]) for field in SUMMARY_FIELD_ORDER)
 
 
 def compute_total_inventory_value(inventory_prepared: pd.DataFrame) -> float:
+    return compute_inventory_value_breakdown(inventory_prepared)["Total Inventory Value"]
+
+
+def compute_inventory_value_breakdown(inventory_prepared: pd.DataFrame) -> dict[str, float]:
+    values = _inventory_value_series(inventory_prepared)
+    if values.empty:
+        return {
+            "Total Inventory Value": 0.0,
+            "Total Cannabis Inventory Value": 0.0,
+            "Total Accessories Inventory Value": 0.0,
+        }
+
+    accessory_mask = _accessory_category_mask(inventory_prepared).reindex(values.index, fill_value=False)
+    total_value = float(values.sum())
+    accessories_value = float(values.loc[accessory_mask].sum())
+    cannabis_value = float(values.loc[~accessory_mask].sum())
+    return {
+        "Total Inventory Value": total_value,
+        "Total Cannabis Inventory Value": cannabis_value,
+        "Total Accessories Inventory Value": accessories_value,
+    }
+
+
+def _inventory_value_series(inventory_prepared: pd.DataFrame) -> pd.Series:
     if inventory_prepared is None or inventory_prepared.empty:
-        return 0.0
+        return pd.Series(dtype=float)
 
     if "Inventory_Value" in inventory_prepared.columns:
-        return float(pd.to_numeric(inventory_prepared["Inventory_Value"], errors="coerce").fillna(0.0).sum())
+        return pd.to_numeric(inventory_prepared["Inventory_Value"], errors="coerce").fillna(0.0).astype(
+            float
+        )
 
-    available = pd.to_numeric(inventory_prepared.get("Available", 0.0), errors="coerce").fillna(0.0)
-    cost = pd.to_numeric(inventory_prepared.get("Cost", 0.0), errors="coerce").fillna(0.0)
-    return float((available * cost).sum())
+    index = inventory_prepared.index
+    available_source = (
+        inventory_prepared["Available"]
+        if "Available" in inventory_prepared.columns
+        else pd.Series(0.0, index=index)
+    )
+    cost_source = (
+        inventory_prepared["Cost"]
+        if "Cost" in inventory_prepared.columns
+        else pd.Series(0.0, index=index)
+    )
+    available = pd.to_numeric(available_source, errors="coerce").fillna(0.0).astype(float)
+    cost = pd.to_numeric(cost_source, errors="coerce").fillna(0.0).astype(float)
+    return available * cost
+
+
+def _accessory_category_mask(inventory_prepared: pd.DataFrame) -> pd.Series:
+    if inventory_prepared is None or inventory_prepared.empty:
+        return pd.Series(dtype=bool)
+
+    category = pd.Series("", index=inventory_prepared.index, dtype="object")
+    category_columns = (
+        "Category",
+        "category",
+        "category_normalized",
+        "Master Category",
+        "masterCategory",
+        "master_category",
+    )
+    for column in category_columns:
+        if column not in inventory_prepared.columns:
+            continue
+        values = inventory_prepared[column].fillna("").astype(str).str.strip()
+        category = category.mask(category.eq(""), values)
+    return category.str.contains(ACCESSORY_CATEGORY_PATTERN, na=False)
 
 
 def write_store_artifacts(

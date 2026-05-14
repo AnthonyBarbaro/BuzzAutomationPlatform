@@ -86,9 +86,33 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertEqual(bundle["logs"]["metric_filter_counts"], {"min_units_sold_30d": 1})
         self.assertEqual(
             list(bundle["summary"].keys()),
-            ["Store", "Week Of", "Snapshot Generated At", "Total Inventory Value"],
+            [
+                "Store",
+                "Week Of",
+                "Snapshot Generated At",
+                "Total Inventory Value",
+                "Total Cannabis Inventory Value",
+                "Total Accessories Inventory Value",
+            ],
         )
         self.assertAlmostEqual(bundle["summary"]["Total Inventory Value"], 133.0)
+        self.assertAlmostEqual(bundle["summary"]["Total Cannabis Inventory Value"], 133.0)
+        self.assertAlmostEqual(bundle["summary"]["Total Accessories Inventory Value"], 0.0)
+
+    def test_inventory_value_breakdown_splits_accessories_from_cannabis(self):
+        inventory_df = pd.DataFrame(
+            [
+                {"Category": "Flower", "Available": 2, "Cost": 10.0},
+                {"Category": "Accessories", "Available": 3, "Cost": 4.0},
+                {"category_normalized": "Smoking Accessories", "Available": 1, "Cost": 5.0},
+            ]
+        )
+
+        breakdown = weekly_sheet.compute_inventory_value_breakdown(inventory_df)
+
+        self.assertAlmostEqual(breakdown["Total Inventory Value"], 37.0)
+        self.assertAlmostEqual(breakdown["Total Cannabis Inventory Value"], 20.0)
+        self.assertAlmostEqual(breakdown["Total Accessories Inventory Value"], 17.0)
 
     def test_extra_keyword_vendor_exclusion_is_supported(self):
         config = json.loads(json.dumps(self.config))
@@ -312,7 +336,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
                 "Brand A | Flower 3.5g | Blue Dream",
             ],
         )
-        self.assertEqual(auto_df["Par Level"].tolist(), [4, 10, 5])
+        self.assertEqual(auto_df["Par Level"].tolist(), ["", "", ""])
         self.assertEqual(auto_df["Cost"].tolist(), [7.0, 8.0, 12.0])
 
     def test_recent_velocity_and_low_stock_can_push_par_above_14d_sales(self):
@@ -654,6 +678,7 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         review_df = bundle["review_df"]
 
         self.assertEqual(list(review_df.columns), list(bundle["auto_df"].columns))
+        self.assertEqual(review_df["Par Level"].tolist(), ["", "", ""])
         merged = merge_preserved_review_columns(review_df, [list(review_df.columns)], manual_columns=self.config["review_manual_columns"])
         pd.testing.assert_frame_equal(merged, review_df)
 
@@ -664,6 +689,8 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
 
         self.assertEqual(len(summary_rows), 2)
         self.assertEqual(header_row_number, 3)
+        self.assertEqual(summary_rows[1][2], "Total Cannabis Inventory Value")
+        self.assertEqual(summary_rows[1][4], "Total Accessories Inventory Value")
         json.dumps({"values": values})
 
     def test_main_continues_after_one_store_failure_and_records_it(self):

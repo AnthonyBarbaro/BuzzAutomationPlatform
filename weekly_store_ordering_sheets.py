@@ -23,7 +23,7 @@ def parse_spreadsheet_target(target: str) -> tuple[str, int | None]:
     return text, None
 
 
-def build_summary_rows(summary: Mapping[str, Any], max_rows: int = 3) -> list[list[Any]]:
+def build_summary_rows(summary: Mapping[str, Any], max_rows: int = 2) -> list[list[Any]]:
     items = [(str(label), _sheet_safe_value(value)) for label, value in summary.items()]
     if not items:
         return []
@@ -99,34 +99,34 @@ def build_readme_rows(
         [
             "1. Open the newest generated tab for the current week, usually REVIEW.",
             "2. Use the filter arrows on the header row. Filters are already turned on for the weekly tab.",
-            "3. Work the red and orange rows first. Those are the items sitting furthest below par.",
+            "3. Work down each Brand and Category group, using recent unit sales and Available side by side.",
         ]
     )
     vendor_brand_guide = (
         "Filter Brand first, then Category. The weekly sheet stays line-by-line by product so each SKU keeps "
-        "its own row and par target."
+        "its own row for review."
     )
     filter_stack = "\n".join(
         [
             "Recommended filter order:",
             "Brand -> Category",
-            "Then optionally sort Available low-to-high to see the biggest par gaps first.",
+            "Then optionally sort Available low-to-high to see the thinnest stock first.",
         ]
     )
     read_suggestions = (
-        "Use Available versus Par Level together with Units Sold 7d/14d/30d to spot which rows are "
+        "Use Available together with Units Sold 7d/14d/30d to spot which rows are "
         "short and which ones are already covered."
     )
     order_workflow = "\n".join(
         [
-            "1. Review the red rows first, then orange, then yellow.",
-            "2. Compare Available to Par Level to estimate the gap for each line item.",
+            "1. Review each Brand and Category block from top to bottom.",
+            "2. Leave Par Level blank and use Available with recent unit sales to estimate gaps.",
             "3. Use the 14d and 30d sales columns to sanity-check whether the SKU still deserves shelf space.",
             "4. If a SKU is gone, look for replacements nearby in the same brand and category.",
         ]
     )
     rerun_safety = (
-        "Reruns for the same week update the same script-owned ordering rows, so you can refresh the par view "
+        "Reruns for the same week update the same script-owned ordering rows, so you can refresh the weekly view "
         "without rebuilding the sheet layout by hand."
     )
 
@@ -979,6 +979,8 @@ def _number_format_requests(
     if summary_row_count:
         summary_formats = {
             "Total Inventory Value": "$#,##0.00",
+            "Total Cannabis Inventory Value": "$#,##0.00",
+            "Total Accessories Inventory Value": "$#,##0.00",
             "Total SKUs Considered": "0",
             "Total SKUs Needing Order": "0",
             "Total 7d Units Sold": "0",
