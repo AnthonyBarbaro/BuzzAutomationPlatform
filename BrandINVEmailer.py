@@ -8,13 +8,15 @@ Combined script that:
 2. On the current day, fetches CSVs (via getCatalog.py) [optional].
 3. Processes brand inventory, generating Excel files grouped by brand.
 4. Uploads those files to a date-based folder inside a parent "INVENTORY" Google Drive folder
-   - Each brand gets its own subfolder (made public).
+   - Each scheduled brand gets its own public subfolder for vendor emails.
+   - An optional OTHER folder holds public child folders for every generated brand,
+     while the OTHER folder itself is restricted to the Buzz Cannabis domain.
 5. Sends an HTML email to the brand's recipients with a single publicly shareable
    Drive folder link (since the folder is public, all files are accessible).
 
 Requires:
 - credentials.json (for Google OAuth Drive + Gmail)
-- brand_config.json (for daily brand scheduling, plus test-mode toggle)
+- brand_config2.json (for daily brand scheduling, plus test-mode toggle)
 """
 
 import os
@@ -25,6 +27,8 @@ import datetime
 import traceback
 import shutil
 import re
+import argparse
+import html
 import pandas as pd
 import time
 from dotenv import load_dotenv
@@ -64,9 +68,13 @@ ORDER_REPORT_FILE_PATTERN = re.compile(
     r"^inventory_order_(7d|14d|30d)_[A-Za-z0-9]+\.(xlsx|xls|csv)$",
     re.IGNORECASE,
 )
+BRAND_REPORT_FILE_PATTERN = re.compile(r"^(.*?)_(.*?)_(\d{2}-\d{2}-\d{4})\.xlsx$", re.IGNORECASE)
 
 # Google Drive parent folder name (where we create subfolders by date)
 DRIVE_PARENT_FOLDER_NAME = "INVENTORY"
+DRIVE_OTHER_PARENT_FOLDER_NAME = "INVENTORY_OTHER"
+DEFAULT_OTHER_FOLDER_NAME = "OTHER"
+DEFAULT_OTHER_FOLDER_DOMAIN = "buzzcannabis.com"
 
 # OAuth credential files
 CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
@@ -181,6 +189,13 @@ def make_folder_public(service, folder_id):
     """
     Make the given Google Drive folder public (viewable by anyone with the link).
     """
+    permissions = list_drive_permissions(service, folder_id)
+    if permissions is not None:
+        for permission in permissions:
+            if permission.get("type") == "anyone" and permission.get("role") == "reader":
+                print(f"[INFO] Folder ID {folder_id} is already public.")
+                return
+
     try:
         permission = {
             "type": "anyone",
@@ -194,7 +209,93 @@ def make_folder_public(service, folder_id):
 
 from googleapiclient.errors import HttpError
 
-def find_or_create_folder(service, folder_name, parent_id=None, retries=5, delay=3):
+def list_drive_permissions(service, folder_id):
+    try:
+        response = service.permissions().list(
+            fileId=folder_id,
+            fields="permissions(id,type,role,domain)"
+        ).execute()
+        return response.get("permissions", [])
+    except Exception as e:
+        print(f"[WARN] Could not inspect permissions for {folder_id}: {e}")
+        return None
+
+
+def remove_anyone_permissions(service, folder_id):
+    """
+    Remove direct public link permissions from a Drive item.
+
+    This keeps container folders private/internal while child brand folders can
+    still be made public with their own direct links.
+    """
+    permissions = list_drive_permissions(service, folder_id)
+    if permissions is None:
+        return
+
+    for permission in permissions:
+        if permission.get("type") != "anyone":
+            continue
+        permission_id = permission.get("id")
+        if not permission_id:
+            continue
+        try:
+            service.permissions().delete(fileId=folder_id, permissionId=permission_id).execute()
+            print(f"[INFO] Removed public access from folder ID {folder_id}.")
+        except Exception as e:
+            print(f"[WARN] Could not remove public access from {folder_id}: {e}")
+
+
+def make_folder_domain_viewable(service, folder_id, domain):
+    """
+    Make the folder viewable only by users in the given Google Workspace domain.
+    """
+    if not domain:
+        return
+
+    remove_anyone_permissions(service, folder_id)
+    permissions = list_drive_permissions(service, folder_id)
+    if permissions is not None:
+        for permission in permissions:
+            if (
+                permission.get("type") == "domain"
+                and permission.get("role") == "reader"
+                and permission.get("domain") == domain
+            ):
+                print(f"[INFO] Folder ID {folder_id} is already viewable by {domain}.")
+                return
+
+    try:
+        permission = {
+            "type": "domain",
+            "role": "reader",
+            "domain": domain,
+            "allowFileDiscovery": False,
+        }
+        service.permissions().create(fileId=folder_id, body=permission).execute()
+        print(f"[INFO] Folder ID {folder_id} is now viewable by {domain} users with the link.")
+    except Exception as e:
+        print(f"[ERROR] Could not make folder domain-viewable for {domain}: {e}")
+
+
+def apply_folder_sharing(service, folder_id, make_public=False, domain_view=None, remove_public=False):
+    if remove_public:
+        remove_anyone_permissions(service, folder_id)
+    if domain_view:
+        make_folder_domain_viewable(service, folder_id, domain_view)
+    if make_public:
+        make_folder_public(service, folder_id)
+
+
+def find_or_create_folder(
+    service,
+    folder_name,
+    parent_id=None,
+    retries=5,
+    delay=3,
+    make_public=False,
+    domain_view=None,
+    remove_public=False,
+):
     folder_name_escaped = folder_name.replace("'", "\\'")
     query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name_escaped}'"
     if parent_id:
@@ -208,7 +309,15 @@ def find_or_create_folder(service, folder_name, parent_id=None, retries=5, delay
         return None
 
     if folders:
-        return folders[0]["id"]
+        folder_id = folders[0]["id"]
+        apply_folder_sharing(
+            service,
+            folder_id,
+            make_public=make_public,
+            domain_view=domain_view,
+            remove_public=remove_public,
+        )
+        return folder_id
 
     # Retry on timeout for folder creation
     for attempt in range(retries):
@@ -223,7 +332,13 @@ def find_or_create_folder(service, folder_name, parent_id=None, retries=5, delay
             new_folder = service.files().create(body=folder_metadata, fields="id").execute()
             folder_id = new_folder.get("id")
             print(f"[INFO] Created new folder '{folder_name}' (ID: {folder_id})")
-            make_folder_public(service, folder_id)
+            apply_folder_sharing(
+                service,
+                folder_id,
+                make_public=make_public,
+                domain_view=domain_view,
+                remove_public=remove_public,
+            )
             return folder_id
 
         except TimeoutError as e:
@@ -390,7 +505,171 @@ def clear_old_input_exports(directory):
                 print(f"[ERROR] Could not delete {file_path}: {e}")
 
 
-def write_inventory_link_manifest(date_str, today_name, brand_folder_links, brand_to_emails):
+def load_other_folder_settings(config):
+    """
+    Read optional OTHER-folder settings from brand_config2.json.
+
+    Defaults are enabled because the OTHER folder is meant to catch every brand,
+    including brands that are not part of the scheduled email list.
+    """
+    settings = config.get("other_folder", {})
+    if settings is False:
+        return {
+            "enabled": False,
+            "parent_folder_name": DRIVE_OTHER_PARENT_FOLDER_NAME,
+            "folder_name": DEFAULT_OTHER_FOLDER_NAME,
+            "domain": DEFAULT_OTHER_FOLDER_DOMAIN,
+        }
+    if not isinstance(settings, dict):
+        settings = {}
+
+    parent_folder_name = str(settings.get("parent_folder_name", DRIVE_OTHER_PARENT_FOLDER_NAME) or "").strip()
+    folder_name = str(settings.get("folder_name", DEFAULT_OTHER_FOLDER_NAME) or "").strip()
+    domain = str(settings.get("domain", DEFAULT_OTHER_FOLDER_DOMAIN) or "").strip()
+    return {
+        "enabled": bool(settings.get("enabled", True)),
+        "parent_folder_name": parent_folder_name or DRIVE_OTHER_PARENT_FOLDER_NAME,
+        "folder_name": folder_name or DEFAULT_OTHER_FOLDER_NAME,
+        "domain": domain or DEFAULT_OTHER_FOLDER_DOMAIN,
+    }
+
+
+def drive_folder_link(folder_id):
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def safe_report_filename_part(value):
+    """
+    Make a brand/store label safe for local workbook filenames.
+
+    Dutchie brand names can contain "/" or trailing whitespace. A slash is fine
+    as a Google Drive folder label, but it becomes a path separator locally.
+    """
+    safe_value = str(value or "").strip()
+    safe_value = re.sub(r"[\\/:*?\"<>|]+", " - ", safe_value)
+    safe_value = re.sub(r"\s+", " ", safe_value).strip().rstrip(".")
+    return safe_value or "Unknown"
+
+
+def parse_brand_from_report_filename(filename):
+    match = BRAND_REPORT_FILE_PATTERN.match(os.path.basename(str(filename or "")))
+    if not match:
+        return None
+    _, brand_name, _ = match.groups()
+    return brand_name
+
+
+def group_generated_files_by_brand(generated_files):
+    grouped = {}
+    for file_path in generated_files:
+        brand_name = parse_brand_from_report_filename(file_path)
+        if not brand_name:
+            print(f"[WARN] Cannot parse brand from {os.path.basename(file_path)}, skipping OTHER upload.")
+            continue
+        grouped.setdefault(brand_name, []).append(file_path)
+    return grouped
+
+
+def upload_other_brand_reports_to_drive(service, generated_files, date_folder_id, other_settings):
+    """
+    Create a domain-only OTHER folder and public child folders for every brand.
+
+    Buzz users can browse the OTHER link. Each child brand folder gets its own
+    public link so it can be shared directly with outside recipients.
+    """
+    if not other_settings.get("enabled"):
+        return None, {}
+
+    other_folder_name = other_settings.get("folder_name") or DEFAULT_OTHER_FOLDER_NAME
+    other_domain = other_settings.get("domain") or DEFAULT_OTHER_FOLDER_DOMAIN
+    other_folder_id = find_or_create_folder(
+        service,
+        other_folder_name,
+        parent_id=date_folder_id,
+        domain_view=other_domain,
+    )
+    if not other_folder_id:
+        print(f"[ERROR] Could not create/find {other_folder_name} folder.")
+        return None, {}
+
+    other_folder_link = drive_folder_link(other_folder_id)
+    other_brand_links = {}
+    brand_file_map = group_generated_files_by_brand(generated_files)
+    print(
+        f"[INFO] Uploading {sum(len(files) for files in brand_file_map.values())} workbook(s) "
+        f"across {len(brand_file_map)} brand folder(s) into {other_folder_name}."
+    )
+
+    for brand_name, files in sorted(brand_file_map.items()):
+        brand_folder_id = find_or_create_folder(
+            service,
+            brand_name,
+            parent_id=other_folder_id,
+            make_public=True,
+        )
+        if not brand_folder_id:
+            print(f"[ERROR] Could not create/find OTHER child folder for {brand_name}.")
+            continue
+
+        other_brand_links[brand_name] = drive_folder_link(brand_folder_id)
+        for file_path in files:
+            try:
+                upload_file_to_drive(service, file_path, brand_folder_id)
+                print(f"[OTHER UPLOAD] {os.path.basename(file_path)} uploaded to {other_folder_name}/{brand_name}")
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"[ERROR] Failed to upload {file_path} to {other_folder_name}/{brand_name}: {e}")
+
+    return other_folder_link, other_brand_links
+
+
+def build_other_folder_email_intro(
+    other_folder_link=None,
+    other_folder_name=DEFAULT_OTHER_FOLDER_NAME,
+    other_domain=DEFAULT_OTHER_FOLDER_DOMAIN,
+):
+    """
+    Build the optional first email link for Buzz users to browse every brand.
+    """
+    if not other_folder_link:
+        return ""
+
+    escaped_name = html.escape(str(other_folder_name or DEFAULT_OTHER_FOLDER_NAME))
+    escaped_domain = html.escape(str(other_domain or DEFAULT_OTHER_FOLDER_DOMAIN))
+    escaped_link = html.escape(str(other_folder_link), quote=True)
+    visible_link = html.escape(str(other_folder_link))
+    return f"""
+          <h3>{escaped_name} - all generated brand folders</h3>
+          <p><strong>First link:</strong> <a href="{escaped_link}">{visible_link}</a></p>
+          <p>
+            Use this when someone needs an inventory report for a brand that is
+            not listed below. The {escaped_name} folder is only viewable by
+            Buzz Cannabis users signed into a {escaped_domain} Google account.
+          </p>
+          <p>
+            Inside {escaped_name}, each brand has its own folder. Those child
+            brand folders are viewable by anyone with that direct brand-folder
+            link, so open {escaped_name}, choose the brand, then share that
+            brand folder link with the person who needs it.
+          </p>
+        """
+
+
+def build_inventory_email_subject(today_name):
+    return f"Brand Inventory Reports for {today_name}"
+
+
+def write_inventory_link_manifest(
+    date_str,
+    today_name,
+    brand_folder_links,
+    brand_to_emails,
+    other_folder_link=None,
+    other_brand_folder_links=None,
+    other_folder_name=DEFAULT_OTHER_FOLDER_NAME,
+    other_domain=DEFAULT_OTHER_FOLDER_DOMAIN,
+    other_parent_folder_name=DRIVE_OTHER_PARENT_FOLDER_NAME,
+):
     """
     Persist Drive folder links so other scripts can reuse the inventory links
     without scraping prior emails.
@@ -409,6 +688,18 @@ def write_inventory_link_manifest(date_str, today_name, brand_folder_links, bran
             for folder_name, link in sorted(brand_folder_links.items())
         },
     }
+    if other_folder_link:
+        manifest["other_folder"] = {
+            "parent_folder_name": other_parent_folder_name,
+            "folder_name": other_folder_name,
+            "link": other_folder_link,
+            "domain": other_domain,
+            "access": f"{other_domain} users with the link can browse this folder.",
+            "brand_folders": {
+                brand_name: {"link": link}
+                for brand_name, link in sorted((other_brand_folder_links or {}).items())
+            },
+        }
 
     dated_path = os.path.join(INVENTORY_LINKS_DIR, f"{date_str}.json")
     latest_path = os.path.join(INVENTORY_LINKS_DIR, "latest.json")
@@ -421,6 +712,26 @@ def write_inventory_link_manifest(date_str, today_name, brand_folder_links, bran
 
     print(f"[INFO] Wrote inventory link manifest: {dated_path}")
     print(f"[INFO] Updated inventory link manifest: {latest_path}")
+
+    if other_folder_link:
+        dated_other_path = os.path.join(INVENTORY_LINKS_DIR, f"{date_str}_other_links.txt")
+        latest_other_path = os.path.join(INVENTORY_LINKS_DIR, "latest_other_links.txt")
+        lines = [
+            f"OTHER ({other_domain} users only): {other_folder_link}",
+            "",
+            "Public child brand folders:",
+        ]
+        for brand_name, link in sorted((other_brand_folder_links or {}).items()):
+            lines.append(f"{brand_name}: {link}")
+        other_links_text = "\n".join(lines) + "\n"
+
+        with open(dated_other_path, "w", encoding="utf-8") as f:
+            f.write(other_links_text)
+        with open(latest_other_path, "w", encoding="utf-8") as f:
+            f.write(other_links_text)
+
+        print(f"[INFO] Wrote OTHER link list: {dated_other_path}")
+        print(f"[INFO] Updated OTHER link list: {latest_other_path}")
 
 def extract_strain_type(product_name: str):
     if not isinstance(product_name, str):
@@ -657,7 +968,8 @@ def process_file(file_path, output_directory, selected_brands):
             print(f"[INFO] Created {out_xlsx} (no brand data after filtering).")
         else:
             for brand_name, brand_data in available_data.groupby('Brand'):
-                out_xlsx = os.path.join(sub_out, f"{store_name}_{brand_name}_{today_str}.xlsx")
+                safe_brand_name = safe_report_filename_part(brand_name)
+                out_xlsx = os.path.join(sub_out, f"{store_name}_{safe_brand_name}_{today_str}.xlsx")
                 order_sections = build_brand_order_sections(
                     INPUT_DIRECTORY,
                     brand_aliases=[brand_name],
@@ -741,9 +1053,29 @@ def process_files(input_directory, output_directory, selected_brands):
 # --------------------------------- MAIN ---------------------------------------
 # ------------------------------------------------------------------------------
 
-def main():
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Build, upload, and optionally email brand inventory reports.")
+    parser.add_argument(
+        "--other-only",
+        action="store_true",
+        help="Only build/upload the OTHER folder. Skips scheduled brand folders and Gmail emails.",
+    )
+    parser.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Use the existing files/ CSV and order-report exports instead of refreshing Dutchie first.",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+
     # 1) Clear out prior catalog/order source exports from the input directory.
-    clear_old_input_exports(INPUT_DIRECTORY)
+    if args.no_refresh:
+        print("[INFO] NO REFRESH mode ON => using existing files/ exports.")
+    else:
+        clear_old_input_exports(INPUT_DIRECTORY)
 
     # 2) Determine today's day name
     today_name = datetime.datetime.now().strftime("%A")  # e.g. "Monday", "Tuesday"
@@ -759,12 +1091,18 @@ def main():
     # read top-level test_mode, test_email
     test_mode = config.get("test_mode", True)
     test_email = config.get("test_email", "anthony@barbaro.tech")
+    other_settings = load_other_folder_settings(config)
+    other_only = bool(args.other_only or config.get("other_only", False))
+    if other_only:
+        other_settings["enabled"] = True
 
     # read brand array
     brand_cfgs = config.get("brands", [])
-    if not brand_cfgs:
+    if not brand_cfgs and not other_settings.get("enabled"):
         print("[INFO] No brand definitions found in brand_config.json -> 'brands' array.")
         return
+    if not brand_cfgs:
+        print("[INFO] No brand definitions found; continuing with OTHER folder only.")
 
     # ---------------------------------------------------------------
     # 4) Build a dictionary of brand synonyms -> (folder_name, emails)
@@ -803,43 +1141,55 @@ def main():
         # For each synonym brand name, map to (folder_name, final_emails)
         for syn in synonyms:
             synonym_to_folder[syn] = (folder_name, final_emails)
+            safe_syn = safe_report_filename_part(syn)
+            synonym_to_folder[safe_syn] = (folder_name, final_emails)
 
         # We'll store folder_name -> final_emails in brand_to_emails
         brand_to_emails[folder_name] = final_emails
 
-    # If no folder_name is active, exit
-    if not brand_to_emails:
+    # If no folder_name is active and OTHER is disabled, exit.
+    if not brand_to_emails and not other_settings.get("enabled"):
         print(f"[INFO] No brands scheduled for {today_name}.")
         return
 
     # active_brands is the set of all "folder_name" keys from brand_to_emails
-    active_brands = set(brand_to_emails.keys())
+    active_brands = set() if other_only else set(brand_to_emails.keys())
 
     print(f"[INFO] Today is {today_name}, active brand folders: {active_brands}")
     if test_mode:
         print(f"[INFO] TEST MODE ON => all emails go to {test_email}")
+    if other_only:
+        print("[INFO] OTHER ONLY mode ON => scheduled brand folders and Gmail emails will be skipped.")
+    if other_settings.get("enabled"):
+        print(
+            f"[INFO] OTHER folder enabled => all brands will be uploaded under "
+            f"{other_settings['folder_name']} for {other_settings['domain']} users."
+        )
 
     # 5) Refresh source exports with Dutchie API preference and browser fallback.
     catalog_mode_used = None
     order_mode_used = None
 
-    try:
-        catalog_mode_used = refresh_catalog_exports(INPUT_DIRECTORY)
-    except FileNotFoundError as exc:
-        print(f"[WARN] {exc}. Skipping catalog refresh step.")
-    except subprocess.CalledProcessError as exc:
-        print(f"[ERROR] Catalog refresh failed: {exc}")
-    except Exception as exc:
-        print(f"[ERROR] Unexpected catalog refresh failure: {exc}")
+    if args.no_refresh:
+        print("[INFO] Source refresh skipped by --no-refresh.")
+    else:
+        try:
+            catalog_mode_used = refresh_catalog_exports(INPUT_DIRECTORY)
+        except FileNotFoundError as exc:
+            print(f"[WARN] {exc}. Skipping catalog refresh step.")
+        except subprocess.CalledProcessError as exc:
+            print(f"[ERROR] Catalog refresh failed: {exc}")
+        except Exception as exc:
+            print(f"[ERROR] Unexpected catalog refresh failure: {exc}")
 
-    try:
-        order_mode_used = refresh_inventory_order_reports(INPUT_DIRECTORY)
-    except FileNotFoundError as exc:
-        print(f"[WARN] {exc}. Skipping inventory order report refresh step.")
-    except subprocess.CalledProcessError as exc:
-        print(f"[ERROR] Inventory order report refresh failed: {exc}")
-    except Exception as exc:
-        print(f"[ERROR] Unexpected inventory order report refresh failure: {exc}")
+        try:
+            order_mode_used = refresh_inventory_order_reports(INPUT_DIRECTORY)
+        except FileNotFoundError as exc:
+            print(f"[WARN] {exc}. Skipping inventory order report refresh step.")
+        except subprocess.CalledProcessError as exc:
+            print(f"[ERROR] Inventory order report refresh failed: {exc}")
+        except Exception as exc:
+            print(f"[ERROR] Unexpected inventory order report refresh failure: {exc}")
 
     if catalog_mode_used or order_mode_used:
         print(
@@ -848,10 +1198,10 @@ def main():
         )
 
     # ----------------------------------------------------------------
-    # 6) synonyms_for_today => process CSV
-    #    We pass ALL synonyms from synonym_to_folder
+    # 6) Process CSVs.
+    #    OTHER mode needs every brand. Otherwise only scheduled config synonyms.
     # ----------------------------------------------------------------
-    synonyms_for_today = list(synonym_to_folder.keys())
+    synonyms_for_today = [] if other_settings.get("enabled") else list(synonym_to_folder.keys())
     safe_makedirs(LOCAL_REPORTS_FOLDER)
     generated_files = process_files(INPUT_DIRECTORY, LOCAL_REPORTS_FOLDER, synonyms_for_today)
 
@@ -861,64 +1211,127 @@ def main():
     
     # 7) Upload to Google Drive
     drive_service = drive_authenticate()
-    parent_folder_id = find_or_create_folder(drive_service, DRIVE_PARENT_FOLDER_NAME, parent_id=None)
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    date_folder_id = find_or_create_folder(drive_service, date_str, parent_id=parent_folder_id)
-
-    # For each folder_name in active_brands, create on Drive
     brand_folder_links = {}
-    for folder_name in active_brands:
-        brand_folder_id = find_or_create_folder(drive_service, folder_name, parent_id=date_folder_id)
-        link = f"https://drive.google.com/drive/folders/{brand_folder_id}"
-        brand_folder_links[folder_name] = link
+
+    if active_brands:
+        parent_folder_id = find_or_create_folder(
+            drive_service,
+            DRIVE_PARENT_FOLDER_NAME,
+            parent_id=None,
+            remove_public=True,
+        )
+        if not parent_folder_id:
+            print(f"[ERROR] Could not find/create Drive parent folder {DRIVE_PARENT_FOLDER_NAME}.")
+            return
+
+        date_folder_id = find_or_create_folder(
+            drive_service,
+            date_str,
+            parent_id=parent_folder_id,
+            remove_public=True,
+        )
+        if not date_folder_id:
+            print(f"[ERROR] Could not find/create Drive date folder {date_str}.")
+            return
+
+        # For each folder_name in active_brands, create on Drive
+        for folder_name in active_brands:
+            brand_folder_id = find_or_create_folder(
+                drive_service,
+                folder_name,
+                parent_id=date_folder_id,
+                make_public=True,
+            )
+            if not brand_folder_id:
+                print(f"[ERROR] Could not create/find Drive folder for {folder_name}.")
+                continue
+            link = drive_folder_link(brand_folder_id)
+            brand_folder_links[folder_name] = link
+
+        # Now, parse brand from each generated XLSX => find folder_name => upload
+        for file_path in generated_files:
+            filename = os.path.basename(file_path)
+            brand_syn = parse_brand_from_report_filename(filename)
+            if not brand_syn:
+                print(f"[WARN] Cannot parse brand from {filename}, skipping.")
+                continue
+
+            if brand_syn not in synonym_to_folder:
+                print(f"[WARN] brand '{brand_syn}' not recognized. Skipping.")
+                continue
+
+            folder_name, _ = synonym_to_folder[brand_syn]
+            if folder_name not in active_brands:
+                continue
+
+            # Reuse folder ID from earlier lookup.
+            if folder_name in brand_folder_links:
+                brand_folder_id = brand_folder_links[folder_name].split("/")[-1]
+            else:
+                print(f"[ERROR] Missing folder ID for {folder_name}, skipping upload.")
+                continue
+
+            try:
+                upload_file_to_drive(drive_service, file_path, brand_folder_id)
+                print(f"[UPLOAD] {filename} uploaded to {folder_name}")
+                time.sleep(0.2)  # Google API throttle protection
+            except Exception as e:
+                print(f"[ERROR] Failed to upload {filename} to {folder_name}: {e}")
+
+    other_folder_link = None
+    other_brand_folder_links = {}
+    if other_settings.get("enabled"):
+        other_parent_folder_name = other_settings.get("parent_folder_name", DRIVE_OTHER_PARENT_FOLDER_NAME)
+        other_parent_folder_id = find_or_create_folder(
+            drive_service,
+            other_parent_folder_name,
+            parent_id=None,
+            remove_public=True,
+        )
+        if not other_parent_folder_id:
+            print(f"[ERROR] Could not find/create Drive parent folder {other_parent_folder_name}.")
+            return
+
+        other_date_folder_id = find_or_create_folder(
+            drive_service,
+            date_str,
+            parent_id=other_parent_folder_id,
+            remove_public=True,
+        )
+        if not other_date_folder_id:
+            print(f"[ERROR] Could not find/create Drive date folder {date_str} under {other_parent_folder_name}.")
+            return
+
+        other_folder_link, other_brand_folder_links = upload_other_brand_reports_to_drive(
+            drive_service,
+            generated_files,
+            other_date_folder_id,
+            other_settings,
+        )
+        if other_folder_link:
+            print(
+                f"[INFO] OTHER folder link ({other_settings['domain']} only): "
+                f"{other_folder_link}"
+            )
 
     write_inventory_link_manifest(
         date_str=date_str,
         today_name=today_name,
         brand_folder_links=brand_folder_links,
         brand_to_emails=brand_to_emails,
+        other_folder_link=other_folder_link,
+        other_brand_folder_links=other_brand_folder_links,
+        other_folder_name=other_settings.get("folder_name", DEFAULT_OTHER_FOLDER_NAME),
+        other_domain=other_settings.get("domain", DEFAULT_OTHER_FOLDER_DOMAIN),
+        other_parent_folder_name=other_settings.get("parent_folder_name", DRIVE_OTHER_PARENT_FOLDER_NAME),
     )
-
-    # Now, parse brand from each generated XLSX => find folder_name => upload
-    brand_pattern = re.compile(r"^(.*?)_(.*?)_(\d{2}-\d{2}-\d{4})\.xlsx$", re.IGNORECASE)
-
-    import time
-
-    for file_path in generated_files:
-        filename = os.path.basename(file_path)
-        m = brand_pattern.match(filename)
-        if not m:
-            print(f"[WARN] Cannot parse brand from {filename}, skipping.")
-            continue
-
-        store_part, brand_syn, _ = m.groups()
-
-        if brand_syn not in synonym_to_folder:
-            print(f"[WARN] brand '{brand_syn}' not recognized. Skipping.")
-            continue
-
-        folder_name, _ = synonym_to_folder[brand_syn]
-        if folder_name not in active_brands:
-            continue
-
-        # ✅ Reuse folder ID from earlier lookup
-        if folder_name in brand_folder_links:
-            brand_folder_id = brand_folder_links[folder_name].split("/")[-1]
-        else:
-            print(f"[ERROR] Missing folder ID for {folder_name}, skipping upload.")
-            continue
-
-        try:
-            upload_file_to_drive(drive_service, file_path, brand_folder_id)
-            print(f"[UPLOAD ✅] {filename} uploaded to {folder_name}")
-            time.sleep(0.2)  # Google API throttle protection
-        except Exception as e:
-            print(f"[ERROR] Failed to upload {filename} → {folder_name}: {e}")
 
     # 8) Email out the folder link
     # Group by unique sets of emails
     email_groups = {}
-    for folder_name, email_list in brand_to_emails.items():
+    email_source = {} if other_only else brand_to_emails
+    for folder_name, email_list in email_source.items():
         email_key = frozenset(email_list)
         if email_key not in email_groups:
             email_groups[email_key] = []
@@ -944,15 +1357,21 @@ def main():
                 brand_lines.append(f"<p>No link found for {f_name}</p>")
 
         brand_html = "\n".join(brand_lines)
-        subject = f"Brand Inventory Reports for {today_name} – {', '.join(folder_list)}"
+        other_intro_html = build_other_folder_email_intro(
+            other_folder_link=other_folder_link,
+            other_folder_name=other_settings.get("folder_name", DEFAULT_OTHER_FOLDER_NAME),
+            other_domain=other_settings.get("domain", DEFAULT_OTHER_FOLDER_DOMAIN),
+        )
+        subject = build_inventory_email_subject(today_name)
         html_body = f"""
         <html>
         <body>
           <p>Hello,</p>
           <p>Below are your brand inventory reports for <strong>{today_name}</strong>.</p>
+          {other_intro_html}
           {order_note}
           {brand_html}
-          <p>All files in that Drive folder are viewable by anyone with the link.</p>
+          <p>All files in the listed brand folders are viewable by anyone with the link.</p>
           <p>Regards,<br>Buzz Cannabis</p>
         </body>
         </html>

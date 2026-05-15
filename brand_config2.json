@@ -1,6 +1,12 @@
 {
   "test_mode": true,
   "test_email": "donna@buzzcannabis.com",
+  "other_folder": {
+    "enabled": true,
+    "parent_folder_name": "INVENTORY_OTHER",
+    "folder_name": "OTHER",
+    "domain": "buzzcannabis.com"
+  },
   "brands": [
     {
       "brand_synonyms": ["Almora Farm", "Heavy Hitters", "Beard Brothers", "Lift Tickets", "Papa & Barkley (P&B)"],
