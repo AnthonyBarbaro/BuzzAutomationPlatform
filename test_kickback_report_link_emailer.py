@@ -6,6 +6,8 @@ from kickback_report_link_emailer import (
     _extract_folder_id,
     _file_matches_brand,
     build_email_bodies,
+    filter_reports_by_date_ranges,
+    parse_date_range_text,
 )
 
 
@@ -59,6 +61,44 @@ class KickbackReportLinkEmailerTests(unittest.TestCase):
         self.assertIn("2026_Kickback", html_body)
         self.assertIn("2025_Kickback", html_body)
         self.assertIn("Support", html_body)
+
+    def test_parse_date_range_text_uses_default_year(self):
+        self.assertEqual(
+            parse_date_range_text("4/26-5/02", 2026),
+            (datetime(2026, 4, 26).date(), datetime(2026, 5, 2).date()),
+        )
+
+    def test_date_range_filter_matches_retail_week_to_drive_folder_offset(self):
+        matches = [
+            ReportMatch(
+                root_key="2026",
+                root_label="2026_Kickback",
+                folder_path=("04-27 to 05-03",),
+                file_name="KANHA_report_2026-04-30_to_2026-05-03.xlsx",
+                file_id="kanha-week",
+                web_view_link="https://drive.google.com/file/d/kanha-week/view",
+                start_date=datetime(2026, 4, 30),
+                end_date=datetime(2026, 5, 3),
+            ),
+            ReportMatch(
+                root_key="2026",
+                root_label="2026_Kickback",
+                folder_path=("05-04 to 05-10",),
+                file_name="KANHA_report_2026-05-07_to_2026-05-10.xlsx",
+                file_id="next-week",
+                web_view_link="https://drive.google.com/file/d/next-week/view",
+                start_date=datetime(2026, 5, 7),
+                end_date=datetime(2026, 5, 10),
+            ),
+        ]
+
+        selected, missing = filter_reports_by_date_ranges(
+            matches,
+            [parse_date_range_text("4/26-5/02", 2026)],
+        )
+
+        self.assertEqual(missing, [])
+        self.assertEqual([match.file_id for match in selected], ["kanha-week"])
 
 
 if __name__ == "__main__":

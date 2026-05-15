@@ -5,7 +5,7 @@ import html
 import re
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -93,6 +93,102 @@ def _parse_report_dates(file_name: str) -> tuple[datetime | None, datetime | Non
         )
     except ValueError:
         return None, None
+
+
+def _parse_date_token(text: str, default_year: int) -> date:
+    value = str(text or "").strip()
+    if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
+        year_text, month_text, day_text = value.split("-")
+        return date(int(year_text), int(month_text), int(day_text))
+
+    match = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})", value)
+    if match:
+        month_text, day_text = match.groups()
+        return date(default_year, int(month_text), int(day_text))
+
+    raise ValueError(f"Could not parse date token: {text!r}")
+
+
+def parse_date_range_text(text: str, default_year: int) -> tuple[date, date]:
+    tokens = re.findall(r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}", str(text or ""))
+    if len(tokens) < 2:
+        raise ValueError(f"Date range must include a start and end date: {text!r}")
+
+    start_day = _parse_date_token(tokens[0], default_year)
+    end_day = _parse_date_token(tokens[1], default_year)
+    if end_day < start_day:
+        end_day = end_day.replace(year=end_day.year + 1)
+    return start_day, end_day
+
+
+def _format_date_range(window: tuple[date, date]) -> str:
+    return f"{window[0].isoformat()} to {window[1].isoformat()}"
+
+
+def _parse_folder_date_range(match: ReportMatch) -> tuple[date, date] | None:
+    for folder_name in reversed(match.folder_path):
+        tokens = re.findall(r"\d{1,2}[/-]\d{1,2}", folder_name)
+        if len(tokens) < 2:
+            continue
+        try:
+            start_day = _parse_date_token(tokens[0], int(match.root_key))
+            end_day = _parse_date_token(tokens[1], int(match.root_key))
+        except ValueError:
+            continue
+        if end_day < start_day:
+            if start_day.month == 12 and end_day.month == 1:
+                start_day = start_day.replace(year=start_day.year - 1)
+            else:
+                end_day = end_day.replace(year=end_day.year + 1)
+        return start_day, end_day
+    return None
+
+
+def _report_date_windows(match: ReportMatch) -> list[tuple[date, date]]:
+    windows: list[tuple[date, date]] = []
+    if match.start_date and match.end_date:
+        windows.append((match.start_date.date(), match.end_date.date()))
+
+    folder_window = _parse_folder_date_range(match)
+    if folder_window:
+        windows.append(folder_window)
+        windows.append((folder_window[0] - timedelta(days=1), folder_window[1] - timedelta(days=1)))
+
+    deduped = []
+    seen = set()
+    for window in windows:
+        if window in seen:
+            continue
+        seen.add(window)
+        deduped.append(window)
+    return deduped
+
+
+def filter_reports_by_date_ranges(
+    matches: Sequence[ReportMatch],
+    date_ranges: Sequence[tuple[date, date]],
+) -> tuple[list[ReportMatch], list[tuple[date, date]]]:
+    selected: list[ReportMatch] = []
+    missing: list[tuple[date, date]] = []
+    seen_file_ids = set()
+
+    for target_range in date_ranges:
+        target_matches = [
+            match
+            for match in matches
+            if target_range in _report_date_windows(match)
+        ]
+        if not target_matches:
+            missing.append(target_range)
+            continue
+
+        for match in sorted(target_matches, key=_report_sort_key):
+            if match.file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(match.file_id)
+            selected.append(match)
+
+    return selected, missing
 
 
 def _report_sort_key(match: ReportMatch) -> tuple:
@@ -218,18 +314,32 @@ def find_brand_reports(service, brand_query: str, years: Sequence[str]) -> list[
     return sorted(matches, key=_report_sort_key)
 
 
-def build_email_bodies(brand_query: str, matches: Sequence[ReportMatch], support_line: str) -> tuple[str, str]:
+def build_email_bodies(
+    brand_query: str,
+    matches: Sequence[ReportMatch],
+    support_line: str,
+    requested_date_ranges: Sequence[tuple[date, date]] | None = None,
+) -> tuple[str, str]:
     safe_brand = html.escape(brand_query)
     count = len(matches)
+    date_note_html = ""
+    date_note_text = ""
+    if requested_date_ranges:
+        ranges_text = ", ".join(_format_date_range(window) for window in requested_date_ranges)
+        date_note_html = f"<p>Requested date windows: {html.escape(ranges_text)}.</p>"
+        date_note_text = f"Requested date windows: {ranges_text}.\n"
+
     intro_html = (
         f"<p>Hello,</p>"
         f"<p>I searched the 2026 and 2025 kickback Drive folders for "
         f"<strong>{safe_brand}</strong> and found <strong>{count}</strong> matching report(s).</p>"
+        f"{date_note_html}"
     )
     intro_text = (
         f"Hello,\n\n"
         f"I searched the 2026 and 2025 kickback Drive folders for {brand_query} "
         f"and found {count} matching report(s).\n"
+        f"{date_note_text}"
     )
 
     if not matches:
@@ -319,6 +429,21 @@ def parse_args() -> argparse.Namespace:
         help="Preview the email body in the terminal without sending.",
     )
     parser.add_argument(
+        "--date-range",
+        action="append",
+        default=[],
+        help=(
+            "Only include reports matching this date window. Accepts MM/DD-MM/DD "
+            "or YYYY-MM-DD to YYYY-MM-DD. Repeat for multiple windows."
+        ),
+    )
+    parser.add_argument(
+        "--default-year",
+        type=int,
+        default=datetime.now().year,
+        help="Year used for MM/DD date ranges (default: current year).",
+    )
+    parser.add_argument(
         "--support-line",
         default=DEFAULT_SUPPORT_LINE,
         help="Support/contact text appended at the end of the email.",
@@ -354,9 +479,32 @@ def main() -> int:
 
     drive_service = _build_drive_service()
     matches = find_brand_reports(drive_service, brand, years)
-    text_body, html_body = build_email_bodies(brand, matches, args.support_line)
+    requested_date_ranges = [
+        parse_date_range_text(value, args.default_year)
+        for value in args.date_range
+    ]
+    missing_date_ranges = []
+    if requested_date_ranges:
+        matches, missing_date_ranges = filter_reports_by_date_ranges(matches, requested_date_ranges)
+
+    text_body, html_body = build_email_bodies(
+        brand,
+        matches,
+        args.support_line,
+        requested_date_ranges=requested_date_ranges,
+    )
 
     print(f"[INFO] Found {len(matches)} matching report(s) for {brand}.")
+    if requested_date_ranges:
+        print("[INFO] Requested date range filter:")
+        for window in requested_date_ranges:
+            print(f"- {_format_date_range(window)}")
+    if missing_date_ranges:
+        print("[ERROR] No report matched these requested date range(s):")
+        for window in missing_date_ranges:
+            print(f"- {_format_date_range(window)}")
+        return 1
+
     for match in matches:
         folder_label = " / ".join(match.folder_path) if match.folder_path else match.root_label
         print(f"- {match.root_label} | {folder_label} | {match.file_name}")
