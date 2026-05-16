@@ -89,6 +89,81 @@ class OwnerSnapshotForecastTests(unittest.TestCase):
         store_net = float(hist[hist["store_code"] != "ALL"]["net_revenue"].sum())
         self.assertAlmostEqual(all_net, store_net)
 
+    def test_robust_weekday_average_ignores_far_outlier(self):
+        self.assertAlmostEqual(
+            osnap._robust_forecast_average([12000.0, 12000.0, 20000.0, 12000.0]),
+            12000.0,
+        )
+
+    def test_weekday_calendar_prediction_counts_remaining_month_weekdays(self):
+        net_by_wd = {
+            0: 11000.0,
+            1: 12000.0,
+            2: 13000.0,
+            3: 17000.0,
+            4: 15000.0,
+            5: 18000.0,
+            6: 14000.0,
+        }
+        rows = []
+        cur = date(2026, 3, 1)
+        while cur <= date(2026, 5, 10):
+            net = net_by_wd[cur.weekday()]
+            if cur == date(2026, 4, 7):  # Tuesday spike; normal Tuesday is 12k
+                net = 20000.0
+            rows.append({
+                "date": cur,
+                "net_revenue": net,
+                "gross_sales": net * 1.08,
+                "tickets": 100.0,
+                "items": 200.0,
+                "discount": net * 0.08,
+                "profit": net * 0.40,
+            })
+            cur += timedelta(days=1)
+
+        hist = osnap._daily_to_history_rows("MV", osnap.pd.DataFrame(rows))
+        fc = osnap._weekday_profile_baseline(hist, "MV", date(2026, 5, 10))
+
+        may_mtd = sum(
+            row["net_revenue"]
+            for row in rows
+            if date(2026, 5, 1) <= row["date"] <= date(2026, 5, 10)
+        )
+        expected_remaining = 0.0
+        cur = date(2026, 5, 11)
+        while cur <= date(2026, 5, 31):
+            expected_remaining += net_by_wd[cur.weekday()]
+            cur += timedelta(days=1)
+
+        self.assertAlmostEqual(fc["net_pred"], may_mtd + expected_remaining, delta=1.0)
+
+    def test_smart_baseline_scales_current_month_run_rate(self):
+        rows = []
+        for start, days, daily_net in [
+            (date(2026, 3, 1), 31, 1000.0),
+            (date(2026, 4, 1), 30, 1000.0),
+            (date(2026, 5, 1), 10, 2000.0),
+        ]:
+            for i in range(days):
+                d = start + timedelta(days=i)
+                rows.append({
+                    "date": d,
+                    "net_revenue": daily_net,
+                    "gross_sales": daily_net * 1.08,
+                    "tickets": 100.0,
+                    "items": 200.0,
+                    "discount": daily_net * 0.08,
+                    "profit": daily_net * 0.40,
+                })
+
+        hist = osnap._daily_to_history_rows("MV", osnap.pd.DataFrame(rows))
+        fc = osnap._smart_month_end_baseline(hist, "MV", date(2026, 5, 10))
+
+        self.assertGreater(fc["net_pred"], 20000.0)
+        self.assertGreater(fc["net_pred"], 55000.0)
+        self.assertLess(fc["net_pred"], 63000.0)
+
     def test_partial_pipeline_does_not_predict_all(self):
         bundle = osnap.run_month_end_forecast_pipeline(
             {"MV": _daily_frame(date(2026, 5, 1), 10)},
@@ -136,7 +211,7 @@ class OwnerSnapshotForecastTests(unittest.TestCase):
         summary.loc[summary["model_key"] == "ml", "mape"] = 0.089
         self.assertTrue(osnap.forecast_ml_beats_baseline(summary, "MV", date(2026, 5, 10)))
 
-    def test_forecast_range_uses_backtest_band_and_clamps_to_mtd(self):
+    def test_single_point_forecast_keeps_backtest_error_and_clamps_to_mtd(self):
         fc = {
             "store_code": "MV",
             "as_of": "2026-05-10",
@@ -171,10 +246,13 @@ class OwnerSnapshotForecastTests(unittest.TestCase):
 
         ranged = osnap.apply_backtest_forecast_range(fc, summary)
 
-        self.assertEqual(ranged["net_pred_low"], 95.0)
-        self.assertEqual(ranged["net_pred_high"], 120.0)
-        self.assertEqual(ranged["remaining_net_low"], 0.0)
-        self.assertEqual(ranged["remaining_net_high"], 25.0)
+        self.assertEqual(ranged["net_pred"], 100.0)
+        self.assertEqual(ranged["net_pred_low"], 100.0)
+        self.assertEqual(ranged["net_pred_high"], 100.0)
+        self.assertEqual(ranged["remaining_net_low"], 5.0)
+        self.assertEqual(ranged["remaining_net_high"], 5.0)
+        self.assertEqual(ranged["range_source"], "single_point")
+        self.assertAlmostEqual(ranged["backtest_net_mape"], 0.10)
 
     def test_forecast_backtest_cli_writes_csv_outputs(self):
         hist = osnap._daily_to_history_rows("MV", _daily_frame(date(2026, 1, 1), 31))

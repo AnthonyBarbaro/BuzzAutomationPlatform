@@ -205,13 +205,18 @@ FORECAST_MONTH_COVERAGE_THRESHOLD = 0.90   # month must have >= 90% days to be "
 FORECAST_MIN_COMPLETE_MONTHS = 2           # minimum complete months before ML trains
 FORECAST_RETRAIN_EVERY_RUN = True          # simplest "keeps learning" behavior
 
-# Baseline fallback (also used for features)
-FORECAST_WEEKDAY_WINDOW_DAYS = 56          # last 8 weeks weekday profile
+# Robust weekday calendar baseline (also used for features)
+FORECAST_WEEKDAY_WINDOW_DAYS = 112         # last 16 weeks weekday profile
+FORECAST_WEEKDAY_LONG_WINDOW_DAYS = 224    # deeper same-weekday fallback
+FORECAST_OUTLIER_MAD_MULTIPLIER = 2.75     # filters days far from same-weekday median
+FORECAST_OUTLIER_RELATIVE_BAND = 0.28      # used when same-weekday values cluster tightly
+FORECAST_WEEKDAY_MIN_CLEAN_SAMPLES = 2
+FORECAST_CURVE_MIN_COMPLETE_MONTHS = 2
 
-# If sklearn is available, also train P10/P90 bands for net & profit
-FORECAST_USE_QUANTILES = True
+# Single point forecast only; no displayed ranges or quantile bands
+FORECAST_USE_QUANTILES = False
 
-# Live forecast selection/range rules
+# Live forecast selection/backtest metadata rules
 FORECAST_ML_NET_IMPROVEMENT_THRESHOLD = 0.10
 FORECAST_MIN_BACKTEST_ROWS_FOR_RANGE = 3
 FORECAST_MIN_BACKTEST_ROWS_FOR_ML_GATE = 5
@@ -402,18 +407,10 @@ def money_range(low: Any, high: Any, fallback: Any = 0.0) -> str:
     return f"{money(lo)} - {money(hi)}"
 
 def forecast_money_range(fc: Dict[str, Any], metric: str) -> str:
-    return money_range(
-        fc.get(f"{metric}_pred_low", fc.get(f"{metric}_pred", 0.0)),
-        fc.get(f"{metric}_pred_high", fc.get(f"{metric}_pred", 0.0)),
-        fc.get(f"{metric}_pred", 0.0),
-    )
+    return money(fc.get(f"{metric}_pred", 0.0))
 
 def forecast_remaining_money_range(fc: Dict[str, Any], metric: str) -> str:
-    return money_range(
-        fc.get(f"remaining_{metric}_low", fc.get(f"remaining_{metric}", 0.0)),
-        fc.get(f"remaining_{metric}_high", fc.get(f"remaining_{metric}", 0.0)),
-        fc.get(f"remaining_{metric}", 0.0),
-    )
+    return money(fc.get(f"remaining_{metric}", 0.0))
 
 def forecast_backtest_error_label(fc: Dict[str, Any]) -> str:
     mape = fc.get("backtest_net_mape")
@@ -436,7 +433,7 @@ def forecast_backtest_short_label(fc: Dict[str, Any]) -> str:
         return "n/a"
 
 def forecast_method_label(fc: Dict[str, Any]) -> str:
-    return "ML + pace" if str(fc.get("model_key", "")).lower() == "ml" else "Weekday pace"
+    return "ML + smart" if str(fc.get("model_key", "")).lower() == "ml" else "Smart forecast"
 
 def pct1(x: float) -> str:
     try:
@@ -1005,6 +1002,123 @@ def _weekday_counts(start_d: date, end_d: date) -> Dict[str, int]:
         cur += timedelta(days=1)
     return out
 
+FORECAST_METRIC_COLS = {
+    "net": "net_revenue",
+    "profit": "profit",
+    "tickets": "tickets",
+    "discount": "discount",
+}
+
+def _robust_forecast_stats(values: Any) -> Dict[str, float]:
+    """
+    Return a cleaned average anchored to the median.
+    A same-weekday spike gets ignored when it is far away from the normal cluster.
+    """
+    if values is None:
+        return {"value": 0.0, "n": 0, "clean_n": 0, "outliers": 0}
+
+    s = pd.Series(values, dtype="float64").replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return {"value": 0.0, "n": 0, "clean_n": 0, "outliers": 0}
+
+    arr = s.astype(float).to_numpy()
+    median = float(np.median(arr))
+    clean = arr
+
+    if arr.size >= 3:
+        deviations = np.abs(arr - median)
+        mad = float(np.median(deviations))
+        if mad > 1e-9:
+            limit = FORECAST_OUTLIER_MAD_MULTIPLIER * 1.4826 * mad
+        else:
+            base = max(abs(median), 1.0)
+            limit = base * FORECAST_OUTLIER_RELATIVE_BAND
+
+        mask = deviations <= max(limit, 1e-9)
+        min_clean = min(arr.size, max(FORECAST_WEEKDAY_MIN_CLEAN_SAMPLES, 1))
+        if int(mask.sum()) >= min_clean:
+            clean = arr[mask]
+
+    if clean.size >= 5:
+        lo, hi = np.quantile(clean, [0.10, 0.90])
+        trimmed = clean[(clean >= lo) & (clean <= hi)]
+        if trimmed.size >= 3:
+            clean = trimmed
+
+    if clean.size <= 2:
+        value = float(np.median(clean))
+    else:
+        value = float(np.mean(clean))
+
+    return {
+        "value": value,
+        "n": int(arr.size),
+        "clean_n": int(clean.size),
+        "outliers": int(arr.size - clean.size),
+    }
+
+def _robust_forecast_average(values: Any) -> float:
+    return float(_robust_forecast_stats(values).get("value", 0.0) or 0.0)
+
+def _robust_weighted_forecast_average(values: List[float], weights: List[float]) -> float:
+    if not values:
+        return 0.0
+
+    v = np.array(values, dtype=float)
+    w = np.array(weights if weights and len(weights) == len(values) else [1.0] * len(values), dtype=float)
+    mask = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    v = v[mask]
+    w = w[mask]
+    if v.size == 0:
+        return 0.0
+
+    if v.size >= 3:
+        median = float(np.median(v))
+        deviations = np.abs(v - median)
+        mad = float(np.median(deviations))
+        if mad > 1e-9:
+            limit = FORECAST_OUTLIER_MAD_MULTIPLIER * 1.4826 * mad
+        else:
+            limit = max(abs(median), 1.0) * FORECAST_OUTLIER_RELATIVE_BAND
+        keep = deviations <= max(limit, 1e-9)
+        if int(keep.sum()) >= min(v.size, max(FORECAST_WEEKDAY_MIN_CLEAN_SAMPLES, 1)):
+            v = v[keep]
+            w = w[keep]
+
+    if v.size == 1:
+        return float(v[0])
+    return float(np.average(v, weights=np.maximum(w, 1e-9)))
+
+def _coerce_forecast_history(hist: pd.DataFrame) -> pd.DataFrame:
+    if hist is None or hist.empty:
+        hist = pd.DataFrame(columns=["store_code"] + _history_keep_cols())
+
+    work = hist.copy()
+    if "date" in work.columns:
+        work["date"] = _normalize_dt(work["date"])
+    else:
+        work["date"] = pd.NaT
+    if "store_code" not in work.columns:
+        work["store_code"] = ""
+    work["store_code"] = work["store_code"].fillna("").astype(str)
+
+    for col in set(_history_keep_cols()) - {"date"}:
+        if col not in work.columns:
+            work[col] = 0.0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+
+    return work.dropna(subset=["date"]).copy()
+
+def _forecast_mtd_sums(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, float]:
+    store = str(store_code)
+    mtd_start = pd.Timestamp(date(as_of.year, as_of.month, 1))
+    as_of_ts = pd.Timestamp(as_of)
+    h = hist[(hist["store_code"] == store) & (hist["date"] >= mtd_start) & (hist["date"] <= as_of_ts)]
+    return {
+        metric: float(h[col].sum()) if col in h.columns and not h.empty else 0.0
+        for metric, col in FORECAST_METRIC_COLS.items()
+    }
+
 def _build_asof_features(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, Any]:
     """
     Build a single feature row for a given store + "as-of" date.
@@ -1083,14 +1197,11 @@ def _build_asof_features(hist: pd.DataFrame, store_code: str, as_of: date) -> Di
     if winW is not None and not winW.empty:
         tmp = winW.copy()
         tmp["wd"] = tmp["date"].dt.weekday
-        g = tmp.groupby("wd").agg(
-            net=("net_revenue", "mean"),
-            profit=("profit", "mean"),
-        )
         for i in range(7):
-            if i in g.index:
-                weekday_avg_net[i] = float(g.loc[i, "net"])
-                weekday_avg_profit[i] = float(g.loc[i, "profit"])
+            wd_rows = tmp[tmp["wd"] == i]
+            if not wd_rows.empty:
+                weekday_avg_net[i] = _robust_forecast_average(wd_rows["net_revenue"])
+                weekday_avg_profit[i] = _robust_forecast_average(wd_rows["profit"])
 
     # Remaining weekday counts (calendar factor)
     rem_counts = _weekday_counts(as_of + timedelta(days=1), last_dom)
@@ -1297,16 +1408,32 @@ def _try_import_sklearn():
 
 def _weekday_profile_baseline(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, float]:
     """
-    Data-driven projection anchored to available daily data.
-    Prioritizes MTD weekday behavior, then recent trend, then wider weekday profile.
+    Robust calendar projection:
+    actual MTD + cleaned average for each remaining weekday in the month.
+
+    Same-weekday spikes that sit far from the median are filtered before averaging,
+    so one unusually large Tuesday does not become the Tuesday forecast.
     """
     as_of_ts = pd.Timestamp(as_of)
     last_dom = _last_day_of_month(as_of)
     store = str(store_code)
-    days_in_month = last_dom.day
-    days_elapsed = max(as_of.day, 1)
 
-    h = hist[(hist["store_code"] == store) & (hist["date"] <= as_of_ts)].copy().sort_values("date")
+    if hist is None or hist.empty:
+        hist = pd.DataFrame(columns=["store_code"] + _history_keep_cols())
+
+    work = hist.copy()
+    if "date" in work.columns:
+        work["date"] = _normalize_dt(work["date"])
+    if "store_code" not in work.columns:
+        work["store_code"] = ""
+    work["store_code"] = work["store_code"].fillna("").astype(str)
+
+    for col in FORECAST_METRIC_COLS.values():
+        if col not in work.columns:
+            work[col] = 0.0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+
+    h = work[(work["store_code"] == store) & (work["date"] <= as_of_ts)].copy().sort_values("date")
     mtd_start = pd.Timestamp(date(as_of.year, as_of.month, 1))
     mtd = h[h["date"] >= mtd_start].copy()
 
@@ -1323,69 +1450,74 @@ def _weekday_profile_baseline(hist: pd.DataFrame, store_code: str, as_of: date) 
             "discount_pred": mtd_discount,
         }
 
-    recent = h[h["date"] >= (as_of_ts - pd.Timedelta(days=13))].copy()
-    profile = h[h["date"] >= (as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_WINDOW_DAYS - 1))].copy()
+    h["wd"] = h["date"].dt.weekday
+    mtd["wd"] = mtd["date"].dt.weekday
 
-    def _weekday_means(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
-        tmp = df.copy()
-        tmp["wd"] = tmp["date"].dt.weekday
-        return tmp.groupby("wd").agg(
-            net=("net_revenue", "mean"),
-            profit=("profit", "mean"),
-            tickets=("tickets", "mean"),
-            discount=("discount", "mean"),
-        )
+    prior = h[h["date"] < mtd_start].copy()
+    recent_prior = prior[prior["date"] >= (as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_WINDOW_DAYS - 1))].copy()
+    long_prior = prior[prior["date"] >= (as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_LONG_WINDOW_DAYS - 1))].copy()
+    recent_all = h[h["date"] >= (as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_WINDOW_DAYS - 1))].copy()
 
-    wd_mtd = _weekday_means(mtd)
-    wd_recent = _weekday_means(recent)
-    wd_profile = _weekday_means(profile)
+    def _metric_fallback(metric_key: str) -> float:
+        col = FORECAST_METRIC_COLS[metric_key]
+        for source in (recent_prior, long_prior, prior, recent_all, mtd, h):
+            if source is not None and not source.empty:
+                stats = _robust_forecast_stats(source[col])
+                if int(stats.get("clean_n", 0)) > 0:
+                    return float(stats["value"])
+        return 0.0
 
-    mtd_obs_days = int(mtd["date"].nunique()) if not mtd.empty else 0
-    recent_obs_days = int(recent["date"].nunique()) if not recent.empty else 0
-    profile_obs_days = int(profile["date"].nunique()) if not profile.empty else 0
+    fallback = {metric: _metric_fallback(metric) for metric in FORECAST_METRIC_COLS}
 
-    mtd_avg = {
-        "net": (mtd_net / mtd_obs_days) if mtd_obs_days else 0.0,
-        "profit": (mtd_profit / mtd_obs_days) if mtd_obs_days else 0.0,
-        "tickets": (mtd_tickets / mtd_obs_days) if mtd_obs_days else 0.0,
-        "discount": (mtd_discount / mtd_obs_days) if mtd_obs_days else 0.0,
-    }
-    recent_avg = {
-        "net": (float(recent["net_revenue"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
-        "profit": (float(recent["profit"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
-        "tickets": (float(recent["tickets"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
-        "discount": (float(recent["discount"].sum()) / recent_obs_days) if recent_obs_days else 0.0,
-    }
-    profile_avg = {
-        "net": (float(profile["net_revenue"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
-        "profit": (float(profile["profit"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
-        "tickets": (float(profile["tickets"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
-        "discount": (float(profile["discount"].sum()) / profile_obs_days) if profile_obs_days else 0.0,
-    }
+    def _source_weekday_value(source: pd.DataFrame, metric_key: str, wd: int) -> Optional[Dict[str, float]]:
+        if source is None or source.empty:
+            return None
+        col = FORECAST_METRIC_COLS[metric_key]
+        vals = source.loc[source["wd"] == wd, col]
+        stats = _robust_forecast_stats(vals)
+        if int(stats.get("clean_n", 0)) <= 0:
+            return None
+        return stats
+
+    def _add_candidate(
+        candidates: List[Tuple[float, float]],
+        source: pd.DataFrame,
+        metric_key: str,
+        wd: int,
+        base_weight: float,
+    ) -> None:
+        stats = _source_weekday_value(source, metric_key, wd)
+        if not stats:
+            return
+        clean_n = int(stats.get("clean_n", 0))
+        confidence = min(1.0, clean_n / 4.0)
+        weight = float(base_weight) * confidence
+        if weight > 0:
+            candidates.append((float(stats["value"]), weight))
 
     def _pick_metric_for_weekday(metric_key: str, wd: int) -> float:
-        vals: List[Tuple[float, float]] = []
-        if wd in wd_mtd.index:
-            w = 0.58 if mtd_obs_days >= 7 else 0.40
-            vals.append((float(wd_mtd.loc[wd, metric_key]), w))
-        if wd in wd_recent.index:
-            vals.append((float(wd_recent.loc[wd, metric_key]), 0.24))
-        if wd in wd_profile.index:
-            vals.append((float(wd_profile.loc[wd, metric_key]), 0.18))
+        candidates: List[Tuple[float, float]] = []
 
-        if vals:
-            w_sum = sum(w for _, w in vals)
-            if w_sum > 0:
-                return sum(v * w for v, w in vals) / w_sum
+        mtd_stats = _source_weekday_value(mtd, metric_key, wd)
+        if mtd_stats:
+            mtd_clean = int(mtd_stats.get("clean_n", 0))
+            mtd_weight = 0.50 if mtd_clean >= 2 else 0.18
+            candidates.append((float(mtd_stats["value"]), mtd_weight * min(1.0, max(mtd_clean, 1) / 4.0)))
 
-        # Fallback to observed daily averages.
-        if recent_obs_days:
-            return recent_avg[metric_key]
-        if mtd_obs_days:
-            return mtd_avg[metric_key]
-        return profile_avg[metric_key]
+        _add_candidate(candidates, recent_prior, metric_key, wd, 0.62)
+        _add_candidate(candidates, long_prior, metric_key, wd, 0.28)
+        _add_candidate(candidates, prior, metric_key, wd, 0.10)
+
+        if not candidates:
+            _add_candidate(candidates, recent_all, metric_key, wd, 0.80)
+            _add_candidate(candidates, h, metric_key, wd, 0.20)
+
+        if candidates:
+            weight_sum = sum(weight for _, weight in candidates)
+            if weight_sum > 0:
+                return float(sum(value * weight for value, weight in candidates) / weight_sum)
+
+        return float(fallback.get(metric_key, 0.0))
 
     # remaining dates
     rem_net = rem_profit = rem_tickets = rem_discount = 0.0
@@ -1398,41 +1530,226 @@ def _weekday_profile_baseline(hist: pd.DataFrame, store_code: str, as_of: date) 
         rem_discount += _pick_metric_for_weekday("discount", wd)
         cur += timedelta(days=1)
 
-    # Trend adjustment from MTD acceleration/deceleration (bounded).
-    trend_factor = 1.0
-    if mtd_obs_days >= 10:
-        mtd_sorted = mtd.sort_values("date")
-        last7 = mtd_sorted.tail(7)
-        prev7 = mtd_sorted.iloc[-14:-7]
-        prev_avg_net = float(prev7["net_revenue"].mean()) if not prev7.empty else 0.0
-        last_avg_net = float(last7["net_revenue"].mean()) if not last7.empty else 0.0
-        if prev_avg_net > 0:
-            trend_factor = float(np.clip(last_avg_net / prev_avg_net, 0.85, 1.15))
-
-    rem_net *= trend_factor
-    rem_profit *= trend_factor
-    rem_tickets *= trend_factor
-    rem_discount *= trend_factor
-
-    # Blend weekday-pattern projection with straight MTD pace.
-    # Weight increases as month observation depth improves.
-    pattern_weight = float(np.clip(0.35 + (mtd_obs_days * 0.035), 0.35, 0.80))
-    pace_net = (mtd_net / days_elapsed) * days_in_month
-    pace_profit = (mtd_profit / days_elapsed) * days_in_month
-    pace_tickets = (mtd_tickets / days_elapsed) * days_in_month
-    pace_discount = (mtd_discount / days_elapsed) * days_in_month
-
-    weekday_net = mtd_net + rem_net
-    weekday_profit = mtd_profit + rem_profit
-    weekday_tickets = mtd_tickets + rem_tickets
-    weekday_discount = mtd_discount + rem_discount
-
     return {
-        "net_pred": max((pattern_weight * weekday_net) + ((1.0 - pattern_weight) * pace_net), mtd_net),
-        "profit_pred": max((pattern_weight * weekday_profit) + ((1.0 - pattern_weight) * pace_profit), mtd_profit),
-        "tickets_pred": max((pattern_weight * weekday_tickets) + ((1.0 - pattern_weight) * pace_tickets), mtd_tickets),
-        "discount_pred": max((pattern_weight * weekday_discount) + ((1.0 - pattern_weight) * pace_discount), mtd_discount),
+        "net_pred": max(mtd_net + rem_net, mtd_net),
+        "profit_pred": max(mtd_profit + rem_profit, mtd_profit),
+        "tickets_pred": max(mtd_tickets + rem_tickets, mtd_tickets),
+        "discount_pred": max(mtd_discount + rem_discount, mtd_discount),
     }
+
+def _month_completion_curve_projection(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, float]:
+    """
+    Learns the usual month shape for a store.
+    Example: if day 14 is normally 45% of the month, current MTD / 0.45
+    becomes a strong month-end estimate.
+    """
+    work = _coerce_forecast_history(hist)
+    store = str(store_code)
+    mtd = _forecast_mtd_sums(work, store, as_of)
+    mtd_start = pd.Timestamp(date(as_of.year, as_of.month, 1))
+    last_dom = _last_day_of_month(as_of)
+
+    prior = work[(work["store_code"] == store) & (work["date"] < mtd_start)].copy()
+    groups = _complete_month_groups(prior)
+
+    out: Dict[str, float] = {}
+    for metric, col in FORECAST_METRIC_COLS.items():
+        current_mtd = float(mtd.get(metric, 0.0) or 0.0)
+        if current_mtd <= 0 or not groups:
+            out[f"{metric}_pred"] = current_mtd
+            continue
+
+        fractions: List[float] = []
+        weights: List[float] = []
+        for group_store, ym, g in groups:
+            if str(group_store) != store or g.empty or col not in g.columns:
+                continue
+
+            month_start = date(int(ym.year), int(ym.month), 1)
+            historical_last_dom = _last_day_of_month(month_start)
+            cutoff_day = min(as_of.day, historical_last_dom.day)
+            total = float(g[col].sum())
+            if total <= 0:
+                continue
+
+            cutoff = pd.Timestamp(date(int(ym.year), int(ym.month), cutoff_day))
+            elapsed = float(g[g["date"] <= cutoff][col].sum())
+            fraction = elapsed / total if total else 0.0
+            if fraction <= 0:
+                continue
+
+            months_ago = max((as_of.year - int(ym.year)) * 12 + (as_of.month - int(ym.month)), 0)
+            recency_weight = 1.0 / (1.0 + (0.12 * months_ago))
+            same_length_weight = 1.15 if historical_last_dom.day == last_dom.day else 1.0
+            same_month_weight = 1.10 if int(ym.month) == as_of.month else 1.0
+            same_dow_weight = 1.05 if cutoff.weekday() == as_of.weekday() else 1.0
+
+            fractions.append(float(fraction))
+            weights.append(float(recency_weight * same_length_weight * same_month_weight * same_dow_weight))
+
+        if len(fractions) < FORECAST_CURVE_MIN_COMPLETE_MONTHS:
+            out[f"{metric}_pred"] = current_mtd
+            continue
+
+        completion_fraction = _robust_weighted_forecast_average(fractions, weights)
+        if completion_fraction <= 0:
+            out[f"{metric}_pred"] = current_mtd
+            continue
+
+        out[f"{metric}_pred"] = max(current_mtd / completion_fraction, current_mtd)
+
+    return out
+
+def _scaled_weekday_calendar_projection(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, float]:
+    """
+    Uses weekday calendar averages, then scales them to the current month.
+    If this month is running 12% hotter than the same weekday mix normally runs,
+    the remaining weekdays get lifted by about that same amount.
+    """
+    work = _coerce_forecast_history(hist)
+    store = str(store_code)
+    as_of_ts = pd.Timestamp(as_of)
+    mtd_start = pd.Timestamp(date(as_of.year, as_of.month, 1))
+    last_dom = _last_day_of_month(as_of)
+
+    h = work[(work["store_code"] == store) & (work["date"] <= as_of_ts)].copy()
+    mtd = h[(h["date"] >= mtd_start) & (h["date"] <= as_of_ts)].copy()
+    mtd_sums = _forecast_mtd_sums(work, store, as_of)
+    if h.empty:
+        return {f"{metric}_pred": float(mtd_sums.get(metric, 0.0) or 0.0) for metric in FORECAST_METRIC_COLS}
+
+    h["wd"] = h["date"].dt.weekday
+    prior = h[h["date"] < mtd_start].copy()
+    recent_prior = prior[prior["date"] >= (as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_WINDOW_DAYS - 1))].copy()
+    long_prior = prior[prior["date"] >= (as_of_ts - pd.Timedelta(days=FORECAST_WEEKDAY_LONG_WINDOW_DAYS - 1))].copy()
+    weekday_cache: Dict[Tuple[str, int], float] = {}
+
+    def _weekday_value(metric_key: str, wd: int) -> float:
+        cache_key = (metric_key, int(wd))
+        if cache_key in weekday_cache:
+            return weekday_cache[cache_key]
+
+        col = FORECAST_METRIC_COLS[metric_key]
+        for source in (recent_prior, long_prior, prior, h):
+            if source is None or source.empty:
+                continue
+            vals = source.loc[source["wd"] == wd, col]
+            stats = _robust_forecast_stats(vals)
+            if int(stats.get("clean_n", 0)) > 0:
+                weekday_cache[cache_key] = float(stats["value"])
+                return weekday_cache[cache_key]
+        weekday_cache[cache_key] = 0.0
+        return 0.0
+
+    def _scale_bounds() -> Tuple[float, float]:
+        # Early month has less evidence, so allow a wider current-month adjustment.
+        if as_of.day <= 7:
+            return 0.55, 1.75
+        if as_of.day <= 14:
+            return 0.60, 1.65
+        if as_of.day <= 21:
+            return 0.65, 1.55
+        return 0.72, 1.45
+
+    scale_low, scale_high = _scale_bounds()
+
+    out: Dict[str, float] = {}
+    for metric in FORECAST_METRIC_COLS:
+        current_mtd = float(mtd_sums.get(metric, 0.0) or 0.0)
+        if current_mtd <= 0:
+            out[f"{metric}_pred"] = 0.0
+            continue
+
+        expected_mtd = 0.0
+        cur = date(as_of.year, as_of.month, 1)
+        while cur <= as_of:
+            expected_mtd += _weekday_value(metric, cur.weekday())
+            cur += timedelta(days=1)
+
+        scale = 1.0
+        if expected_mtd > 0:
+            scale = float(np.clip(current_mtd / expected_mtd, scale_low, scale_high))
+
+        remaining = 0.0
+        cur = as_of + timedelta(days=1)
+        while cur <= last_dom:
+            remaining += _weekday_value(metric, cur.weekday()) * scale
+            cur += timedelta(days=1)
+
+        out[f"{metric}_pred"] = max(current_mtd + remaining, current_mtd)
+
+    return out
+
+def _straight_pace_projection(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, float]:
+    work = _coerce_forecast_history(hist)
+    mtd = _forecast_mtd_sums(work, str(store_code), as_of)
+    days_elapsed = max(int(as_of.day), 1)
+    days_in_month = _last_day_of_month(as_of).day
+    return {
+        f"{metric}_pred": max(float(value) / days_elapsed * days_in_month, float(value))
+        for metric, value in mtd.items()
+    }
+
+def _combine_forecast_components(
+    components: List[Tuple[Dict[str, float], float]],
+    mtd: Dict[str, float],
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for metric in FORECAST_METRIC_COLS:
+        key = f"{metric}_pred"
+        current_mtd = float(mtd.get(metric, 0.0) or 0.0)
+        values: List[float] = []
+        weights: List[float] = []
+        for component, weight in components:
+            pred = float(component.get(key, 0.0) or 0.0)
+            if not np.isfinite(pred) or pred < current_mtd:
+                continue
+            values.append(pred)
+            weights.append(float(weight))
+
+        if not values:
+            out[key] = current_mtd
+        else:
+            out[key] = max(_robust_weighted_forecast_average(values, weights), current_mtd)
+
+    return out
+
+def _smart_month_end_baseline(hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, float]:
+    """
+    Ensemble forecast:
+      1) month-completion curve says how far through the month MTD usually is
+      2) scaled weekday calendar keeps the exact remaining weekdays in the month
+      3) raw weekday calendar and simple pace get small votes as guardrails
+    """
+    work = _coerce_forecast_history(hist)
+    mtd = _forecast_mtd_sums(work, str(store_code), as_of)
+
+    if as_of >= _last_day_of_month(as_of):
+        return {f"{metric}_pred": float(value) for metric, value in mtd.items()}
+
+    month_curve = _month_completion_curve_projection(work, store_code, as_of)
+    scaled_calendar = _scaled_weekday_calendar_projection(work, store_code, as_of)
+    raw_calendar = _weekday_profile_baseline(work, store_code, as_of)
+    pace = _straight_pace_projection(work, store_code, as_of)
+
+    if as_of.day <= 7:
+        weights = (0.52, 0.36, 0.04, 0.08)
+    elif as_of.day <= 14:
+        weights = (0.55, 0.37, 0.03, 0.05)
+    elif as_of.day <= 21:
+        weights = (0.58, 0.34, 0.03, 0.05)
+    else:
+        weights = (0.55, 0.36, 0.04, 0.05)
+
+    return _combine_forecast_components(
+        [
+            (month_curve, weights[0]),
+            (scaled_calendar, weights[1]),
+            (raw_calendar, weights[2]),
+            (pace, weights[3]),
+        ],
+        mtd,
+    )
 
 def _forecast_result_from_predictions(
     hist: pd.DataFrame,
@@ -1523,13 +1840,13 @@ class MonthEndForecaster:
         # Not enough data -> no ML model
         complete_months = int(meta.get("n_complete_months", 0))
         if complete_months < FORECAST_MIN_COMPLETE_MONTHS or X.empty or not y_dict:
-            self.meta["model_name"] = "baseline_weekday_profile"
+            self.meta["model_name"] = "smart_month_shape_ensemble"
             self.models = {}
             self.q_models = {}
             return
 
         if not self.sklearn.get("ok"):
-            self.meta["model_name"] = "baseline_weekday_profile"
+            self.meta["model_name"] = "smart_month_shape_ensemble"
             self.models = {}
             self.q_models = {}
             return
@@ -1624,13 +1941,13 @@ class MonthEndForecaster:
             return False
 
     def predict_baseline(self, hist: pd.DataFrame, store_code: str, as_of: date) -> Dict[str, Any]:
-        base = _weekday_profile_baseline(hist, str(store_code), as_of)
+        base = _smart_month_end_baseline(hist, str(store_code), as_of)
         return _forecast_result_from_predictions(
             hist,
             str(store_code),
             as_of,
             base,
-            "weekday_pace_baseline",
+            "smart_month_shape_ensemble",
             "baseline",
         )
 
@@ -1649,10 +1966,10 @@ class MonthEndForecaster:
 
         p10_net = p90_net = None
         p10_profit = p90_profit = None
-        if self.q_models.get("net"):
+        if FORECAST_USE_QUANTILES and self.q_models.get("net"):
             p10_net = float(self.q_models["net"]["p10"].predict(X1)[0])
             p90_net = float(self.q_models["net"]["p90"].predict(X1)[0])
-        if self.q_models.get("profit"):
+        if FORECAST_USE_QUANTILES and self.q_models.get("profit"):
             p10_profit = float(self.q_models["profit"]["p10"].predict(X1)[0])
             p90_profit = float(self.q_models["profit"]["p90"].predict(X1)[0])
 
@@ -1672,7 +1989,7 @@ class MonthEndForecaster:
             store,
             as_of,
             predictions,
-            f"{self.meta.get('model_name', 'ML')} + adaptive pace",
+            f"{self.meta.get('model_name', 'ML')} + robust weekday",
             "ml",
             net_p10=p10_net,
             net_p90=p90_net,
@@ -1940,37 +2257,31 @@ def apply_backtest_forecast_range(fc: Dict[str, Any], summary: pd.DataFrame) -> 
         high_key = f"{metric}_pred_high"
         pred = float(out.get(pred_key, 0.0) or 0.0)
         mtd_actual = float(out.get(mtd_key, 0.0) or 0.0)
+        point = max(pred, mtd_actual)
+        out[pred_key] = float(point)
+        out[low_key] = float(point)
+        out[high_key] = float(point)
+
         row = _forecast_summary_row(
             summary, store_code, model_key, metric, bucket, FORECAST_MIN_BACKTEST_ROWS_FOR_RANGE
         )
         if row is None:
-            out[low_key] = max(pred, mtd_actual)
-            out[high_key] = max(pred, mtd_actual)
             continue
         if metric == "net":
             net_row = row
-        low_factor = float(row.get("actual_to_pred_p10", np.nan))
-        high_factor = float(row.get("actual_to_pred_p90", np.nan))
-        if not np.isfinite(low_factor) or low_factor <= 0:
-            low_factor = 1.0
-        if not np.isfinite(high_factor) or high_factor <= 0:
-            high_factor = 1.0
-        lo_factor, hi_factor = sorted([low_factor, high_factor])
-        low = max(pred * lo_factor, mtd_actual)
-        high = max(pred * hi_factor, low, mtd_actual)
-        out[low_key] = float(low)
-        out[high_key] = float(high)
 
-    out["remaining_net_low"] = max(float(out.get("net_pred_low", out.get("net_pred", 0.0))) - float(out.get("mtd_net", 0.0)), 0.0)
-    out["remaining_net_high"] = max(float(out.get("net_pred_high", out.get("net_pred", 0.0))) - float(out.get("mtd_net", 0.0)), 0.0)
-    out["remaining_profit_low"] = max(float(out.get("profit_pred_low", out.get("profit_pred", 0.0))) - float(out.get("mtd_profit", 0.0)), 0.0)
-    out["remaining_profit_high"] = max(float(out.get("profit_pred_high", out.get("profit_pred", 0.0))) - float(out.get("mtd_profit", 0.0)), 0.0)
+    out["remaining_net_low"] = max(float(out.get("net_pred", 0.0)) - float(out.get("mtd_net", 0.0)), 0.0)
+    out["remaining_net_high"] = out["remaining_net_low"]
+    out["remaining_profit_low"] = max(float(out.get("profit_pred", 0.0)) - float(out.get("mtd_profit", 0.0)), 0.0)
+    out["remaining_profit_high"] = out["remaining_profit_low"]
     if net_row is not None:
-        out["range_source"] = str(net_row.get("scope", "backtest"))
+        out["range_source"] = "single_point"
+        out["backtest_scope"] = str(net_row.get("scope", "backtest"))
         out["backtest_net_mape"] = float(net_row.get("mape", np.nan))
         out["backtest_net_n"] = int(float(net_row.get("n", 0)))
     else:
-        out["range_source"] = "none"
+        out["range_source"] = "single_point"
+        out["backtest_scope"] = "none"
         out["backtest_net_mape"] = None
         out["backtest_net_n"] = 0
     return out
@@ -2013,19 +2324,19 @@ def run_month_end_forecast_pipeline(
     by_store = {}
     if include_all:
         baseline_all = engine.predict_baseline(hist, "ALL", as_of)
-        use_ml_all = forecast_ml_beats_baseline(backtest_summary, "ALL", as_of)
-        all_fc = engine.predict_ml_adaptive(hist, "ALL", as_of) if use_ml_all else None
-        by_store["ALL"] = apply_backtest_forecast_range(all_fc or baseline_all, backtest_summary)
+        by_store["ALL"] = apply_backtest_forecast_range(baseline_all, backtest_summary)
 
     for abbr in present_codes:
         baseline_fc = engine.predict_baseline(hist, abbr, as_of)
-        use_ml = forecast_ml_beats_baseline(backtest_summary, abbr, as_of)
-        ml_fc = engine.predict_ml_adaptive(hist, abbr, as_of) if use_ml else None
-        by_store[abbr] = apply_backtest_forecast_range(ml_fc or baseline_fc, backtest_summary)
+        by_store[abbr] = apply_backtest_forecast_range(baseline_fc, backtest_summary)
+
+    live_meta = dict(engine.meta)
+    live_meta["model_name"] = "smart_month_shape_ensemble"
+    live_meta["point_forecast_only"] = True
 
     bundle = {
         "as_of": as_of.isoformat(),
-        "meta": engine.meta,
+        "meta": live_meta,
         "stores": by_store,
         "include_all": include_all,
     }
