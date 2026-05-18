@@ -9,9 +9,14 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from weekly_brand_credit_emailer import (
+    DEFAULT_API_ENV_FILE,
+    DEFAULT_AUTO_OUTPUT_ROOT,
     DEFAULT_INVENTORY_LINKS_FILE,
+    DEFAULT_INVENTORY_INPUT_DIR,
     DEFAULT_LINKS_FILE,
     DEFAULT_REPORTS_DIR,
+    DEFAULT_SALES_SOURCE,
+    DEFAULT_WEEKLY_DRIVE_PARENT,
     WEEKLY_BRAND_EMAILS,
     load_inventory_manifest,
     run_weekly_brand_credit_emailer,
@@ -42,8 +47,8 @@ class WeeklyBrandCreditEmailerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Weekly Brand Credit Emailer")
-        self.root.geometry("980x720")
-        self.root.minsize(900, 640)
+        self.root.geometry("1040x820")
+        self.root.minsize(960, 720)
 
         self.style = ttk.Style(self.root)
         if "clam" in self.style.theme_names():
@@ -52,8 +57,17 @@ class WeeklyBrandCreditEmailerApp:
         self.reports_dir_var = tk.StringVar(value=DEFAULT_REPORTS_DIR)
         self.links_file_var = tk.StringVar(value=DEFAULT_LINKS_FILE)
         self.inventory_links_file_var = tk.StringVar(value=DEFAULT_INVENTORY_LINKS_FILE)
+        self.auto_output_root_var = tk.StringVar(value=DEFAULT_AUTO_OUTPUT_ROOT)
+        self.inventory_input_dir_var = tk.StringVar(value=DEFAULT_INVENTORY_INPUT_DIR)
+        self.drive_parent_folder_var = tk.StringVar(value=DEFAULT_WEEKLY_DRIVE_PARENT)
+        self.env_file_var = tk.StringVar(value=DEFAULT_API_ENV_FILE)
+        self.sales_source_var = tk.StringVar(value=DEFAULT_SALES_SOURCE)
         self.test_email_var = tk.StringVar()
         self.no_attachments_var = tk.BooleanVar(value=False)
+        self.auto_generate_var = tk.BooleanVar(value=True)
+        self.skip_sales_pull_var = tk.BooleanVar(value=False)
+        self.skip_inventory_refresh_var = tk.BooleanVar(value=False)
+        self.no_drive_upload_var = tk.BooleanVar(value=False)
 
         self.brand_enabled_vars = {}
         self.brand_link_vars = {}
@@ -68,8 +82,17 @@ class WeeklyBrandCreditEmailerApp:
         self.reports_dir_var.set(cfg.get("reports_dir", DEFAULT_REPORTS_DIR))
         self.links_file_var.set(cfg.get("links_file", DEFAULT_LINKS_FILE))
         self.inventory_links_file_var.set(cfg.get("inventory_links_file", DEFAULT_INVENTORY_LINKS_FILE))
+        self.auto_output_root_var.set(cfg.get("auto_output_root", DEFAULT_AUTO_OUTPUT_ROOT))
+        self.inventory_input_dir_var.set(cfg.get("inventory_input_dir", DEFAULT_INVENTORY_INPUT_DIR))
+        self.drive_parent_folder_var.set(cfg.get("drive_parent_folder", DEFAULT_WEEKLY_DRIVE_PARENT))
+        self.env_file_var.set(cfg.get("env_file", DEFAULT_API_ENV_FILE))
+        self.sales_source_var.set(cfg.get("sales_source", DEFAULT_SALES_SOURCE))
         self.test_email_var.set(cfg.get("test_email", ""))
         self.no_attachments_var.set(bool(cfg.get("no_attachments", False)))
+        self.auto_generate_var.set(bool(cfg.get("auto_generate", True)))
+        self.skip_sales_pull_var.set(bool(cfg.get("skip_sales_pull", False)))
+        self.skip_inventory_refresh_var.set(bool(cfg.get("skip_inventory_refresh", False)))
+        self.no_drive_upload_var.set(bool(cfg.get("no_drive_upload", False)))
 
         selected = set(cfg.get("selected_brands", [cfg["brand"] for cfg in WEEKLY_BRAND_EMAILS]))
         for brand_cfg in WEEKLY_BRAND_EMAILS:
@@ -81,8 +104,17 @@ class WeeklyBrandCreditEmailerApp:
             "reports_dir": self.reports_dir_var.get().strip(),
             "links_file": self.links_file_var.get().strip(),
             "inventory_links_file": self.inventory_links_file_var.get().strip(),
+            "auto_output_root": self.auto_output_root_var.get().strip(),
+            "inventory_input_dir": self.inventory_input_dir_var.get().strip(),
+            "drive_parent_folder": self.drive_parent_folder_var.get().strip(),
+            "env_file": self.env_file_var.get().strip(),
+            "sales_source": self.sales_source_var.get().strip(),
             "test_email": self.test_email_var.get().strip(),
             "no_attachments": self.no_attachments_var.get(),
+            "auto_generate": self.auto_generate_var.get(),
+            "skip_sales_pull": self.skip_sales_pull_var.get(),
+            "skip_inventory_refresh": self.skip_inventory_refresh_var.get(),
+            "no_drive_upload": self.no_drive_upload_var.get(),
             "selected_brands": [
                 brand_cfg["brand"]
                 for brand_cfg in WEEKLY_BRAND_EMAILS
@@ -95,7 +127,7 @@ class WeeklyBrandCreditEmailerApp:
         outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=1)
+        outer.rowconfigure(4, weight=1)
 
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
@@ -103,7 +135,7 @@ class WeeklyBrandCreditEmailerApp:
         ttk.Label(header, text="Weekly Brand Credit Emailer", font=("Helvetica", 18, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="Paste or reuse the current Hashish and Treesap inventory folder links, then preview or send.",
+            text="Generate Hashish and Treesap weekly deal/inventory reports, upload Drive folders, then preview or send.",
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
         path_frame = ttk.LabelFrame(outer, text="Paths", padding=12)
@@ -113,6 +145,9 @@ class WeeklyBrandCreditEmailerApp:
         self._build_path_row(path_frame, 0, "Reports Dir", self.reports_dir_var, self._browse_reports_dir)
         self._build_path_row(path_frame, 1, "links.txt", self.links_file_var, self._browse_links_file)
         self._build_path_row(path_frame, 2, "Inventory JSON", self.inventory_links_file_var, self._browse_inventory_file)
+        self._build_path_row(path_frame, 3, "Auto Output Root", self.auto_output_root_var, self._browse_auto_output_root)
+        self._build_path_row(path_frame, 4, "Input Exports Dir", self.inventory_input_dir_var, self._browse_inventory_input_dir)
+        self._build_path_row(path_frame, 5, ".env File", self.env_file_var, self._browse_env_file)
 
         brand_frame = ttk.LabelFrame(outer, text="Brands", padding=12)
         brand_frame.grid(row=2, column=0, sticky="ew", pady=(14, 0))
@@ -141,8 +176,48 @@ class WeeklyBrandCreditEmailerApp:
                 textvariable=self.brand_link_vars[brand],
             ).grid(row=idx, column=2, sticky="ew", pady=6)
 
+        automation_frame = ttk.LabelFrame(outer, text="Automation", padding=12)
+        automation_frame.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        automation_frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            automation_frame,
+            text="Full automatic: pull/generate reports, upload Drive folders, then email",
+            variable=self.auto_generate_var,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+
+        ttk.Label(automation_frame, text="Sales Source").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Combobox(
+            automation_frame,
+            textvariable=self.sales_source_var,
+            values=("api", "browser"),
+            state="readonly",
+            width=12,
+        ).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
+
+        ttk.Label(automation_frame, text="Drive Parent").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(automation_frame, textvariable=self.drive_parent_folder_var).grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=(10, 0)
+        )
+
+        ttk.Checkbutton(
+            automation_frame,
+            text="Use existing sales exports",
+            variable=self.skip_sales_pull_var,
+        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(
+            automation_frame,
+            text="Use existing inventory exports",
+            variable=self.skip_inventory_refresh_var,
+        ).grid(row=3, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
+        ttk.Checkbutton(
+            automation_frame,
+            text="Do not upload to Drive",
+            variable=self.no_drive_upload_var,
+        ).grid(row=3, column=2, sticky="w", padx=(10, 0), pady=(10, 0))
+
         options_frame = ttk.LabelFrame(outer, text="Send Options", padding=12)
-        options_frame.grid(row=3, column=0, sticky="nsew", pady=(14, 0))
+        options_frame.grid(row=4, column=0, sticky="nsew", pady=(14, 0))
         options_frame.columnconfigure(1, weight=1)
         options_frame.rowconfigure(2, weight=1)
 
@@ -168,7 +243,7 @@ class WeeklyBrandCreditEmailerApp:
         self.send_button = ttk.Button(button_row, text="Send Emails", command=lambda: self._start_run(dry_run=False))
         self.send_button.grid(row=0, column=2, padx=(8, 0))
 
-        self.log_widget = ScrolledText(options_frame, height=18, wrap="word")
+        self.log_widget = ScrolledText(options_frame, height=14, wrap="word")
         self.log_widget.grid(row=3, column=0, columnspan=2, sticky="nsew")
         self.log_widget.configure(state="disabled")
 
@@ -192,6 +267,21 @@ class WeeklyBrandCreditEmailerApp:
         if path:
             self.inventory_links_file_var.set(path)
             self._load_inventory_links_into_form()
+
+    def _browse_auto_output_root(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.auto_output_root_var.set(folder)
+
+    def _browse_inventory_input_dir(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.inventory_input_dir_var.set(folder)
+
+    def _browse_env_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Env Files", ".env"), ("All Files", "*.*")])
+        if path:
+            self.env_file_var.set(path)
 
     def _load_inventory_links_into_form(self):
         manifest = load_inventory_manifest(self.inventory_links_file_var.get().strip())
@@ -241,16 +331,36 @@ class WeeklyBrandCreditEmailerApp:
         reports_dir = self.reports_dir_var.get().strip()
         links_file = self.links_file_var.get().strip()
         inventory_links_file = self.inventory_links_file_var.get().strip()
-        if not reports_dir or not links_file or not inventory_links_file:
+        auto_generate = self.auto_generate_var.get()
+        if not reports_dir:
+            reports_dir = DEFAULT_REPORTS_DIR
+        if not links_file:
+            links_file = DEFAULT_LINKS_FILE
+        if not inventory_links_file:
+            inventory_links_file = DEFAULT_INVENTORY_LINKS_FILE
+
+        if not auto_generate and (not reports_dir or not links_file or not inventory_links_file):
             messagebox.showerror("Missing Paths", "Reports directory, links.txt, and inventory JSON are required.")
             return
 
+        if auto_generate:
+            if not self.auto_output_root_var.get().strip() or not self.inventory_input_dir_var.get().strip():
+                messagebox.showerror("Missing Automation Paths", "Auto output root and input exports directory are required.")
+                return
+            if self.sales_source_var.get().strip() == "api" and not self.env_file_var.get().strip():
+                messagebox.showerror("Missing .env", "An .env file is required when Sales Source is api.")
+                return
+            if not self.drive_parent_folder_var.get().strip() and not self.no_drive_upload_var.get():
+                messagebox.showerror("Missing Drive Parent", "Drive parent folder is required unless Drive upload is disabled.")
+                return
+
         inventory_overrides = {}
-        for brand_cfg in WEEKLY_BRAND_EMAILS:
-            brand = brand_cfg["brand"]
-            link = self.brand_link_vars[brand].get().strip()
-            if link:
-                inventory_overrides[brand_cfg["inventory_folder"]] = link
+        if not auto_generate or self.no_drive_upload_var.get():
+            for brand_cfg in WEEKLY_BRAND_EMAILS:
+                brand = brand_cfg["brand"]
+                link = self.brand_link_vars[brand].get().strip()
+                if link:
+                    inventory_overrides[brand_cfg["inventory_folder"]] = link
 
         self._save_config()
         self._append_log("")
@@ -268,6 +378,17 @@ class WeeklyBrandCreditEmailerApp:
                 "dry_run": dry_run,
                 "test_email": self.test_email_var.get().strip() or None,
                 "no_attachments": self.no_attachments_var.get(),
+                "auto_generate": auto_generate,
+                "sales_source": self.sales_source_var.get().strip() or DEFAULT_SALES_SOURCE,
+                "env_file": self.env_file_var.get().strip() or DEFAULT_API_ENV_FILE,
+                "auto_output_root": self.auto_output_root_var.get().strip() or DEFAULT_AUTO_OUTPUT_ROOT,
+                "inventory_input_dir": self.inventory_input_dir_var.get().strip() or DEFAULT_INVENTORY_INPUT_DIR,
+                "skip_sales_pull": self.skip_sales_pull_var.get(),
+                "skip_inventory_refresh": self.skip_inventory_refresh_var.get(),
+                "include_inventory_order_reports": True,
+                "include_inventory_cost": True,
+                "no_drive_upload": self.no_drive_upload_var.get(),
+                "drive_parent_folder": self.drive_parent_folder_var.get().strip() or DEFAULT_WEEKLY_DRIVE_PARENT,
             },
             daemon=True,
         )
@@ -297,6 +418,11 @@ class WeeklyBrandCreditEmailerApp:
 
         mode = "Preview" if dry_run else "Send"
         summary = f"{mode} finished.\n\nSuccessful emails: {sends}"
+        prepare = result.get("prepare") or {}
+        if prepare:
+            summary += f"\n\nWeek: {prepare.get('week_start')} to {prepare.get('week_end')}"
+            summary += f"\nReports: {result.get('reports_dir')}"
+            summary += f"\nLinks: {result.get('links_file')}"
         if failures:
             summary += "\n\nSkipped:\n" + "\n".join(failures)
         messagebox.showinfo("Completed", summary)

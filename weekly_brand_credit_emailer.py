@@ -3,11 +3,10 @@
 Send weekly brand credit emails for the brands that need both deal report links
 and inventory folder links in the same message.
 
-Expected workflow:
-1. Run BrandINVEmailer.py to generate inventory folders and inventory_links/latest.json
-2. Run deals.py to generate brand_reports/*.xlsx
-3. Run uploadDrive.py (or equivalent) to refresh links.txt with deal report links
-4. Run this script to email the external brand contacts and CC Buzz finance contacts
+Workflow modes:
+1. Existing-link mode emails the latest already-generated deal and inventory links.
+2. Automatic mode pulls last week's sales/inventory exports, generates only the
+   Hashish and Treesap reports, uploads them to Drive by brand/week, then emails.
 """
 
 import argparse
@@ -22,15 +21,24 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email import encoders
 from email.utils import formatdate
+from pathlib import Path
 
 import openpyxl
 
 
+BASE_DIR = Path(__file__).resolve().parent
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_GMAIL_FILE = "token_gmail.json"
+TOKEN_DRIVE_FILE = "token_drive.json"
 DEFAULT_REPORTS_DIR = "brand_reports"
 DEFAULT_LINKS_FILE = "links.txt"
 DEFAULT_INVENTORY_LINKS_FILE = os.path.join("inventory_links", "latest.json")
+DEFAULT_AUTO_OUTPUT_ROOT = os.path.join("reports", "weekly_brand_credit")
+DEFAULT_WEEKLY_DRIVE_PARENT = "Weekly Brand Credit Reports"
+DEFAULT_INVENTORY_INPUT_DIR = "files"
+DEFAULT_SALES_SOURCE = "api"
+DEFAULT_API_ENV_FILE = str(BASE_DIR / ".env")
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 BUZZ_CC = ["joseph@buzzcannabis.com", "donna@buzzcannabis.com"]
 
 WEEKLY_BRAND_EMAILS = [
@@ -38,12 +46,16 @@ WEEKLY_BRAND_EMAILS = [
         "brand": "Hashish",
         "report_aliases": ["Hashish"],
         "inventory_folder": "Hashish",
+        "inventory_aliases": ["Hashish"],
+        "drive_folder": "Hashish",
         "to": ["ryanbtcventures@gmail.com"],
     },
     {
         "brand": "TreeSap",
         "report_aliases": ["TreeSap", "Treesap"],
         "inventory_folder": "Treesap",
+        "inventory_aliases": ["Treesap", "TreeSap"],
+        "drive_folder": "Treesap",
         "to": ["sales@treesapsyrup.com"],
     },
 ]
@@ -60,6 +72,84 @@ def emit_status(message, status_callback=None):
         print(message)
 
 
+def resolve_repo_path(path_value):
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return BASE_DIR / path
+
+
+def coerce_date(value):
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    if isinstance(value, str):
+        return datetime.date.fromisoformat(value)
+    raise TypeError(f"Unsupported date value: {value!r}")
+
+
+def get_previous_monday_sunday(reference_date=None):
+    today = coerce_date(reference_date) if reference_date else datetime.date.today()
+    monday_this_week = today - datetime.timedelta(days=today.weekday())
+    last_monday = monday_this_week - datetime.timedelta(days=7)
+    last_sunday = last_monday + datetime.timedelta(days=6)
+    return last_monday, last_sunday
+
+
+def week_key_for_range(start_date, end_date):
+    start_day = coerce_date(start_date)
+    end_day = coerce_date(end_date)
+    return f"{start_day.isoformat()}_to_{end_day.isoformat()}"
+
+
+def selected_brand_configs(selected_brands=None):
+    return [
+        brand_cfg
+        for brand_cfg in WEEKLY_BRAND_EMAILS
+        if should_include_brand(brand_cfg, selected_brands)
+    ]
+
+
+def label_for_brand_config(brand_cfg):
+    return brand_cfg.get("drive_folder") or brand_cfg.get("inventory_folder") or brand_cfg["brand"]
+
+
+def capture_printed_status(func, status_callback=None):
+    """
+    Run a noisy legacy helper while forwarding its print output through the GUI/CLI log.
+    """
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    result = None
+    error = None
+    with contextlib.redirect_stdout(buffer):
+        try:
+            result = func()
+        except Exception as exc:
+            error = exc
+
+    for raw_line in buffer.getvalue().splitlines():
+        line = raw_line.strip()
+        if line:
+            emit_status(line, status_callback)
+
+    if error:
+        raise error
+    return result
+
+
+def call_in_base_dir(func):
+    current_dir = os.getcwd()
+    os.chdir(BASE_DIR)
+    try:
+        return func()
+    finally:
+        os.chdir(current_dir)
+
+
 def gmail_authenticate():
     import google.auth.transport.requests
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -68,15 +158,17 @@ def gmail_authenticate():
 
     scopes = ["https://www.googleapis.com/auth/gmail.send"]
     creds = None
-    if os.path.exists(TOKEN_GMAIL_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_GMAIL_FILE, scopes)
+    token_path = resolve_repo_path(TOKEN_GMAIL_FILE)
+    credentials_path = resolve_repo_path(CREDENTIALS_FILE)
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(google.auth.transport.requests.Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, scopes)
+            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), scopes)
             creds = flow.run_local_server(port=0)
-        with open(TOKEN_GMAIL_FILE, "w", encoding="utf-8") as f:
+        with open(token_path, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
@@ -139,6 +231,136 @@ def send_email_with_gmail_html(
         f"[GMAIL] Email sent to {all_recipients} | ID: {sent['id']} | Subject: {subject}",
         status_callback,
     )
+
+
+def drive_authenticate():
+    import google.auth.transport.requests
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = None
+    token_path = resolve_repo_path(TOKEN_DRIVE_FILE)
+    credentials_path = resolve_repo_path(CREDENTIALS_FILE)
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), DRIVE_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(google.auth.transport.requests.Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), DRIVE_SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(token_path, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+
+    return build("drive", "v3", credentials=creds)
+
+
+def drive_link_for_folder(folder_id):
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def escape_drive_query_value(value):
+    return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def find_drive_item(service, name, parent_id=None, mime_type=None):
+    name_escaped = escape_drive_query_value(name)
+    query_parts = [f"name='{name_escaped}'", "trashed=false"]
+    if mime_type:
+        query_parts.append(f"mimeType='{mime_type}'")
+    if parent_id:
+        query_parts.append(f"'{parent_id}' in parents")
+
+    response = service.files().list(
+        q=" and ".join(query_parts),
+        spaces="drive",
+        fields="files(id,name,mimeType,webViewLink)",
+        pageSize=10,
+    ).execute()
+    items = response.get("files", [])
+    return items[0] if items else None
+
+
+def make_drive_item_public(service, item_id, status_callback=None):
+    try:
+        permissions = service.permissions().list(
+            fileId=item_id,
+            fields="permissions(id,type,role)",
+        ).execute().get("permissions", [])
+        for permission in permissions:
+            if permission.get("type") == "anyone" and permission.get("role") == "reader":
+                return
+    except Exception:
+        pass
+
+    permission = {"type": "anyone", "role": "reader"}
+    try:
+        service.permissions().create(fileId=item_id, body=permission).execute()
+    except Exception as exc:
+        emit_status(f"[WARN] Could not make Drive item public: {item_id} ({exc})", status_callback)
+
+
+def find_or_create_drive_folder(service, folder_name, parent_id=None, make_public=False, status_callback=None):
+    folder_mime = "application/vnd.google-apps.folder"
+    existing = find_drive_item(service, folder_name, parent_id=parent_id, mime_type=folder_mime)
+    if existing:
+        folder_id = existing["id"]
+        if make_public:
+            make_drive_item_public(service, folder_id, status_callback=status_callback)
+        return folder_id
+
+    metadata = {
+        "name": folder_name,
+        "mimeType": folder_mime,
+    }
+    if parent_id:
+        metadata["parents"] = [parent_id]
+
+    created = service.files().create(body=metadata, fields="id").execute()
+    folder_id = created["id"]
+    emit_status(f"[DRIVE] Created folder: {folder_name}", status_callback)
+    if make_public:
+        make_drive_item_public(service, folder_id, status_callback=status_callback)
+    return folder_id
+
+
+def upload_or_update_file_to_drive(service, file_path, parent_id, make_public=True, status_callback=None):
+    from googleapiclient.http import MediaFileUpload
+
+    path = Path(file_path)
+    existing = find_drive_item(service, path.name, parent_id=parent_id)
+    media = MediaFileUpload(str(path), resumable=True)
+
+    if existing:
+        uploaded = service.files().update(
+            fileId=existing["id"],
+            media_body=media,
+            fields="id,webViewLink",
+        ).execute()
+        action = "Updated"
+    else:
+        metadata = {"name": path.name, "parents": [parent_id]}
+        uploaded = service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id,webViewLink",
+        ).execute()
+        action = "Uploaded"
+
+    file_id = uploaded["id"]
+    if make_public:
+        make_drive_item_public(service, file_id, status_callback=status_callback)
+        uploaded = service.files().get(fileId=file_id, fields="id,webViewLink").execute()
+
+    link = uploaded.get("webViewLink")
+    emit_status(f"[DRIVE] {action} {path.name}", status_callback)
+    return {
+        "id": file_id,
+        "name": path.name,
+        "path": str(path),
+        "link": link,
+    }
 
 
 def parse_kickback_summary(report_path):
@@ -215,10 +437,11 @@ def parse_report_link_line(line):
 
 def load_report_links(links_file):
     entries = []
-    if not os.path.isfile(links_file):
+    links_path = resolve_repo_path(links_file)
+    if not links_path.is_file():
         return entries
 
-    with open(links_file, "r", encoding="utf-8") as f:
+    with open(links_path, "r", encoding="utf-8") as f:
         for raw_line in f:
             line = raw_line.strip()
             if not line:
@@ -272,7 +495,8 @@ def default_inventory_manifest():
 
 
 def load_inventory_manifest(manifest_path):
-    if not os.path.isfile(manifest_path):
+    manifest_path = resolve_repo_path(manifest_path)
+    if not manifest_path.is_file():
         return default_inventory_manifest()
 
     with open(manifest_path, "r", encoding="utf-8") as f:
@@ -289,9 +513,8 @@ def load_inventory_manifest(manifest_path):
 
 
 def save_inventory_manifest(manifest_path, payload, status_callback=None):
-    parent_dir = os.path.dirname(manifest_path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
+    manifest_path = resolve_repo_path(manifest_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     payload["generated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     payload.setdefault("date", datetime.datetime.now().strftime("%Y-%m-%d"))
@@ -332,10 +555,11 @@ def find_latest_report(reports_dir, aliases):
     alias_keys = {normalize_key(alias) for alias in aliases}
     candidates = []
 
-    if not os.path.isdir(reports_dir):
+    reports_path = resolve_repo_path(reports_dir)
+    if not reports_path.is_dir():
         return None
 
-    for filename in os.listdir(reports_dir):
+    for filename in os.listdir(reports_path):
         match = pattern.match(filename)
         if not match:
             continue
@@ -346,7 +570,7 @@ def find_latest_report(reports_dir, aliases):
             {
                 "brand": match.group("brand").strip(),
                 "filename": filename,
-                "path": os.path.join(reports_dir, filename),
+                "path": str(reports_path / filename),
                 "start_date": match.group("start"),
                 "end_date": match.group("end"),
             }
@@ -374,6 +598,313 @@ def select_report_links(report_info, link_entries, aliases):
     ]
 
 
+def clear_sales_exports(input_dir, status_callback=None):
+    input_path = resolve_repo_path(input_dir)
+    if not input_path.is_dir():
+        return []
+
+    deleted = []
+    pattern = re.compile(r"^sales[A-Za-z]+\.xlsx$", re.IGNORECASE)
+    for child in input_path.iterdir():
+        if child.is_file() and pattern.match(child.name):
+            child.unlink()
+            deleted.append(str(child))
+            emit_status(f"[CLEANUP] Deleted old sales export: {child}", status_callback)
+    return deleted
+
+
+def run_weekly_sales_pull(start_date, end_date, sales_source=DEFAULT_SALES_SOURCE, env_file=DEFAULT_API_ENV_FILE, status_callback=None):
+    from autoJob import run_sales_report_api, run_sales_report_browser
+
+    start_day = coerce_date(start_date)
+    end_day = coerce_date(end_date)
+    if sales_source == "api":
+        emit_status(f"[AUTO] Pulling sales from Dutchie API for {start_day} to {end_day}", status_callback)
+        return capture_printed_status(
+            lambda: call_in_base_dir(lambda: run_sales_report_api(start_day, end_day, env_file=env_file)),
+            status_callback=status_callback,
+        )
+
+    emit_status(f"[AUTO] Pulling sales with browser flow for {start_day} to {end_day}", status_callback)
+    return capture_printed_status(
+        lambda: call_in_base_dir(lambda: run_sales_report_browser(start_day, end_day)),
+        status_callback=status_callback,
+    )
+
+
+def generate_deal_reports_for_week(brand_cfgs, reports_dir, status_callback=None):
+    import deals
+
+    selected = [brand_cfg["brand"] for brand_cfg in brand_cfgs]
+    emit_status(f"[AUTO] Generating deal reports for: {', '.join(selected)}", status_callback)
+
+    return capture_printed_status(
+        lambda: call_in_base_dir(
+            lambda: deals.run_deals_reports(
+                selected_brands=selected,
+                output_dir=str(resolve_repo_path(reports_dir)),
+                old_dir=str(resolve_repo_path("old")),
+                archive_existing=True,
+                sync_reference=False,
+                sync_sheet=False,
+            )
+        ),
+        status_callback=status_callback,
+    )
+
+
+def refresh_inventory_sources(input_dir, include_order_reports=True, status_callback=None):
+    from brand_inventory_report_job import refresh_sources
+
+    input_path = resolve_repo_path(input_dir)
+    emit_status(f"[AUTO] Refreshing inventory source exports in {input_path}", status_callback)
+    return capture_printed_status(
+        lambda: refresh_sources(input_path, include_order_reports=include_order_reports),
+        status_callback=status_callback,
+    )
+
+
+def generate_inventory_reports_for_week(brand_cfgs, input_dir, output_dir, include_cost=True, status_callback=None):
+    from brand_inventory_report_job import build_brand_inventory_reports
+
+    selected = []
+    for brand_cfg in brand_cfgs:
+        selected.extend(brand_cfg.get("inventory_aliases") or [brand_cfg["inventory_folder"]])
+    selected = list(dict.fromkeys(selected))
+    output_path = resolve_repo_path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    emit_status(f"[AUTO] Generating inventory reports for: {', '.join(selected)}", status_callback)
+    return capture_printed_status(
+        lambda: build_brand_inventory_reports(
+            input_dir=resolve_repo_path(input_dir),
+            output_dir=output_path,
+            selected_brands=selected,
+            include_cost=include_cost,
+        ),
+        status_callback=status_callback,
+    )
+
+
+def inventory_files_for_brand(brand_cfg, inventory_brand_map):
+    aliases = brand_cfg.get("inventory_aliases") or [brand_cfg["inventory_folder"]]
+    alias_keys = {str(alias).strip().lower() for alias in aliases}
+    files = []
+    for brand_key, brand_files in (inventory_brand_map or {}).items():
+        if str(brand_key).strip().lower() in alias_keys:
+            files.extend(brand_files or [])
+    return sorted(dict.fromkeys(files))
+
+
+def write_report_links_file(links_file, uploaded_report_links, status_callback=None):
+    links_path = resolve_repo_path(links_file)
+    links_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(links_path, "w", encoding="utf-8") as handle:
+        for item in uploaded_report_links:
+            link = item.get("link")
+            if link:
+                handle.write(f"{item['name']}: {link}\n")
+    emit_status(f"[INFO] Saved report links: {links_path}", status_callback)
+
+
+def upload_weekly_brand_outputs(
+    brand_cfgs,
+    reports_dir,
+    inventory_brand_map,
+    links_file=DEFAULT_LINKS_FILE,
+    inventory_links_file=DEFAULT_INVENTORY_LINKS_FILE,
+    drive_parent_folder=DEFAULT_WEEKLY_DRIVE_PARENT,
+    week_start=None,
+    week_end=None,
+    status_callback=None,
+):
+    start_day = coerce_date(week_start) if week_start else get_previous_monday_sunday()[0]
+    end_day = coerce_date(week_end) if week_end else get_previous_monday_sunday()[1]
+    week_folder = week_key_for_range(start_day, end_day)
+
+    service = drive_authenticate()
+    parent_id = find_or_create_drive_folder(
+        service,
+        drive_parent_folder,
+        parent_id=None,
+        make_public=False,
+        status_callback=status_callback,
+    )
+
+    inventory_manifest = load_inventory_manifest(inventory_links_file)
+    uploaded_report_links = []
+    folders = {}
+    failures = []
+
+    for brand_cfg in brand_cfgs:
+        report_info = find_latest_report(reports_dir, brand_cfg["report_aliases"])
+        if not report_info:
+            failures.append(f"{brand_cfg['brand']}: no generated deal report found in {reports_dir}")
+            continue
+
+        brand_folder_name = label_for_brand_config(brand_cfg)
+        brand_folder_id = find_or_create_drive_folder(
+            service,
+            brand_folder_name,
+            parent_id=parent_id,
+            make_public=False,
+            status_callback=status_callback,
+        )
+        week_folder_id = find_or_create_drive_folder(
+            service,
+            week_folder,
+            parent_id=brand_folder_id,
+            make_public=True,
+            status_callback=status_callback,
+        )
+        week_folder_link = drive_link_for_folder(week_folder_id)
+
+        uploaded_deal = upload_or_update_file_to_drive(
+            service,
+            report_info["path"],
+            week_folder_id,
+            make_public=True,
+            status_callback=status_callback,
+        )
+        uploaded_report_links.append(uploaded_deal)
+
+        inventory_files = inventory_files_for_brand(brand_cfg, inventory_brand_map)
+        if not inventory_files:
+            failures.append(f"{brand_cfg['brand']}: no inventory workbooks generated")
+        for inventory_file in inventory_files:
+            upload_or_update_file_to_drive(
+                service,
+                inventory_file,
+                week_folder_id,
+                make_public=True,
+                status_callback=status_callback,
+            )
+
+        folders[brand_cfg["inventory_folder"]] = {
+            "folder_id": week_folder_id,
+            "link": week_folder_link,
+            "report": uploaded_deal,
+            "inventory_files": inventory_files,
+        }
+        set_inventory_link(
+            inventory_manifest,
+            folder_name=brand_cfg["inventory_folder"],
+            link=week_folder_link,
+            emails=brand_cfg["to"] + BUZZ_CC,
+        )
+        emit_status(f"[DRIVE] Weekly folder for {brand_cfg['brand']}: {week_folder_link}", status_callback)
+
+    write_report_links_file(links_file, uploaded_report_links, status_callback=status_callback)
+    save_inventory_manifest(inventory_links_file, inventory_manifest, status_callback=status_callback)
+
+    return {
+        "folders": folders,
+        "report_links": uploaded_report_links,
+        "failures": failures,
+        "week_folder": week_folder,
+    }
+
+
+def prepare_weekly_brand_credit_run(
+    selected_brands=None,
+    reports_dir=DEFAULT_REPORTS_DIR,
+    links_file=DEFAULT_LINKS_FILE,
+    inventory_links_file=DEFAULT_INVENTORY_LINKS_FILE,
+    inventory_input_dir=DEFAULT_INVENTORY_INPUT_DIR,
+    auto_output_root=DEFAULT_AUTO_OUTPUT_ROOT,
+    sales_source=DEFAULT_SALES_SOURCE,
+    env_file=DEFAULT_API_ENV_FILE,
+    skip_sales_pull=False,
+    skip_inventory_refresh=False,
+    include_inventory_order_reports=True,
+    include_inventory_cost=True,
+    no_drive_upload=False,
+    drive_parent_folder=DEFAULT_WEEKLY_DRIVE_PARENT,
+    status_callback=None,
+):
+    brand_cfgs = selected_brand_configs(selected_brands)
+    if not brand_cfgs:
+        raise ValueError("No matching weekly brand configs selected.")
+
+    week_start, week_end = get_previous_monday_sunday()
+    week_key = week_key_for_range(week_start, week_end)
+    output_root = resolve_repo_path(auto_output_root) / week_key
+
+    if reports_dir == DEFAULT_REPORTS_DIR:
+        reports_dir = str(output_root / "deal_reports")
+    if links_file == DEFAULT_LINKS_FILE:
+        links_file = str(output_root / "links.txt")
+
+    inventory_output_dir = output_root / "inventory_reports"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    emit_status(f"[AUTO] Weekly range: {week_start.isoformat()} to {week_end.isoformat()}", status_callback)
+
+    if not skip_sales_pull:
+        clear_sales_exports(inventory_input_dir, status_callback=status_callback)
+        run_weekly_sales_pull(
+            week_start,
+            week_end,
+            sales_source=sales_source,
+            env_file=env_file,
+            status_callback=status_callback,
+        )
+    else:
+        emit_status("[AUTO] Sales pull skipped; using existing files/sales*.xlsx exports.", status_callback)
+
+    generate_deal_reports_for_week(brand_cfgs, reports_dir, status_callback=status_callback)
+
+    if not skip_inventory_refresh:
+        refresh_inventory_sources(
+            inventory_input_dir,
+            include_order_reports=include_inventory_order_reports,
+            status_callback=status_callback,
+        )
+    else:
+        emit_status("[AUTO] Inventory source refresh skipped; using existing catalog/order files.", status_callback)
+
+    inventory_brand_map = generate_inventory_reports_for_week(
+        brand_cfgs,
+        input_dir=inventory_input_dir,
+        output_dir=inventory_output_dir,
+        include_cost=include_inventory_cost,
+        status_callback=status_callback,
+    )
+
+    upload_result = {
+        "folders": {},
+        "report_links": [],
+        "failures": [],
+        "week_folder": week_key,
+    }
+    if no_drive_upload:
+        emit_status("[AUTO] Drive upload skipped by option.", status_callback)
+    else:
+        upload_result = upload_weekly_brand_outputs(
+            brand_cfgs,
+            reports_dir=reports_dir,
+            inventory_brand_map=inventory_brand_map,
+            links_file=links_file,
+            inventory_links_file=inventory_links_file,
+            drive_parent_folder=drive_parent_folder,
+            week_start=week_start,
+            week_end=week_end,
+            status_callback=status_callback,
+        )
+
+    return {
+        "week_start": week_start.isoformat(),
+        "week_end": week_end.isoformat(),
+        "week_key": week_key,
+        "reports_dir": str(reports_dir),
+        "links_file": str(links_file),
+        "inventory_links_file": str(inventory_links_file),
+        "inventory_output_dir": str(inventory_output_dir),
+        "inventory_brand_map": inventory_brand_map,
+        "upload": upload_result,
+    }
+
+
 def build_email_body(brand_label, report_info, inventory_info, report_links, kickback_rows):
     inventory_folder_name = inventory_info["folder_name"]
     inventory_link = inventory_info["link"]
@@ -384,7 +915,7 @@ def build_email_body(brand_label, report_info, inventory_info, report_links, kic
     <html>
       <body>
         <p>Hello,</p>
-        <p>Please see below the {brand_label} brand deals for <strong>{report_info['start_date']} to {report_info['end_date']}</strong>, along with the inventory folder link.</p>
+        <p>Please see below the {brand_label} brand deals for <strong>{report_info['start_date']} to {report_info['end_date']}</strong>, along with the weekly Drive folder containing the deal and inventory reports.</p>
         <h3>Folder: {inventory_folder_name}</h3>
         <p>Link: <a href="{inventory_link}">{inventory_link}</a></p>
         <h3>{brand_label}</h3>
@@ -392,7 +923,7 @@ def build_email_body(brand_label, report_info, inventory_info, report_links, kic
         {report_link_html}
         <h3>Kickback Summary:</h3>
         {kickback_html}
-        <p>Joseph and Donna are copied on this credit email.</p>
+        <p><strong>please include/contact joseph@buzzcannabis.com &amp; donna@buzzcannabis.com in all emails regarding these credits.</strong></p>
         <p>Regards,<br>Buzz Cannabis</p>
       </body>
     </html>
@@ -442,6 +973,62 @@ def parse_args():
         action="store_true",
         help="Do not attach the local XLSX deal report to the email.",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Pull/generate Hashish and Treesap reports, upload weekly Drive folders, then email.",
+    )
+    parser.add_argument(
+        "--sales-source",
+        choices=("api", "browser"),
+        default=DEFAULT_SALES_SOURCE,
+        help=f"Where to pull weekly sales data from in --auto mode (default: {DEFAULT_SALES_SOURCE}).",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=DEFAULT_API_ENV_FILE,
+        help=f"Dutchie API .env file for --sales-source api (default: {DEFAULT_API_ENV_FILE}).",
+    )
+    parser.add_argument(
+        "--auto-output-root",
+        default=DEFAULT_AUTO_OUTPUT_ROOT,
+        help=f"Local output root for automatic weekly reports (default: {DEFAULT_AUTO_OUTPUT_ROOT}).",
+    )
+    parser.add_argument(
+        "--inventory-input-dir",
+        default=DEFAULT_INVENTORY_INPUT_DIR,
+        help=f"Input folder for sales/catalog/order exports (default: {DEFAULT_INVENTORY_INPUT_DIR}).",
+    )
+    parser.add_argument(
+        "--skip-sales-pull",
+        action="store_true",
+        help="In --auto mode, use existing files/sales*.xlsx instead of pulling sales.",
+    )
+    parser.add_argument(
+        "--skip-inventory-refresh",
+        action="store_true",
+        help="In --auto mode, use existing catalog/order source files instead of refreshing inventory.",
+    )
+    parser.add_argument(
+        "--no-inventory-order-reports",
+        action="store_true",
+        help="In --auto mode, skip 7d/14d/30d inventory order report refresh and tabs.",
+    )
+    parser.add_argument(
+        "--no-inventory-cost",
+        action="store_true",
+        help="In --auto mode, hide cost columns in generated inventory workbooks.",
+    )
+    parser.add_argument(
+        "--no-drive-upload",
+        action="store_true",
+        help="In --auto mode, generate local reports but do not upload to Drive.",
+    )
+    parser.add_argument(
+        "--drive-parent-folder",
+        default=DEFAULT_WEEKLY_DRIVE_PARENT,
+        help=f"Top-level Drive folder for weekly automatic uploads (default: {DEFAULT_WEEKLY_DRIVE_PARENT}).",
+    )
     return parser.parse_args()
 
 
@@ -452,6 +1039,9 @@ def should_include_brand(brand_cfg, requested_brands):
     requested = {normalize_key(value) for value in requested_brands}
     candidates = {normalize_key(brand_cfg["brand"]), normalize_key(brand_cfg["inventory_folder"])}
     candidates.update(normalize_key(alias) for alias in brand_cfg["report_aliases"])
+    candidates.update(normalize_key(alias) for alias in brand_cfg.get("inventory_aliases", []))
+    if brand_cfg.get("drive_folder"):
+        candidates.add(normalize_key(brand_cfg["drive_folder"]))
     return not candidates.isdisjoint(requested)
 
 
@@ -485,7 +1075,9 @@ def get_inventory_override_for_brand(brand_cfg, overrides):
     candidates = [
         brand_cfg["brand"],
         brand_cfg["inventory_folder"],
+        brand_cfg.get("drive_folder", ""),
         *brand_cfg["report_aliases"],
+        *brand_cfg.get("inventory_aliases", []),
     ]
     for candidate in candidates:
         link = overrides.get(normalize_key(candidate))
@@ -535,14 +1127,48 @@ def run_weekly_brand_credit_emailer(
     test_email=None,
     no_attachments=False,
     prompt_for_missing=False,
+    auto_generate=False,
+    sales_source=DEFAULT_SALES_SOURCE,
+    env_file=DEFAULT_API_ENV_FILE,
+    auto_output_root=DEFAULT_AUTO_OUTPUT_ROOT,
+    inventory_input_dir=DEFAULT_INVENTORY_INPUT_DIR,
+    skip_sales_pull=False,
+    skip_inventory_refresh=False,
+    include_inventory_order_reports=True,
+    include_inventory_cost=True,
+    no_drive_upload=False,
+    drive_parent_folder=DEFAULT_WEEKLY_DRIVE_PARENT,
     status_callback=None,
 ):
+    prepare_result = None
+    if auto_generate:
+        prepare_result = prepare_weekly_brand_credit_run(
+            selected_brands=selected_brands,
+            reports_dir=reports_dir,
+            links_file=links_file,
+            inventory_links_file=inventory_links_file,
+            inventory_input_dir=inventory_input_dir,
+            auto_output_root=auto_output_root,
+            sales_source=sales_source,
+            env_file=env_file,
+            skip_sales_pull=skip_sales_pull,
+            skip_inventory_refresh=skip_inventory_refresh,
+            include_inventory_order_reports=include_inventory_order_reports,
+            include_inventory_cost=include_inventory_cost,
+            no_drive_upload=no_drive_upload,
+            drive_parent_folder=drive_parent_folder,
+            status_callback=status_callback,
+        )
+        reports_dir = prepare_result["reports_dir"]
+        links_file = prepare_result["links_file"]
+        inventory_links_file = prepare_result["inventory_links_file"]
+
     inventory_overrides = normalize_inventory_overrides(inventory_overrides)
     report_links = load_report_links(links_file)
     inventory_manifest = load_inventory_manifest(inventory_links_file)
     inventory_links = load_inventory_links(inventory_links_file)
 
-    failures = []
+    failures = list((prepare_result or {}).get("upload", {}).get("failures", []))
     sends = 0
 
     for brand_cfg in WEEKLY_BRAND_EMAILS:
@@ -623,6 +1249,10 @@ def run_weekly_brand_credit_emailer(
     return {
         "sends": sends,
         "failures": failures,
+        "prepare": prepare_result,
+        "reports_dir": reports_dir,
+        "links_file": links_file,
+        "inventory_links_file": inventory_links_file,
     }
 
 
@@ -644,6 +1274,17 @@ def main():
         test_email=args.test_email,
         no_attachments=args.no_attachments,
         prompt_for_missing=True,
+        auto_generate=args.auto,
+        sales_source=args.sales_source,
+        env_file=args.env_file,
+        auto_output_root=args.auto_output_root,
+        inventory_input_dir=args.inventory_input_dir,
+        skip_sales_pull=args.skip_sales_pull,
+        skip_inventory_refresh=args.skip_inventory_refresh,
+        include_inventory_order_reports=not args.no_inventory_order_reports,
+        include_inventory_cost=not args.no_inventory_cost,
+        no_drive_upload=args.no_drive_upload,
+        drive_parent_folder=args.drive_parent_folder,
     )
 
     if result["sends"] == 0 and not args.dry_run:
