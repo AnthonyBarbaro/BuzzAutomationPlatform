@@ -2,9 +2,11 @@ import unittest
 from datetime import datetime
 
 from kickback_report_link_emailer import (
+    ANTHONY_EMAIL,
     ReportMatch,
     _extract_folder_id,
     _file_matches_brand,
+    anthony_only_recipients,
     build_email_bodies,
     filter_reports_by_date_ranges,
     parse_date_range_text,
@@ -66,6 +68,12 @@ class KickbackReportLinkEmailerTests(unittest.TestCase):
         self.assertEqual(
             parse_date_range_text("4/26-5/02", 2026),
             (datetime(2026, 4, 26).date(), datetime(2026, 5, 2).date()),
+        )
+
+    def test_recipient_policy_forces_anthony_only(self):
+        self.assertEqual(
+            anthony_only_recipients(["rep@example.com", "donna@buzzcannabis.com"]),
+            [ANTHONY_EMAIL],
         )
 
     def test_date_range_filter_matches_retail_week_to_drive_folder_offset(self):

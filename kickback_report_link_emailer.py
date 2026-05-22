@@ -24,9 +24,10 @@ READONLY_DRIVE_TOKEN_FILE = THIS_DIR / "token_drive_readonly.json"
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
-DEFAULT_RECIPIENTS = ["anthony@buzzcannabis.com"]
+ANTHONY_EMAIL = "anthony@buzzcannabis.com"
+DEFAULT_RECIPIENTS = [ANTHONY_EMAIL]
 DEFAULT_SUPPORT_LINE = (
-    "Please include anthony@buzzcannabis.com and donna@buzzcannabis.com "
+    "Please include anthony@buzzcannabis.com "
     "in all emails regarding these credits."
 )
 KICKBACK_ROOTS = {
@@ -392,7 +393,12 @@ def build_email_bodies(
     return "\n".join(text_sections).strip() + "\n", "\n".join(html_sections)
 
 
+def anthony_only_recipients(recipients: Sequence[str] | None) -> list[str]:
+    return [ANTHONY_EMAIL]
+
+
 def send_email(subject: str, text_body: str, html_body: str, recipients: Sequence[str]) -> str:
+    recipients = anthony_only_recipients(recipients)
     service = _build_gmail_service()
     message = EmailMessage()
     message["From"] = "me"
@@ -421,7 +427,7 @@ def parse_args() -> argparse.Namespace:
         "--to",
         nargs="+",
         default=DEFAULT_RECIPIENTS,
-        help="Recipient email address(es) (default: anthony@buzzcannabis.com)",
+        help="Recipient email address(es). Kickback sends are forced to anthony@buzzcannabis.com.",
     )
     parser.add_argument(
         "--dry-run",
@@ -514,8 +520,17 @@ def main() -> int:
         print(text_body)
         return 0
 
-    message_id = send_email(subject, text_body, html_body, args.to)
-    print(f"[GMAIL] Email sent to {', '.join(args.to)} | ID: {message_id} | Subject: {subject}")
+    recipients = anthony_only_recipients(args.to)
+    blocked_recipients = [
+        recipient
+        for recipient in args.to
+        if str(recipient).strip().lower() != ANTHONY_EMAIL
+    ]
+    if blocked_recipients:
+        print(f"[WARN] Recipient policy forced send to {ANTHONY_EMAIL} only.")
+
+    message_id = send_email(subject, text_body, html_body, recipients)
+    print(f"[GMAIL] Email sent to {', '.join(recipients)} | ID: {message_id} | Subject: {subject}")
     return 0
 
 
