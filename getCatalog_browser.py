@@ -23,6 +23,13 @@ from webdriver_manager.chrome import ChromeDriverManager
 import getSalesReport as sales_report
 
 CATALOG_URL = "https://dusk.backoffice.dutchie.com/products/catalog"
+MIN_CATALOG_EXPORT_BYTES = 128
+CATALOG_HEADER_MARKERS = ("SKU", "Product", "Price")
+CATALOG_EXPORT_ATTEMPTS = 3
+CATALOG_READY_TIMEOUT_SECONDS = 180
+EXPORT_MODAL_TIMEOUT_SECONDS = 60
+POST_STORE_SELECT_WAIT_SECONDS = 12
+PRE_EXPORT_SETTLE_SECONDS = 20
 
 
 def launch_browser(download_dir):
@@ -60,26 +67,74 @@ def launch_browser(download_dir):
     return driver
 
 
+def is_valid_catalog_export(path):
+    """
+    Dutchie can occasionally return a tiny/blank CSV if export is clicked before
+    the catalog table is ready. Do not let that replace a real store file.
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return False
+        if os.path.getsize(path) < MIN_CATALOG_EXPORT_BYTES:
+            return False
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as handle:
+            first_line = handle.readline()
+    except OSError:
+        return False
+
+    return all(marker in first_line for marker in CATALOG_HEADER_MARKERS)
+
+
+def wait_for_catalog_ready(timeout=CATALOG_READY_TIMEOUT_SECONDS):
+    driver = sales_report.driver
+    wait = WebDriverWait(driver, timeout)
+
+    # The older working catalog exporter used a fixed sleep before exporting.
+    # Dutchie's catalog grid is virtualized enough that row/text probes can lie,
+    # especially on Mission Valley, so only require Actions to exist and then
+    # give the store switch time to finish.
+    wait.until(EC.element_to_be_clickable((By.ID, "actions-menu-button")))
+    time.sleep(PRE_EXPORT_SETTLE_SECONDS)
+
+
 def rename_catalog_export(downloaded_path, current_store, output_dir):
+    if not is_valid_catalog_export(downloaded_path):
+        raise RuntimeError(
+            f"Downloaded catalog export for {current_store} was blank or invalid: {downloaded_path}"
+        )
+
     extension = os.path.splitext(downloaded_path)[1] or ".csv"
     today_str = datetime.now().strftime("%m-%d-%Y")
     store_abbr = sales_report.store_abbr_map.get(current_store, "UNK")
     destination = os.path.join(output_dir, f"{today_str}_{store_abbr}{extension}")
+    temp_destination = f"{destination}.tmp"
+
+    if os.path.exists(temp_destination):
+        os.remove(temp_destination)
+    os.rename(downloaded_path, temp_destination)
 
     if os.path.exists(destination):
         os.remove(destination)
-    os.rename(downloaded_path, destination)
+    os.rename(temp_destination, destination)
     print(f"[SAVED] {current_store}: {destination}")
 
 
 def click_actions_and_export(current_store, output_dir):
     driver = sales_report.driver
-    wait = WebDriverWait(driver, 12)
+    wait = WebDriverWait(driver, EXPORT_MODAL_TIMEOUT_SECONDS)
 
     try:
+        print(f"[WAIT] {current_store}: waiting for catalog table to load...")
+        wait_for_catalog_ready()
         before_snapshot = sales_report._snapshot_files(output_dir)
-        sales_report.robust_click(By.ID, "actions-menu-button", "Actions button", timeout=12, attempts=4)
-        time.sleep(1)
+        sales_report.robust_click(
+            By.ID,
+            "actions-menu-button",
+            "Actions button",
+            timeout=EXPORT_MODAL_TIMEOUT_SECONDS,
+            attempts=4,
+        )
+        time.sleep(2)
 
         export_option = wait.until(
             EC.element_to_be_clickable(
@@ -138,10 +193,21 @@ def run_catalog_browser_export(output_dir="files", stores=None):
             if not sales_report.select_dropdown_item(store_name):
                 failures.append(f"{store_name}: store selection failed")
                 continue
-            try:
-                click_actions_and_export(store_name, output_dir)
-            except Exception as exc:
-                failures.append(f"{store_name}: {exc}")
+            print(f"[WAIT] {store_name}: letting store catalog settle for {POST_STORE_SELECT_WAIT_SECONDS}s")
+            time.sleep(POST_STORE_SELECT_WAIT_SECONDS)
+            last_error = None
+            for attempt in range(1, CATALOG_EXPORT_ATTEMPTS + 1):
+                try:
+                    print(f"[EXPORT] {store_name}: attempt {attempt}/{CATALOG_EXPORT_ATTEMPTS}")
+                    click_actions_and_export(store_name, output_dir)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    print(f"[WARN] {store_name}: catalog export attempt {attempt} failed: {exc}")
+                    time.sleep(4)
+            if last_error is not None:
+                failures.append(f"{store_name}: {last_error}")
     finally:
         driver.quit()
 

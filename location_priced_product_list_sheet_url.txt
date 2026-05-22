@@ -1,0 +1,3 @@
+# Google Sheet used by other-scripts/location_priced_product_list.py
+# This file is reused by cron so each run updates the same spreadsheet.
+https://docs.google.com/spreadsheets/d/1HlQdBf-Itb-9v24vOk1V9N7qASy8_c6fPKvVQOnl8zY/edit?ouid=109813902982001131370
