@@ -42,47 +42,73 @@ MIN_AVAILABLE_QTY = 5          # Minimum inventory units to keep a product
 MIN_COST = 1.0                 # Minimum cost to keep a product
 
 # --- Margin & tax/fees configuration --------------------------------------- #
-# Everyday scenario: 30% off + 10% back in points ≈ 37% total discount
-# Effective revenue is about 63% of shelf price.
-EFFECTIVE_REVENUE_RATE = 0.63
-OUT_THE_DOOR_MULTIPLIER = 1.33  # multiplier from effective price
+# Everyday scenario: 30% off, no loyalty-back adjustment.
+# Effective revenue is about 70% of shelf price.
+EFFECTIVE_REVENUE_RATE = 0.70
+OUT_THE_DOOR_TAX_RATE = 0.36
+OUT_THE_DOOR_MULTIPLIER = round(1 + OUT_THE_DOOR_TAX_RATE, 2)
+TARGET_MARGIN = 0.45
+MARGIN_REVIEW_FLOOR = 0.35
+
+RAW_OTD_COLUMN = "Raw_Out-The-Door"
+ROUNDING_LOSS_COLUMN = "RoundDown_Loss"
+TAX_BACKED_REVENUE_COLUMN = "Revenue_After_Tax"
+TARGET_OTD_COLUMN = "TargetOTD_45Margin"
+OTD_GAP_COLUMN = "OTD_Gap_To_45"
 
 # --- Promo definitions ------------------------------------------------------ #
-# Scenario 1: 50% discount + 10% back in points (~55% total) + 30% lower cost
+# Scenario 1: 50% discount + 30% kickback/lower cost
 PROMO_50 = {
-    "label": "50% Off + 10% Back + 30% Cost Relief",
-    "total_discount": 0.55,     # overall customer-facing discount on price
-    "cost_reduction": 0.30,     # vendor gives ~30% cost support
+    "label": "50% Off + 30% Kickback",
+    "total_discount": 0.50,
+    "cost_reduction": 0.30,
 }
 
-# Scenario 2: 40% discount + 10% back in points (~46% total) + 25% lower cost
+# Scenario 2: 40% discount + 25% kickback/lower cost
 PROMO_40 = {
-    "label": "40% Off + 10% Back + 25% Cost Relief",
-    "total_discount": 0.46,     # 1 - (0.60 * 0.90) = 0.46
-    "cost_reduction": 0.25,     # vendor gives 25% cost support
-}
-
-# Scenario 3: 50% discount + 10% back + 25% lower cost (softer vendor support)
-PROMO_50_SOFT = {
-    "label": "50% Off + 10% Back + 25% Cost Relief",
-    "total_discount": 0.55,
+    "label": "40% Off + 25% Kickback",
+    "total_discount": 0.40,
     "cost_reduction": 0.25,
 }
 
-# Scenario 4: 40% discount + 10% back + 20% lower cost
+# Scenario 3: 50% discount + 25% kickback/lower cost
+PROMO_50_SOFT = {
+    "label": "50% Off + 25% Kickback",
+    "total_discount": 0.50,
+    "cost_reduction": 0.25,
+}
+
+# Scenario 4: 40% discount + 20% kickback/lower cost
 PROMO_40_SOFT = {
-    "label": "40% Off + 10% Back + 20% Cost Relief",
-    "total_discount": 0.46,
+    "label": "40% Off + 20% Kickback",
+    "total_discount": 0.40,
     "cost_reduction": 0.20,
+}
+
+PRODUCT_BACK_25 = {
+    "label": "25% Product Back",
+    "rate": 0.25,
+}
+
+PRODUCT_BACK_30 = {
+    "label": "30% Product Back",
+    "rate": 0.30,
 }
 
 # --- Columns to strip from the final export -------------------------------- #
 # (We still use some of these internally, but they won’t show in the Excel.)
 COLUMNS_TO_STRIP = [
+    "SKU",
+    "Sku",
+    "sku",
     "Strain",
+    "Strain Type",
+    "Strain type",
+    "StrainType",
     "Location price",
     "Vendor",
     "Tags",
+    "Store",
     "Strain_Type",
     "Product_Weight",
     "Product_SubType",
@@ -95,6 +121,8 @@ EXPORT_ONLY_COLUMNS_TO_REMOVE = {
     "Brand Strain Type",
     "Price_Used_Source",
     "Is_Store_Specific",
+    "Product_List",
+    "Merged_Count",
 }
 
 # Columns to format as currency / percent in Excel (for Products sheet only)
@@ -103,15 +131,22 @@ CURRENCY_COLUMNS = {
     "Cost",
     "Price_Used",
     "Effective_Price",
+    RAW_OTD_COLUMN,
     "Out-The-Door",
+    ROUNDING_LOSS_COLUMN,
+    TAX_BACKED_REVENUE_COLUMN,
     "TargetPrice_45Margin",
     "DiffTo45Margin",
+    TARGET_OTD_COLUMN,
+    OTD_GAP_COLUMN,
     "Promo50_Effective_Price",
     "Promo50_Cost",
     "Promo40_Effective_Price",
     "Promo40_Cost",
     "Promo50_Cost_25Relief",
     "Promo40_Cost_20Relief",
+    "ProductBack25_Cost",
+    "ProductBack30_Cost",
 }
 
 PERCENT_COLUMNS = {
@@ -120,10 +155,72 @@ PERCENT_COLUMNS = {
     "Margin_Promo40",
     "Margin_Promo50_25Relief",
     "Margin_Promo40_20Relief",
+    "Margin_ProductBack25",
+    "Margin_ProductBack30",
+    "Margin_Promo50_ProductBack25",
+    "Margin_Promo50_ProductBack30",
     "AvgMargin",
     "MinMargin",
     "MaxMargin",
 }
+
+HIDDEN_PRODUCT_COLUMNS = {
+    "Promo40_Effective_Price",
+    "Promo40_Cost",
+    "Margin_Promo40",
+    "Promo50_Cost_25Relief",
+    "Margin_Promo50_25Relief",
+    "Promo40_Cost_20Relief",
+    "Margin_Promo40_20Relief",
+    "ProductBack25_Cost",
+    "Margin_ProductBack25",
+    "ProductBack30_Cost",
+    "Margin_ProductBack30",
+    "Margin_Promo50_ProductBack25",
+    "Margin_Promo50_ProductBack30",
+}
+
+EXPORT_COLUMN_ORDER = [
+    "Product",
+    "Category",
+    "Brand",
+    "Cost",
+    "Price",
+    "Price_Used",
+    "Effective_Price",
+    RAW_OTD_COLUMN,
+    "Out-The-Door",
+    ROUNDING_LOSS_COLUMN,
+    TAX_BACKED_REVENUE_COLUMN,
+    "Margin",
+    "TargetPrice_45Margin",
+    "DiffTo45Margin",
+    TARGET_OTD_COLUMN,
+    OTD_GAP_COLUMN,
+    "Promo50_Effective_Price",
+    "Promo50_Cost",
+    "Margin_Promo50",
+    "Promo40_Effective_Price",
+    "Promo40_Cost",
+    "Margin_Promo40",
+    "Promo50_Cost_25Relief",
+    "Margin_Promo50_25Relief",
+    "Promo40_Cost_20Relief",
+    "Margin_Promo40_20Relief",
+    "ProductBack25_Cost",
+    "Margin_ProductBack25",
+    "ProductBack30_Cost",
+    "Margin_ProductBack30",
+    "Margin_Promo50_ProductBack25",
+    "Margin_Promo50_ProductBack30",
+]
+
+WIDE_TEXT_COLUMNS = {"Product"}
+MEDIUM_TEXT_COLUMNS = {"Category", "Brand", "Scenario"}
+DEFAULT_COLUMN_WIDTH_CAP = 60
+WIDE_COLUMN_WIDTH_CAP = 120
+MEDIUM_COLUMN_WIDTH_CAP = 50
+NUMERIC_COLUMN_WIDTH_CAP = 28
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -253,8 +350,10 @@ def format_excel_file(filename: str) -> None:
                     if length > max_length:
                         max_length = length
 
-            # Auto width
-            ws.column_dimensions[col_letter].width = min(max(max_length + 2, len(header_text) + 2), 40)
+            # Auto width with enough room for headers and long product names.
+            ws.column_dimensions[col_letter].width = _best_column_width(header_text, max_length)
+            if header_text in HIDDEN_PRODUCT_COLUMNS:
+                ws.column_dimensions[col_letter].hidden = True
 
             # Number formats + right alignment
             if header_text in CURRENCY_COLUMNS:
@@ -295,6 +394,45 @@ def _display_width_hint(value) -> int:
     return len(str(value))
 
 
+def _column_width_cap(header_text: str) -> int:
+    """Return a practical Excel width cap that keeps text readable."""
+    if header_text in WIDE_TEXT_COLUMNS:
+        return WIDE_COLUMN_WIDTH_CAP
+    if header_text in MEDIUM_TEXT_COLUMNS:
+        return MEDIUM_COLUMN_WIDTH_CAP
+    if header_text in CURRENCY_COLUMNS or header_text in PERCENT_COLUMNS:
+        return NUMERIC_COLUMN_WIDTH_CAP
+    return DEFAULT_COLUMN_WIDTH_CAP
+
+
+def _best_column_width(header_text: str, max_length: int) -> float:
+    """Choose a width that fits the title/header and most visible values."""
+    header_width = _display_width_hint(header_text) + 2
+    content_width = max_length + 2
+    cap = max(_column_width_cap(header_text), header_width)
+    return min(max(header_width, content_width, 10), cap)
+
+
+def revenue_after_rounddown_loss(effective_price):
+    """Treat the full out-the-door rounddown as lost revenue."""
+    raw_otd = effective_price * OUT_THE_DOOR_MULTIPLIER
+    return effective_price - (raw_otd - np.trunc(raw_otd))
+
+
+def target_price_for_margin(cost_value):
+    """Small exact search for the first whole-dollar price that hits target margin."""
+    if pd.isna(cost_value):
+        return np.nan
+
+    required_revenue = cost_value / (1 - TARGET_MARGIN)
+    price = max(0, int(np.ceil(required_revenue / EFFECTIVE_REVENUE_RATE)))
+
+    while revenue_after_rounddown_loss(price * EFFECTIVE_REVENUE_RATE) < required_revenue:
+        price += 1
+
+    return float(price)
+
+
 def export_schema_cleaner(df: pd.DataFrame) -> pd.DataFrame:
     """Drop columns that should never appear in the exported workbook."""
     if df is None or df.empty:
@@ -304,8 +442,20 @@ def export_schema_cleaner(df: pd.DataFrame) -> pd.DataFrame:
     existing = [col for col in df.columns if col in columns_to_remove]
     if existing:
         print(f"[INFO] Removing export-only columns: {existing}")
-        return df.drop(columns=existing)
-    return df
+        df = df.drop(columns=existing)
+    if "Price" in df.columns and "Price_Used" in df.columns:
+        price = pd.to_numeric(df["Price"], errors="coerce")
+        price_used = pd.to_numeric(df["Price_Used"], errors="coerce")
+        same_price = (
+            (price.isna() & price_used.isna())
+            | np.isclose(price.fillna(0), price_used.fillna(0), rtol=0, atol=0.005)
+        )
+        if bool(same_price.all()):
+            print("[INFO] Removing Price_Used because it matches Price for this export.")
+            df = df.drop(columns=["Price_Used"])
+    ordered = [col for col in EXPORT_COLUMN_ORDER if col in df.columns]
+    remaining = [col for col in df.columns if col not in ordered]
+    return df[ordered + remaining]
 
 
 def build_header_column_map(ws) -> dict[str, str]:
@@ -342,38 +492,87 @@ def apply_excel_formulas(ws, header_map: dict[str, str]) -> None:
 
     print(f"[INFO] Applying formulas to sheet '{ws.title}'...")
 
+    price_basis_col = "Price_Used" if "Price_Used" in header_map else "Price"
+
+    def rounddown_loss_adjusted_revenue(amount_ref: str) -> str:
+        raw_otd = f'({amount_ref}*{OUT_THE_DOOR_MULTIPLIER})'
+        return f'({amount_ref}-({raw_otd}-ROUNDDOWN({raw_otd},0)))'
+
+    def revenue_for_shelf_price(price_ref: str) -> str:
+        return rounddown_loss_adjusted_revenue(f'({price_ref}*{EFFECTIVE_REVENUE_RATE})')
+
+    def target_price_45_formula(cost_ref: str) -> str:
+        required_revenue = f'({cost_ref}/(1-{TARGET_MARGIN}))'
+        base_price = f'ROUNDUP({required_revenue}/{EFFECTIVE_REVENUE_RATE},0)'
+        base_plus_one = f'({base_price}+1)'
+        base_plus_two = f'({base_price}+2)'
+        return (
+            f'=IFERROR(IF({revenue_for_shelf_price(base_price)}>={required_revenue},'
+            f'{base_price},IF({revenue_for_shelf_price(base_plus_one)}>={required_revenue},'
+            f'{base_plus_one},{base_plus_two})),"")'
+        )
+
     formula_specs = [
         (
             "Effective_Price",
-            ["Price_Used"],
-            lambda refs: f'=IFERROR({refs["Price_Used"]}*{EFFECTIVE_REVENUE_RATE},"")',
+            [price_basis_col],
+            lambda refs: f'=IFERROR({refs[price_basis_col]}*{EFFECTIVE_REVENUE_RATE},"")',
         ),
         (
-            "Out-The-Door",
+            RAW_OTD_COLUMN,
             ["Effective_Price"],
             lambda refs: f'=IFERROR({refs["Effective_Price"]}*{OUT_THE_DOOR_MULTIPLIER},"")',
         ),
         (
+            "Out-The-Door",
+            [RAW_OTD_COLUMN],
+            lambda refs: f'=IFERROR(ROUNDDOWN({refs[RAW_OTD_COLUMN]},0),"")',
+        ),
+        (
+            ROUNDING_LOSS_COLUMN,
+            [RAW_OTD_COLUMN, "Out-The-Door"],
+            lambda refs: f'=IFERROR({refs[RAW_OTD_COLUMN]}-{refs["Out-The-Door"]},"")',
+        ),
+        (
+            TAX_BACKED_REVENUE_COLUMN,
+            ["Effective_Price", ROUNDING_LOSS_COLUMN],
+            lambda refs: f'=IFERROR({refs["Effective_Price"]}-{refs[ROUNDING_LOSS_COLUMN]},"")',
+        ),
+        (
             "Margin",
-            ["Effective_Price", "Cost"],
+            [TAX_BACKED_REVENUE_COLUMN, "Cost"],
             lambda refs: (
-                f'=IFERROR(({refs["Effective_Price"]}-{refs["Cost"]})/{refs["Effective_Price"]},"")'
+                f'=IFERROR(({refs[TAX_BACKED_REVENUE_COLUMN]}-{refs["Cost"]})/'
+                f'{refs[TAX_BACKED_REVENUE_COLUMN]},"")'
             ),
         ),
         (
             "TargetPrice_45Margin",
             ["Cost"],
-            lambda refs: f'=IFERROR({refs["Cost"]}/0.385,"")',
+            lambda refs: target_price_45_formula(refs["Cost"]),
+        ),
+        (
+            TARGET_OTD_COLUMN,
+            ["TargetPrice_45Margin"],
+            lambda refs: (
+                f'=IFERROR(ROUNDDOWN({refs["TargetPrice_45Margin"]}*'
+                f'{EFFECTIVE_REVENUE_RATE}*{OUT_THE_DOOR_MULTIPLIER},0),"")'
+            ),
+        ),
+        (
+            OTD_GAP_COLUMN,
+            [TARGET_OTD_COLUMN, "Out-The-Door"],
+            lambda refs: f'=IFERROR({refs[TARGET_OTD_COLUMN]}-{refs["Out-The-Door"]},"")',
         ),
         (
             "DiffTo45Margin",
-            ["TargetPrice_45Margin", "Price_Used"],
-            lambda refs: f'=IFERROR({refs["TargetPrice_45Margin"]}-{refs["Price_Used"]},"")',
+            ["TargetPrice_45Margin", price_basis_col],
+            lambda refs: f'=IFERROR({refs["TargetPrice_45Margin"]}-{refs[price_basis_col]},"")',
         ),
         (
             "Promo50_Effective_Price",
-            ["Price_Used"],
-            lambda refs: f'=IFERROR({refs["Price_Used"]}*(1-{PROMO_50["total_discount"]}),"")',
+            [price_basis_col],
+            lambda refs: f'=IFERROR({refs[price_basis_col]}*(1-{PROMO_50["total_discount"]}),"")',
         ),
         (
             "Promo50_Cost",
@@ -381,17 +580,62 @@ def apply_excel_formulas(ws, header_map: dict[str, str]) -> None:
             lambda refs: f'=IFERROR({refs["Cost"]}*(1-{PROMO_50["cost_reduction"]}),"")',
         ),
         (
+            "ProductBack25_Cost",
+            ["Cost"],
+            lambda refs: f'=IFERROR({refs["Cost"]}/(1+{PRODUCT_BACK_25["rate"]}),"")',
+        ),
+        (
+            "ProductBack30_Cost",
+            ["Cost"],
+            lambda refs: f'=IFERROR({refs["Cost"]}/(1+{PRODUCT_BACK_30["rate"]}),"")',
+        ),
+        (
             "Margin_Promo50",
             ["Promo50_Effective_Price", "Promo50_Cost"],
             lambda refs: (
-                f'=IFERROR(({refs["Promo50_Effective_Price"]}-{refs["Promo50_Cost"]})/'
-                f'{refs["Promo50_Effective_Price"]},"")'
+                f'=IFERROR(({rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])}-'
+                f'{refs["Promo50_Cost"]})/'
+                f'{rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])},"")'
+            ),
+        ),
+        (
+            "Margin_ProductBack25",
+            [TAX_BACKED_REVENUE_COLUMN, "ProductBack25_Cost"],
+            lambda refs: (
+                f'=IFERROR(({refs[TAX_BACKED_REVENUE_COLUMN]}-{refs["ProductBack25_Cost"]})/'
+                f'{refs[TAX_BACKED_REVENUE_COLUMN]},"")'
+            ),
+        ),
+        (
+            "Margin_ProductBack30",
+            [TAX_BACKED_REVENUE_COLUMN, "ProductBack30_Cost"],
+            lambda refs: (
+                f'=IFERROR(({refs[TAX_BACKED_REVENUE_COLUMN]}-{refs["ProductBack30_Cost"]})/'
+                f'{refs[TAX_BACKED_REVENUE_COLUMN]},"")'
+            ),
+        ),
+        (
+            "Margin_Promo50_ProductBack25",
+            ["Promo50_Effective_Price", "ProductBack25_Cost"],
+            lambda refs: (
+                f'=IFERROR(({rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])}-'
+                f'{refs["ProductBack25_Cost"]})/'
+                f'{rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])},"")'
+            ),
+        ),
+        (
+            "Margin_Promo50_ProductBack30",
+            ["Promo50_Effective_Price", "ProductBack30_Cost"],
+            lambda refs: (
+                f'=IFERROR(({rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])}-'
+                f'{refs["ProductBack30_Cost"]})/'
+                f'{rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])},"")'
             ),
         ),
         (
             "Promo40_Effective_Price",
-            ["Price_Used"],
-            lambda refs: f'=IFERROR({refs["Price_Used"]}*(1-{PROMO_40["total_discount"]}),"")',
+            [price_basis_col],
+            lambda refs: f'=IFERROR({refs[price_basis_col]}*(1-{PROMO_40["total_discount"]}),"")',
         ),
         (
             "Promo40_Cost",
@@ -402,8 +646,9 @@ def apply_excel_formulas(ws, header_map: dict[str, str]) -> None:
             "Margin_Promo40",
             ["Promo40_Effective_Price", "Promo40_Cost"],
             lambda refs: (
-                f'=IFERROR(({refs["Promo40_Effective_Price"]}-{refs["Promo40_Cost"]})/'
-                f'{refs["Promo40_Effective_Price"]},"")'
+                f'=IFERROR(({rounddown_loss_adjusted_revenue(refs["Promo40_Effective_Price"])}-'
+                f'{refs["Promo40_Cost"]})/'
+                f'{rounddown_loss_adjusted_revenue(refs["Promo40_Effective_Price"])},"")'
             ),
         ),
         (
@@ -415,8 +660,9 @@ def apply_excel_formulas(ws, header_map: dict[str, str]) -> None:
             "Margin_Promo50_25Relief",
             ["Promo50_Effective_Price", "Promo50_Cost_25Relief"],
             lambda refs: (
-                f'=IFERROR(({refs["Promo50_Effective_Price"]}-{refs["Promo50_Cost_25Relief"]})/'
-                f'{refs["Promo50_Effective_Price"]},"")'
+                f'=IFERROR(({rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])}-'
+                f'{refs["Promo50_Cost_25Relief"]})/'
+                f'{rounddown_loss_adjusted_revenue(refs["Promo50_Effective_Price"])},"")'
             ),
         ),
         (
@@ -428,8 +674,9 @@ def apply_excel_formulas(ws, header_map: dict[str, str]) -> None:
             "Margin_Promo40_20Relief",
             ["Promo40_Effective_Price", "Promo40_Cost_20Relief"],
             lambda refs: (
-                f'=IFERROR(({refs["Promo40_Effective_Price"]}-{refs["Promo40_Cost_20Relief"]})/'
-                f'{refs["Promo40_Effective_Price"]},"")'
+                f'=IFERROR(({rounddown_loss_adjusted_revenue(refs["Promo40_Effective_Price"])}-'
+                f'{refs["Promo40_Cost_20Relief"]})/'
+                f'{rounddown_loss_adjusted_revenue(refs["Promo40_Effective_Price"])},"")'
             ),
         ),
     ]
@@ -591,81 +838,127 @@ def process_single_file(file_path: str, selected_brands):
         price = df['Price_Used']
         cost = df['Cost']
 
-        # Everyday effective price & out-the-door (30% off + 10% back → 63% of price)
+        # Everyday effective price & rounded out-the-door
+        # (30% off -> 70% of price, then 36% tax and round down OTD).
         eff = price * EFFECTIVE_REVENUE_RATE
+        raw_otd = eff * OUT_THE_DOOR_MULTIPLIER
+        otd = np.trunc(raw_otd)
+        rounding_loss = raw_otd - otd
+        net_revenue = eff - rounding_loss
+        profit_per_unit = net_revenue - cost
         df['Effective_Price'] = eff
-        df['Out-The-Door'] = eff * OUT_THE_DOOR_MULTIPLIER
+        df[RAW_OTD_COLUMN] = raw_otd
+        df['Out-The-Door'] = otd
+        df[ROUNDING_LOSS_COLUMN] = rounding_loss
+        df[TAX_BACKED_REVENUE_COLUMN] = net_revenue
 
-        # Everyday (current) margin
+        # Everyday margin treats the full OTD rounddown as lost revenue.
         df['Margin'] = np.where(
-            eff.notna() & (eff != 0),
-            (eff - cost) / eff,
+            net_revenue.notna() & (net_revenue != 0),
+            profit_per_unit / net_revenue,
             np.nan
         )
 
-        # Target price for 45% margin
-        df['TargetPrice_45Margin'] = np.where(
-            cost.notna(),
-            cost / 0.385,
-            np.nan
-        )
+        # Target price for 45% margin: first whole-dollar shelf price whose
+        # revenue still clears target after the full OTD rounddown loss.
+        df['TargetPrice_45Margin'] = cost.apply(target_price_for_margin)
+        target_eff = df['TargetPrice_45Margin'] * EFFECTIVE_REVENUE_RATE
+        df[TARGET_OTD_COLUMN] = np.trunc(target_eff * OUT_THE_DOOR_MULTIPLIER)
         df['DiffTo45Margin'] = df['TargetPrice_45Margin'] - df['Price_Used']
+        df[OTD_GAP_COLUMN] = df[TARGET_OTD_COLUMN] - df['Out-The-Door']
 
-        # --- Promo 50% off + 10% back + 30% lower cost --------------------
-        promo50_price = price * (1 - PROMO_50["total_discount"])  # Price_Used * 0.45
+        # --- Promo 50% off + 30% lower cost -------------------------------
+        promo50_price = price * (1 - PROMO_50["total_discount"])  # Price_Used * 0.50
         promo50_cost = cost * (1 - PROMO_50["cost_reduction"])    # Cost * 0.70
+        promo50_revenue = revenue_after_rounddown_loss(promo50_price)
+        product_back25_cost = cost / (1 + PRODUCT_BACK_25["rate"])
+        product_back30_cost = cost / (1 + PRODUCT_BACK_30["rate"])
 
         df['Promo50_Effective_Price'] = promo50_price
         df['Promo50_Cost'] = promo50_cost
+        df['ProductBack25_Cost'] = product_back25_cost
+        df['ProductBack30_Cost'] = product_back30_cost
 
         df['Margin_Promo50'] = np.where(
-            promo50_price.notna() & (promo50_price > 0),
-            (promo50_price - promo50_cost) / promo50_price,
+            promo50_revenue.notna() & (promo50_revenue > 0),
+            (promo50_revenue - promo50_cost) / promo50_revenue,
+            np.nan
+        )
+        df['Margin_ProductBack25'] = np.where(
+            net_revenue.notna() & (net_revenue > 0),
+            (net_revenue - product_back25_cost) / net_revenue,
+            np.nan
+        )
+        df['Margin_ProductBack30'] = np.where(
+            net_revenue.notna() & (net_revenue > 0),
+            (net_revenue - product_back30_cost) / net_revenue,
+            np.nan
+        )
+        df['Margin_Promo50_ProductBack25'] = np.where(
+            promo50_revenue.notna() & (promo50_revenue > 0),
+            (promo50_revenue - product_back25_cost) / promo50_revenue,
+            np.nan
+        )
+        df['Margin_Promo50_ProductBack30'] = np.where(
+            promo50_revenue.notna() & (promo50_revenue > 0),
+            (promo50_revenue - product_back30_cost) / promo50_revenue,
             np.nan
         )
 
-        # --- Promo 40% off + 10% back + 25% cost relief -------------------
-        promo40_price = price * (1 - PROMO_40["total_discount"])  # Price_Used * 0.54
+        # --- Promo 40% off + 25% cost relief ------------------------------
+        promo40_price = price * (1 - PROMO_40["total_discount"])  # Price_Used * 0.60
         promo40_cost = cost * (1 - PROMO_40["cost_reduction"])    # Cost * 0.75
+        promo40_revenue = revenue_after_rounddown_loss(promo40_price)
 
         df['Promo40_Effective_Price'] = promo40_price
         df['Promo40_Cost'] = promo40_cost
 
         df['Margin_Promo40'] = np.where(
-            promo40_price.notna() & (promo40_price > 0),
-            (promo40_price - promo40_cost) / promo40_price,
+            promo40_revenue.notna() & (promo40_revenue > 0),
+            (promo40_revenue - promo40_cost) / promo40_revenue,
             np.nan
         )
 
         # --- Alternate promo scenarios with less cost relief -------------
-        # 50% off + 10% back, but only 25% cost relief
+        # 50% off, but only 25% cost relief
         promo50_cost_soft = cost * (1 - PROMO_50_SOFT["cost_reduction"])  # Cost * 0.75
         df['Promo50_Cost_25Relief'] = promo50_cost_soft
         df['Margin_Promo50_25Relief'] = np.where(
-            promo50_price.notna() & (promo50_price > 0),
-            (promo50_price - promo50_cost_soft) / promo50_price,
+            promo50_revenue.notna() & (promo50_revenue > 0),
+            (promo50_revenue - promo50_cost_soft) / promo50_revenue,
             np.nan
         )
 
-        # 40% off + 10% back, but only 20% cost relief
+        # 40% off, but only 20% cost relief
         promo40_cost_soft = cost * (1 - PROMO_40_SOFT["cost_reduction"])  # Cost * 0.80
         df['Promo40_Cost_20Relief'] = promo40_cost_soft
         df['Margin_Promo40_20Relief'] = np.where(
-            promo40_price.notna() & (promo40_price > 0),
-            (promo40_price - promo40_cost_soft) / promo40_price,
+            promo40_revenue.notna() & (promo40_revenue > 0),
+            (promo40_revenue - promo40_cost_soft) / promo40_revenue,
             np.nan
         )
 
     else:
         # If we can't compute margins, keep the rows but with NaNs
         df['Effective_Price'] = np.nan
+        df[RAW_OTD_COLUMN] = np.nan
         df['Out-The-Door'] = np.nan
+        df[ROUNDING_LOSS_COLUMN] = np.nan
+        df[TAX_BACKED_REVENUE_COLUMN] = np.nan
         df['Margin'] = np.nan
         df['TargetPrice_45Margin'] = np.nan
         df['DiffTo45Margin'] = np.nan
+        df[TARGET_OTD_COLUMN] = np.nan
+        df[OTD_GAP_COLUMN] = np.nan
         df['Promo50_Effective_Price'] = np.nan
         df['Promo50_Cost'] = np.nan
         df['Margin_Promo50'] = np.nan
+        df['ProductBack25_Cost'] = np.nan
+        df['ProductBack30_Cost'] = np.nan
+        df['Margin_ProductBack25'] = np.nan
+        df['Margin_ProductBack30'] = np.nan
+        df['Margin_Promo50_ProductBack25'] = np.nan
+        df['Margin_Promo50_ProductBack30'] = np.nan
         df['Promo40_Effective_Price'] = np.nan
         df['Promo40_Cost'] = np.nan
         df['Margin_Promo40'] = np.nan
@@ -826,8 +1119,12 @@ def build_scenario_summary(df: pd.DataFrame) -> list[dict]:
     scenario_rows: list[dict] = []
 
     scenario_label_map = {
-        "Margin": "Current Everyday Pricing",
+        "Margin": "Current 30% Off Pricing",
+        "Margin_ProductBack25": f"Current 30% Off + {PRODUCT_BACK_25['label']}",
+        "Margin_ProductBack30": f"Current 30% Off + {PRODUCT_BACK_30['label']}",
         "Margin_Promo50": PROMO_50["label"],
+        "Margin_Promo50_ProductBack25": f"50% Off + {PRODUCT_BACK_25['label']}",
+        "Margin_Promo50_ProductBack30": f"50% Off + {PRODUCT_BACK_30['label']}",
         "Margin_Promo40": PROMO_40["label"],
         "Margin_Promo50_25Relief": PROMO_50_SOFT["label"],
         "Margin_Promo40_20Relief": PROMO_40_SOFT["label"],
@@ -920,6 +1217,53 @@ def build_category_summary(df: pd.DataFrame) -> list[dict]:
     return rows
 
 
+def build_dashboard_metrics(df: pd.DataFrame) -> dict:
+    """Build high-level workbook metrics for the Summary sheet."""
+    if df is None or df.empty:
+        return {}
+
+    margin = pd.to_numeric(df.get("Margin", pd.Series(dtype=float)), errors="coerce").dropna()
+    rounding_loss = pd.to_numeric(
+        df.get(ROUNDING_LOSS_COLUMN, pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+
+    return {
+        "Avg Margin": margin.mean() if not margin.empty else np.nan,
+        f"SKUs < {MARGIN_REVIEW_FLOOR:.0%}": int((margin < MARGIN_REVIEW_FLOOR).sum()) if not margin.empty else 0,
+        f"SKUs < {TARGET_MARGIN:.0%}": int((margin < TARGET_MARGIN).sum()) if not margin.empty else 0,
+        "Avg Rounding Loss": rounding_loss.mean() if not rounding_loss.empty else np.nan,
+        "Total Rounding Loss": rounding_loss.sum() if not rounding_loss.empty else np.nan,
+    }
+
+
+def build_margin_risk_rows(df: pd.DataFrame, limit: int = 10) -> list[dict]:
+    """Return the lowest-margin products for quick action review."""
+    if df is None or df.empty or "Margin" not in df.columns:
+        return []
+
+    work = df.copy()
+    work["_MarginSort"] = pd.to_numeric(work["Margin"], errors="coerce")
+    work = work[work["_MarginSort"].notna()].sort_values("_MarginSort", ascending=True)
+    if work.empty:
+        return []
+
+    price_display_col = "Price_Used" if "Price_Used" in work.columns else "Price"
+    if price_display_col in work.columns:
+        work["Display_Price"] = work[price_display_col]
+
+    display_cols = [
+        "Product",
+        "Category",
+        "Display_Price",
+        "Out-The-Door",
+        "Margin",
+        OTD_GAP_COLUMN,
+    ]
+    existing_cols = [col for col in display_cols if col in work.columns]
+    return work.head(limit)[existing_cols].to_dict("records")
+
+
 def enhance_summary_and_charts(filename: str,
                                brand: str,
                                data_df: pd.DataFrame,
@@ -944,9 +1288,15 @@ def enhance_summary_and_charts(filename: str,
 
     scenario_rows = build_scenario_summary(data_df)
     category_rows = build_category_summary(data_df)
+    dashboard_metrics = build_dashboard_metrics(data_df)
+    margin_risk_rows = build_margin_risk_rows(data_df)
     scenario_specs = [
-        ("Margin", "Current Everyday Pricing"),
+        ("Margin", "Current 30% Off Pricing"),
+        ("Margin_ProductBack25", f"Current 30% Off + {PRODUCT_BACK_25['label']}"),
+        ("Margin_ProductBack30", f"Current 30% Off + {PRODUCT_BACK_30['label']}"),
         ("Margin_Promo50", PROMO_50["label"]),
+        ("Margin_Promo50_ProductBack25", f"50% Off + {PRODUCT_BACK_25['label']}"),
+        ("Margin_Promo50_ProductBack30", f"50% Off + {PRODUCT_BACK_30['label']}"),
         ("Margin_Promo40", PROMO_40["label"]),
         ("Margin_Promo50_25Relief", PROMO_50_SOFT["label"]),
         ("Margin_Promo40_20Relief", PROMO_40_SOFT["label"]),
@@ -976,6 +1326,54 @@ def enhance_summary_and_charts(filename: str,
     )
 
     current_row = 3
+
+    # ---------------------------------------------------------------------
+    # KPI strip
+    # ---------------------------------------------------------------------
+    if dashboard_metrics:
+        sec_title = ws.cell(row=current_row, column=1)
+        sec_title.value = "Key Metrics"
+        sec_title.font = Font(size=13, bold=True)
+        current_row += 1
+
+        metric_header_row = current_row
+        metric_value_row = current_row + 1
+        metric_items = list(dashboard_metrics.items())
+
+        margin_range = product_range("Margin") if use_excel_formulas else None
+        rounding_loss_range = product_range(ROUNDING_LOSS_COLUMN) if use_excel_formulas else None
+
+        metric_formulas = {
+            "Avg Margin": f'=IFERROR(AVERAGE({margin_range}),"")' if margin_range else None,
+            f"SKUs < {MARGIN_REVIEW_FLOOR:.0%}": f'=IFERROR(COUNTIF({margin_range},"<{MARGIN_REVIEW_FLOOR}"),"")' if margin_range else None,
+            f"SKUs < {TARGET_MARGIN:.0%}": f'=IFERROR(COUNTIF({margin_range},"<{TARGET_MARGIN}"),"")' if margin_range else None,
+            "Avg Rounding Loss": f'=IFERROR(AVERAGE({rounding_loss_range}),"")' if rounding_loss_range else None,
+            "Total Rounding Loss": f'=IFERROR(SUM({rounding_loss_range}),"")' if rounding_loss_range else None,
+        }
+
+        for col_idx, (label, value) in enumerate(metric_items, start=1):
+            header_cell = ws.cell(row=metric_header_row, column=col_idx)
+            header_cell.value = label
+            header_cell.font = Font(bold=True, color="FFFFFF")
+            header_cell.alignment = Alignment(horizontal="center", vertical="center")
+            header_cell.fill = PatternFill(start_color="595959", end_color="595959", fill_type="solid")
+            header_cell.border = thin_border
+
+            value_cell = ws.cell(row=metric_value_row, column=col_idx)
+            value_cell.value = metric_formulas.get(label) or value
+            value_cell.font = Font(size=12, bold=True)
+            value_cell.alignment = Alignment(horizontal="right", vertical="center")
+            value_cell.border = thin_border
+            value_cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+
+            if "Margin" in label:
+                value_cell.number_format = "0.0%"
+            elif "SKUs" in label:
+                value_cell.number_format = "0"
+            else:
+                value_cell.number_format = '"$"#,##0.00'
+
+        current_row = metric_value_row + 3
 
     # ---------------------------------------------------------------------
     # Scenario summary section
@@ -1222,6 +1620,61 @@ def enhance_summary_and_charts(filename: str,
         pie.set_categories(labels)
 
         ws.add_chart(pie, f"N{cat_header_row}")
+        current_row = cat_data_end + 3
+
+    # ---------------------------------------------------------------------
+    # Lowest-margin action list
+    # ---------------------------------------------------------------------
+    if margin_risk_rows:
+        sec_title = ws.cell(row=current_row, column=1)
+        sec_title.value = "Lowest Margin Products"
+        sec_title.font = Font(size=13, bold=True)
+        current_row += 1
+
+        risk_header_row = current_row
+        risk_headers = [
+            "Product",
+            "Category",
+            "Price",
+            "OTD",
+            "Margin",
+            "OTD Gap to 45%",
+        ]
+
+        for col_idx, header in enumerate(risk_headers, start=1):
+            cell = ws.cell(row=risk_header_row, column=col_idx)
+            cell.value = header
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.fill = PatternFill(start_color="808080", end_color="808080", fill_type="solid")
+            cell.border = thin_border
+
+        risk_data_start = risk_header_row + 1
+        for row_offset, rowdata in enumerate(margin_risk_rows):
+            row_idx = risk_data_start + row_offset
+            values = [
+                rowdata.get("Product", ""),
+                rowdata.get("Category", ""),
+                rowdata.get("Display_Price", np.nan),
+                rowdata.get("Out-The-Door", np.nan),
+                rowdata.get("Margin", np.nan),
+                rowdata.get(OTD_GAP_COLUMN, np.nan),
+            ]
+
+            for col_idx, value in enumerate(values, start=1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.border = thin_border
+                if col_idx in (3, 4, 6):
+                    cell.number_format = '"$"#,##0.00'
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                elif col_idx == 5:
+                    cell.number_format = "0.0%"
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                if row_offset % 2 == 0:
+                    cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 
     # Freeze panes under the first header area
     ws.freeze_panes = "A5" if scenario_rows else "A3"
@@ -1229,13 +1682,24 @@ def enhance_summary_and_charts(filename: str,
     # Auto-fit column widths
     for col_idx in range(1, ws.max_column + 1):
         max_length = 0
+        header_hint = ""
         for row in range(1, ws.max_row + 1):
             val = ws.cell(row=row, column=col_idx).value
             if val is not None:
                 max_length = max(max_length, _display_width_hint(val))
+                if not header_hint and str(val) in (
+                    WIDE_TEXT_COLUMNS
+                    | MEDIUM_TEXT_COLUMNS
+                    | CURRENCY_COLUMNS
+                    | PERCENT_COLUMNS
+                    | {"Price", "OTD", "OTD Gap to 45%", "# SKUs", "Quality"}
+                ):
+                    header_hint = str(val)
         header_val = ws.cell(row=1, column=col_idx).value
-        header_length = _display_width_hint(header_val)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_length + 2, header_length + 2), 40)
+        header_text = str(header_val) if header_val is not None else ""
+        if header_hint:
+            header_text = header_hint
+        ws.column_dimensions[get_column_letter(col_idx)].width = _best_column_width(header_text, max_length)
 
     wb.save(filename)
 
@@ -1475,19 +1939,33 @@ def process_files(input_directory,
 # =============================================================================
 
 def get_all_brands(input_directory):
+    if not input_directory or not os.path.isdir(input_directory):
+        return []
+
     brands = set()
     brand_found = False
-    for filename in os.listdir(input_directory):
-        if filename.endswith('.csv'):
-            file_path = os.path.join(input_directory, filename)
-            try:
-                df = pd.read_csv(file_path)
-                if 'Brand' in df.columns:
-                    brand_found = True
-                    new_brands = df['Brand'].dropna().unique().tolist()
-                    brands.update(new_brands)
-            except:
-                pass
+    for filename in sorted(os.listdir(input_directory)):
+        if not filename.lower().endswith('.csv'):
+            continue
+
+        file_path = os.path.join(input_directory, filename)
+        try:
+            df = pd.read_csv(file_path, usecols=["Brand"])
+        except ValueError:
+            continue
+        except Exception as exc:
+            print(f"[WARN] Could not read brands from {filename}: {exc}")
+            continue
+
+        if 'Brand' in df.columns:
+            brand_found = True
+            new_brands = (
+                df['Brand']
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            brands.update(brand for brand in new_brands if brand)
 
     if not brand_found:
         return []
@@ -1740,20 +2218,20 @@ class BrandInventoryApp:
 
         brand_button_frame = ttk.Frame(brand_frame, style="Card.TFrame")
         brand_button_frame.grid(row=0, column=1, sticky="e", pady=(0, 6))
-        self.load_brands_button = ttk.Button(
-            brand_button_frame,
-            text="Load Brands",
-            command=self.load_brands,
-            style="Secondary.TButton",
-        )
-        self.load_brands_button.pack(side='left', padx=(0, 8))
         self.select_all_button = ttk.Button(
             brand_button_frame,
             text="Select All",
             command=self.select_all_brands,
             style="Secondary.TButton",
         )
-        self.select_all_button.pack(side='left')
+        self.select_all_button.pack(side='left', padx=(0, 8))
+        self.clear_brand_selection_button = ttk.Button(
+            brand_button_frame,
+            text="Clear",
+            command=self.clear_brand_selection,
+            style="Secondary.TButton",
+        )
+        self.clear_brand_selection_button.pack(side='left')
 
         list_container = ttk.Frame(brand_frame, style="Card.TFrame")
         list_container.grid(row=1, column=0, sticky="nsew")
@@ -1813,8 +2291,8 @@ class BrandInventoryApp:
             self.browse_output_button,
             self.get_files_button,
             self.clear_files_button,
-            self.load_brands_button,
             self.select_all_button,
+            self.clear_brand_selection_button,
             self.generate_button,
             self.input_entry,
             self.output_entry,
@@ -1825,6 +2303,8 @@ class BrandInventoryApp:
             self._log(f"[INFO] Input directory: {self.input_dir.get()}")
         if self.output_dir.get():
             self._log(f"[INFO] Output directory: {self.output_dir.get()}")
+        if self.input_dir.get():
+            self.master.after(150, self.auto_load_brands)
 
     def _configure_styles(self):
         self.colors = {
@@ -1974,6 +2454,32 @@ class BrandInventoryApp:
         self._log(f"[ERROR] {title}\n{detail}\n")
         messagebox.showerror("Error", f"{title}\n\n{detail}")
 
+    def _populate_brand_listbox(self, brands: list[str]) -> None:
+        self.brand_listbox.delete(0, tk.END)
+        self.brand_listbox.configure(state='normal')
+        if not brands:
+            self.brand_listbox.insert(tk.END, "No brands found. You can still run the report.")
+            return
+        for brand in brands:
+            self.brand_listbox.insert(tk.END, brand)
+
+    def auto_load_brands(self):
+        input_dir = self.input_dir.get()
+        if not input_dir or not os.path.isdir(input_dir):
+            return
+        try:
+            self.status_text.set("Auto-loading brands...")
+            brands = get_all_brands(input_dir)
+            self._populate_brand_listbox(brands)
+            if brands:
+                self._log(f"[INFO] Auto-loaded {len(brands)} brand(s) from {input_dir}.")
+                self.status_text.set(f"Auto-loaded {len(brands)} brand(s).")
+            else:
+                self._log(f"[INFO] No brands found while auto-loading from {input_dir}.")
+                self.status_text.set("No brands found.")
+        except Exception:
+            self._show_error("Failed to auto-load brands", traceback.format_exc())
+
     def _open_generated_report(self, generated_files: list[str]):
         if not generated_files:
             return
@@ -2053,6 +2559,7 @@ class BrandInventoryApp:
             if result.stderr:
                 self._log(result.stderr)
             self.status_text.set("Dutchie API files fetched successfully.")
+            self.auto_load_brands()
             messagebox.showinfo("Success", "Files successfully fetched from the Dutchie API.")
         except subprocess.CalledProcessError:
             self._show_error("Failed to get files", traceback.format_exc())
@@ -2077,6 +2584,7 @@ class BrandInventoryApp:
                 except Exception as e:
                     print(f"Error deleting {filename}: {e}")
         self.status_text.set(f"Deleted {count} CSV file(s).")
+        self.brand_listbox.delete(0, tk.END)
         self._log(f"[INFO] Deleted {count} CSV file(s) from {input_dir}")
         messagebox.showinfo("Files Deleted", f"Deleted {count} CSV files from {input_dir}.")
 
@@ -2085,6 +2593,7 @@ class BrandInventoryApp:
         if directory:
             self.input_dir.set(directory)
             self._log(f"[INFO] Selected input directory: {directory}")
+            self.auto_load_brands()
 
     def browse_output(self):
         directory = filedialog.askdirectory()
@@ -2099,14 +2608,10 @@ class BrandInventoryApp:
         try:
             self.status_text.set("Loading brands...")
             brands = get_all_brands(self.input_dir.get())
-            self.brand_listbox.delete(0, tk.END)
-            self.brand_listbox.configure(state='normal')
+            self._populate_brand_listbox(brands)
             if not brands:
-                self.brand_listbox.insert(tk.END, "No brands found. You can still run the report.")
                 self._log("[INFO] No brands found in the selected input directory.")
             else:
-                for b in brands:
-                    self.brand_listbox.insert(tk.END, b)
                 self._log(f"[INFO] Loaded {len(brands)} brand(s).")
             self.status_text.set("Brands loaded.")
         except Exception:
@@ -2125,6 +2630,13 @@ class BrandInventoryApp:
                 messagebox.showinfo("Info", "No brands available to select.")
         else:
             messagebox.showinfo("Info", "No brands to select.")
+
+    def clear_brand_selection(self):
+        if self.brand_listbox['state'] != 'normal':
+            messagebox.showinfo("Info", "No brands to clear.")
+            return
+        self.brand_listbox.selection_clear(0, tk.END)
+        self._log("[INFO] Cleared selected brands.")
 
     def run_process(self):
         input_dir = self.input_dir.get()
