@@ -305,13 +305,13 @@ DEFAULT_BRAND_CRITERIA = {
         'kickback': 0.30,
         'brands': ['Eureka |']
     }, 
-    'Ember Valley': { 
-       # 'vendors': ['LB Atlantis LLC', 'Garden Of Weeden Inc.', 'Courtney Lang','NC INVESTMENT GROUP, LLC','Hilife Group MV , LLC', 'Ember Valley', 'Helios | Hypeereon Corporation'],
-        'days': ['Thursday','Tuesday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        'brands': ['Ember Valley |','EV |']
-    }, 
+    # 'Ember Valley': { 
+    #    # 'vendors': ['LB Atlantis LLC', 'Garden Of Weeden Inc.', 'Courtney Lang','NC INVESTMENT GROUP, LLC','Hilife Group MV , LLC', 'Ember Valley', 'Helios | Hypeereon Corporation'],
+    #     'days': ['Thursday','Tuesday'],
+    #     'discount': 0.50,
+    #     'kickback': 0.30,
+    #     'brands': ['Ember Valley |','EV |']
+    # }, 
     'Emerald Sky': {
         'vendors': ['KIVA / LCISM CORP','Garden Of Weeden Inc.','Vino & Cigarro, LLC'],
         'days': ['Tuesday','Thursday'],
@@ -645,6 +645,12 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.50,
            'kickback': 0.30,
            'brands': ['LIME |']},
+    'Traditional': {
+        #'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+           'days': ['Monday','Tuesday'], #Started March 2
+           'discount': 0.50,
+           'kickback': 0.30,
+           'brands': ['Traditional |']},
 }
 
 brand_criteria = DEFAULT_BRAND_CRITERIA

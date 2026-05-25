@@ -8,6 +8,7 @@ from weekly_brand_credit_emailer import (
     find_latest_report,
     get_previous_monday_sunday,
     inventory_files_for_brand,
+    parse_args,
     should_include_brand,
     week_key_for_range,
 )
@@ -47,6 +48,10 @@ class WeeklyBrandCreditEmailerTests(unittest.TestCase):
             inventory_files_for_brand(treesap_cfg, brand_map),
             ["/tmp/treesap_lm.xlsx", "/tmp/treesap_mv.xlsx"],
         )
+
+    def test_cli_defaults_to_auto_refresh(self):
+        self.assertTrue(parse_args([]).auto)
+        self.assertFalse(parse_args(["--existing-links"]).auto)
 
 
 if __name__ == "__main__":

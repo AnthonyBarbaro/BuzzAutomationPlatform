@@ -259,6 +259,10 @@ def load_order_report_table(path):
     return _load_order_report_table_cached(os.path.abspath(path)).copy()
 
 
+def clear_order_report_cache():
+    _load_order_report_table_cached.cache_clear()
+
+
 def discover_order_report_files(directory):
     report_files = OrderedDict((days, OrderedDict()) for days in ORDER_REPORT_WINDOWS)
     if not directory or not os.path.isdir(directory):

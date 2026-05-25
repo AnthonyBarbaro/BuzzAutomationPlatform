@@ -4,9 +4,9 @@ Send weekly brand credit emails for the brands that need both deal report links
 and inventory folder links in the same message.
 
 Workflow modes:
-1. Existing-link mode emails the latest already-generated deal and inventory links.
-2. Automatic mode pulls last week's sales/inventory exports, generates only the
+1. Automatic mode pulls last week's sales/inventory exports, generates only the
    Hashish and Treesap reports, uploads them to Drive by brand/week, then emails.
+2. Existing-link mode emails the latest already-generated deal and inventory links.
 """
 
 import argparse
@@ -664,6 +664,16 @@ def refresh_inventory_sources(input_dir, include_order_reports=True, status_call
     )
 
 
+def clear_inventory_order_report_cache(status_callback=None):
+    try:
+        from inventory_order_reports import clear_order_report_cache
+    except ImportError:
+        return
+
+    clear_order_report_cache()
+    emit_status("[AUTO] Cleared cached order-report tables before rebuilding inventory.", status_callback)
+
+
 def generate_inventory_reports_for_week(brand_cfgs, input_dir, output_dir, include_cost=True, status_callback=None):
     from brand_inventory_report_job import build_brand_inventory_reports
 
@@ -675,6 +685,7 @@ def generate_inventory_reports_for_week(brand_cfgs, input_dir, output_dir, inclu
     output_path.mkdir(parents=True, exist_ok=True)
 
     emit_status(f"[AUTO] Generating inventory reports for: {', '.join(selected)}", status_callback)
+    clear_inventory_order_report_cache(status_callback=status_callback)
     return capture_printed_status(
         lambda: build_brand_inventory_reports(
             input_dir=resolve_repo_path(input_dir),
@@ -930,7 +941,7 @@ def build_email_body(brand_label, report_info, inventory_info, report_links, kic
     """
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Send weekly deal + inventory credit emails.")
     parser.add_argument(
         "--brands",
@@ -975,8 +986,16 @@ def parse_args():
     )
     parser.add_argument(
         "--auto",
+        dest="auto",
         action="store_true",
-        help="Pull/generate Hashish and Treesap reports, upload weekly Drive folders, then email.",
+        default=True,
+        help="Pull/generate Hashish and Treesap reports, upload weekly Drive folders, then email (default).",
+    )
+    parser.add_argument(
+        "--existing-links",
+        dest="auto",
+        action="store_false",
+        help="Use already-generated deal and inventory links without refreshing inventory.",
     )
     parser.add_argument(
         "--sales-source",
@@ -1029,7 +1048,7 @@ def parse_args():
         default=DEFAULT_WEEKLY_DRIVE_PARENT,
         help=f"Top-level Drive folder for weekly automatic uploads (default: {DEFAULT_WEEKLY_DRIVE_PARENT}).",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def should_include_brand(brand_cfg, requested_brands):
@@ -1256,8 +1275,8 @@ def run_weekly_brand_credit_emailer(
     }
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     try:
         inventory_overrides = parse_inventory_link_overrides(args.inventory_link)
     except ValueError as exc:
