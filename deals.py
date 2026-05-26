@@ -189,15 +189,15 @@ DEFAULT_BRAND_CRITERIA = {
         'kickback': 0.25,
         'brands': ['Terra', 'Petra', 'KIVA', 'Lost Farms', 'Camino']
     },
-    'Dabwoods': {
-        #'vendors': ['The Clear Group Inc.','Decoi','Garden Of Weeden Inc.','Garden Of Weeden'],
-        'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-        'discount': 0.50,
-        'kickback': 0.30,
-        'categories': ['Disposables','Cartridges'],
-        'excluded_phrases': ['DabBar X','Cart'],
-        'brands': ['Dabwoods','DabBar']
-    },
+    # 'Dabwoods': {
+    #     #'vendors': ['The Clear Group Inc.','Decoi','Garden Of Weeden Inc.','Garden Of Weeden'],
+    #     'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+    #     'discount': 0.50,
+    #     'kickback': 0.30,
+    #     'categories': ['Disposables','Cartridges'],
+    #     'excluded_phrases': ['DabBar X','Cart'],
+    #     'brands': ['Dabwoods','DabBar']
+    # },
      'Time Machine': {
          #'vendors': ['Vino & Cigarro, LLC','Garden Of Weeden Inc.','KIVA / LCISM CORP','Garden Of Weeden'],
          'days': ['Tuesday','Friday'],
