@@ -35,6 +35,10 @@ from dotenv import load_dotenv
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
+from brand_inventory_rows import (
+    consolidate_duplicate_inventory_rows,
+    sort_inventory_rows,
+)
 from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
     build_brand_order_sections,
@@ -899,12 +903,17 @@ def process_file(file_path, output_directory, selected_brands):
         print(f"[WARN] 'Available' not found in {file_path}, skipping.")
         return None, None
 
-    unavailable_data = df[df['Available'] <= 2]
-    available_data = df[df['Available'] > 2]
+    df['Available'] = pd.to_numeric(df['Available'], errors='coerce').fillna(0)
+    if 'Cost' in df.columns:
+        df['Cost'] = pd.to_numeric(df['Cost'], errors='coerce')
+    df = consolidate_duplicate_inventory_rows(df)
+
+    unavailable_data = df[df['Available'] <= 2].copy()
+    available_data = df[df['Available'] > 2].copy()
 
     # If we only want certain brands:
     if 'Brand' in available_data.columns and selected_brands:
-        available_data = available_data[available_data['Brand'].isin(selected_brands)]
+        available_data = available_data[available_data['Brand'].isin(selected_brands)].copy()
 
     # Extract strain and product details
     if 'Product' in available_data.columns:
@@ -919,23 +928,15 @@ def process_file(file_path, output_directory, selected_brands):
         available_data['Product_Weight'] = ""
         available_data['Product_SubType'] = ""
 
-    sort_cols = []
-    if 'Category' in available_data.columns:
-        sort_cols.append('Category')
-    if 'Cost' in available_data.columns:
-        sort_cols.append('Cost')
-    if 'Product' in available_data.columns:
-        sort_cols.append('Product')
+    available_data = sort_inventory_rows(
+        available_data,
+        include_cost_as_tiebreaker='Cost' in available_data.columns,
+    )
 
-    available_data.sort_values(by=sort_cols, inplace=True, na_position='last')
-
-    unavailable_sort_cols = []
-    if 'Category' in unavailable_data.columns:
-        unavailable_sort_cols.append('Category')
-    if 'Product' in unavailable_data.columns:
-        unavailable_sort_cols.append('Product')
-    if unavailable_sort_cols:
-        unavailable_data.sort_values(by=unavailable_sort_cols, inplace=True, na_position='last')
+    unavailable_data = sort_inventory_rows(
+        unavailable_data,
+        include_cost_as_tiebreaker='Cost' in unavailable_data.columns,
+    )
 
     # Drop Cost column after sorting
     if 'Cost' in available_data.columns:

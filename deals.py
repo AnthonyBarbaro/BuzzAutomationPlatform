@@ -647,7 +647,7 @@ DEFAULT_BRAND_CRITERIA = {
            'brands': ['LIME |']},
     'Traditional': {
         #'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
-           'days': ['Monday','Tuesday'], #Started March 2
+           'days': ['Monday','Tuesday'], #May
            'discount': 0.50,
            'kickback': 0.30,
            'brands': ['Traditional |']},

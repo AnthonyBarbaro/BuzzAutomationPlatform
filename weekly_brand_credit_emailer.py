@@ -22,8 +22,14 @@ from email.mime.text import MIMEText
 from email import encoders
 from email.utils import formatdate
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import openpyxl
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +46,20 @@ DEFAULT_SALES_SOURCE = "api"
 DEFAULT_API_ENV_FILE = str(BASE_DIR / ".env")
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 BUZZ_CC = ["joseph@buzzcannabis.com", "donna@buzzcannabis.com"]
+TEST_MODE_EMAIL = "anthony@buzzcannabis.com"
+STORE_LABELS = {
+    "MV": "Mission Valley",
+    "LG": "Lemon Grove",
+    "LM": "La Mesa",
+    "WP": "Wildomar Palomar",
+    "SV": "Sorrento Valley",
+    "NC": "National City",
+}
+HASHISH_SECTION_CATEGORY_ORDER = {
+    "Disposables": 80,
+    "Pre-Rolls": 90,
+    "Wellness": 100,
+}
 
 WEEKLY_BRAND_EMAILS = [
     {
@@ -63,6 +83,12 @@ WEEKLY_BRAND_EMAILS = [
 
 def normalize_key(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def safe_filename_part(value):
+    safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(value or "").strip())
+    safe = re.sub(r"\s+", " ", safe).strip(" ._-")
+    return safe or "file"
 
 
 def emit_status(message, status_callback=None):
@@ -707,6 +733,463 @@ def inventory_files_for_brand(brand_cfg, inventory_brand_map):
     return sorted(dict.fromkeys(files))
 
 
+def _inventory_store_code_from_path(file_path):
+    stem = Path(file_path).stem.upper()
+    for token in re.split(r"[^A-Z0-9]+", stem):
+        if token in STORE_LABELS:
+            return token
+    return ""
+
+
+def _inventory_store_label(file_path):
+    code = _inventory_store_code_from_path(file_path)
+    if code:
+        return f"{code} - {STORE_LABELS.get(code, code)}"
+    return Path(file_path).stem
+
+
+def _format_available_quantity(value):
+    if value is None:
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value).strip()
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:g}"
+
+
+def _find_header_index(header_map, candidates):
+    for candidate in candidates:
+        idx = header_map.get(normalize_key(candidate))
+        if idx is not None:
+            return idx
+    return None
+
+
+def read_two_week_sell_thru_by_product(workbook):
+    if "Order" not in workbook.sheetnames:
+        return {}
+
+    ws = workbook["Order"]
+    header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not header:
+        return {}
+
+    header_map = {
+        normalize_key(value): idx
+        for idx, value in enumerate(header)
+        if value not in (None, "")
+    }
+    product_idx = _find_header_index(header_map, ("Product", "Product Name"))
+    sell_thru_idx = _find_header_index(header_map, ("Units Sold 14d", "Quantity Sold 14d", "Sold 14d"))
+    if product_idx is None or sell_thru_idx is None:
+        return {}
+
+    sold_by_product = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        product = row[product_idx] if product_idx < len(row) else None
+        product_key = normalize_key(product)
+        if not product_key:
+            continue
+        sold_value = row[sell_thru_idx] if sell_thru_idx < len(row) else None
+        sold_by_product[product_key] = _format_available_quantity(sold_value)
+
+    return sold_by_product
+
+
+def _category_label(value):
+    raw = re.sub(r"\s+", " ", str(value or "").strip())
+    key = normalize_key(raw)
+    if not key:
+        return ""
+    if "disposable" in key:
+        return "Disposables"
+    if "preroll" in key or ("pre" in key and "roll" in key):
+        return "Pre-Rolls"
+    if "wellness" in key:
+        return "Wellness"
+    if "concentrate" in key:
+        return "Concentrate"
+    return raw
+
+
+def read_available_product_rows(inventory_workbook):
+    rows = []
+    workbook_path = Path(inventory_workbook)
+    wb = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True)
+    try:
+        two_week_sell_thru = read_two_week_sell_thru_by_product(wb)
+        if "Available" not in wb.sheetnames:
+            return rows
+
+        ws = wb["Available"]
+        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        if not header:
+            return rows
+
+        header_map = {
+            normalize_key(value): idx
+            for idx, value in enumerate(header)
+            if value not in (None, "")
+        }
+        available_idx = header_map.get("available")
+        product_idx = header_map.get("product") if "product" in header_map else header_map.get("productname")
+        category_idx = header_map.get("category")
+        if available_idx is None or product_idx is None:
+            return rows
+
+        store = _inventory_store_label(workbook_path)
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            product = row[product_idx] if product_idx < len(row) else None
+            product_text = re.sub(r"\s+", " ", str(product or "").strip())
+            if not product_text or normalize_key(product_text) == "product":
+                continue
+
+            available = row[available_idx] if available_idx < len(row) else None
+            rows.append(
+                {
+                    "store": store,
+                    "available": _format_available_quantity(available),
+                    "sell_thru_14d": two_week_sell_thru.get(normalize_key(product_text), ""),
+                    "category": _category_label(row[category_idx] if category_idx is not None and category_idx < len(row) else ""),
+                    "product": product_text,
+                }
+            )
+    finally:
+        wb.close()
+
+    return rows
+
+
+def _store_sort_key(store_label):
+    code = str(store_label or "").split(" - ", 1)[0].strip().upper()
+    store_order = {store_code: idx for idx, store_code in enumerate(STORE_LABELS)}
+    return (store_order.get(code, 999), str(store_label or ""))
+
+
+def _hashish_variant(product_name):
+    match = re.search(r"\(([BW])\)\s*$", str(product_name or "").strip(), re.IGNORECASE)
+    if not match:
+        return ""
+    return f"({match.group(1).upper()})"
+
+
+def _hashish_product_line(product_name):
+    parts = [part.strip() for part in str(product_name or "").split("|") if part.strip()]
+    if len(parts) >= 2:
+        return parts[1]
+    return parts[0] if parts else ""
+
+
+def _hashish_pack_size(product_name):
+    match = re.search(r"((?:\d+(?:\.\d+)?)|(?:\.\d+))\s*g\b", str(product_name or ""), re.IGNORECASE)
+    if not match:
+        return ""
+    value = match.group(1)
+    if value.startswith("."):
+        return f"{value}g"
+    try:
+        number = float(value)
+    except ValueError:
+        return f"{value}g"
+    if number.is_integer():
+        return f"{int(number)}g"
+    return f"{number:g}g"
+
+
+def hashish_product_section(row):
+    product = str(row.get("product") or "")
+    category = _category_label(row.get("category"))
+    if category and category != "Concentrate":
+        return category
+
+    line = _hashish_product_line(product)
+    line_key = normalize_key(line)
+    variant = _hashish_variant(product)
+    size = _hashish_pack_size(line or product)
+    size_prefix = f"{size} " if size else ""
+    variant_prefix = f"{variant} " if variant else ""
+
+    if "liverosin" in line_key or "rosin" in line_key:
+        return f"{variant_prefix}{size_prefix}Live Rosin".strip()
+    if "templeball" in line_key or ("temple" in line_key and "ball" in line_key):
+        return f"{size_prefix}Temple Ball".strip()
+    if "topper" in line_key:
+        return f"{size_prefix}Topper".strip()
+    if category:
+        return category
+    return line or "Other"
+
+
+def _hashish_section_sort_key(section_label):
+    label = str(section_label or "")
+    key = normalize_key(label)
+    category_order = HASHISH_SECTION_CATEGORY_ORDER.get(label)
+    if category_order is not None:
+        return (category_order, 0, 0, label)
+
+    size_match = re.search(r"((?:\d+(?:\.\d+)?)|(?:\.\d+))g", label, re.IGNORECASE)
+    size = 999.0
+    if size_match:
+        try:
+            size = float(size_match.group(1))
+        except ValueError:
+            size = 999.0
+
+    variant = _hashish_variant(label)
+    variant_order = {"(B)": 0, "(W)": 1}.get(variant, 2)
+    if "liverosin" in key:
+        return (10, size, variant_order, label)
+    if "templeball" in key:
+        return (30, size, variant_order, label)
+    if "topper" in key:
+        return (40, size, variant_order, label)
+    if label == "Concentrate":
+        return (70, size, variant_order, label)
+    return (75, size, variant_order, label)
+
+
+def group_hashish_available_rows(rows):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(hashish_product_section(row), []).append(row)
+
+    ordered = []
+    for label in sorted(grouped, key=_hashish_section_sort_key):
+        ordered.append(
+            (
+                label,
+                sorted(
+                    grouped[label],
+                    key=lambda item: (
+                        normalize_key(item.get("category")),
+                        normalize_key(item.get("product")),
+                    ),
+                ),
+            )
+        )
+    return ordered
+
+
+def _available_product_pdf_table(sections, doc, cell_style, header_cell_style, section_style):
+    data = [
+        [
+            Paragraph("Available", header_cell_style),
+            Paragraph("2 Wk Sell Thru", header_cell_style),
+            Paragraph("Product", header_cell_style),
+            Paragraph("Category", header_cell_style),
+        ]
+    ]
+    style_commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEF2F7")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#111827")),
+        ("ALIGN", (0, 0), (1, -1), "CENTER"),
+        ("ALIGN", (3, 0), (3, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.4),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.45, colors.HexColor("#9CA3AF")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.65, colors.HexColor("#6B7280")),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
+        ("LINEBEFORE", (1, 0), (-1, -1), 0.2, colors.HexColor("#E5E7EB")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2.6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2.6),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.4),
+    ]
+    for section_label, rows in sections:
+        section_row = len(data)
+        data.append([Paragraph(escape(str(section_label)), section_style), "", "", ""])
+        style_commands.extend(
+            [
+                ("SPAN", (0, section_row), (-1, section_row)),
+                ("BACKGROUND", (0, section_row), (-1, section_row), colors.HexColor("#F8FAFC")),
+                ("LINEABOVE", (0, section_row), (-1, section_row), 0.5, colors.HexColor("#9CA3AF")),
+                ("LINEBELOW", (0, section_row), (-1, section_row), 0.3, colors.HexColor("#CBD5E1")),
+                ("TOPPADDING", (0, section_row), (-1, section_row), 2.0),
+                ("BOTTOMPADDING", (0, section_row), (-1, section_row), 2.0),
+            ]
+        )
+        for row in rows:
+            data.append(
+                [
+                    Paragraph(escape(str(row.get("available", ""))), cell_style),
+                    Paragraph(escape(str(row.get("sell_thru_14d", ""))), cell_style),
+                    Paragraph(escape(row.get("product", "")), cell_style),
+                    Paragraph(escape(str(row.get("category", ""))), cell_style),
+                ]
+            )
+
+    table = Table(
+        data,
+        colWidths=[0.58 * inch, 0.82 * inch, 5.15 * inch, 0.95 * inch],
+        repeatRows=1,
+        hAlign="CENTER",
+    )
+    table.setStyle(TableStyle(style_commands))
+    return table
+
+
+def build_printable_available_inventory_pdf(
+    brand_label,
+    inventory_files,
+    output_dir,
+    week_start=None,
+    week_end=None,
+):
+    output_path = resolve_repo_path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    start_text = coerce_date(week_start).isoformat() if week_start else ""
+    end_text = coerce_date(week_end).isoformat() if week_end else ""
+    week_suffix = f"_{start_text}_to_{end_text}" if start_text and end_text else ""
+    pdf_path = output_path / (
+        f"{safe_filename_part(brand_label)}_available_products_all_stores{week_suffix}.pdf"
+    )
+
+    all_rows = []
+    for file_path in sorted(inventory_files, key=lambda path: _store_sort_key(_inventory_store_label(path))):
+        if str(file_path).lower().endswith((".xlsx", ".xlsm")):
+            all_rows.extend(read_available_product_rows(file_path))
+
+    grouped_rows = {}
+    for row in all_rows:
+        grouped_rows.setdefault(row["store"], []).append(row)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "PrintableInventoryTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=15,
+        leading=16,
+        alignment=0,
+        spaceAfter=5,
+    )
+    meta_style = ParagraphStyle(
+        "PrintableInventoryMeta",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8,
+        leading=9,
+        textColor=colors.HexColor("#4B5563"),
+        spaceAfter=7,
+    )
+    store_style = ParagraphStyle(
+        "PrintableInventoryStore",
+        parent=styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        leading=13,
+        spaceBefore=1,
+        spaceAfter=5,
+    )
+    cell_style = ParagraphStyle(
+        "PrintableInventoryCell",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7.4,
+        leading=8.2,
+    )
+    header_cell_style = ParagraphStyle(
+        "PrintableInventoryHeader",
+        parent=cell_style,
+        fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#111827"),
+    )
+    section_style = ParagraphStyle(
+        "PrintableInventorySection",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8.3,
+        leading=9.0,
+        textColor=colors.HexColor("#111827"),
+    )
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=letter,
+        leftMargin=0.28 * inch,
+        rightMargin=0.28 * inch,
+        topMargin=0.28 * inch,
+        bottomMargin=0.28 * inch,
+        title=f"{brand_label} Available Products",
+    )
+
+    elements = [
+        Paragraph(f"{escape(str(brand_label))} Available Products", title_style),
+        Paragraph(
+            escape(f"All stores{f' | {start_text} to {end_text}' if start_text and end_text else ''}"),
+            meta_style,
+        ),
+    ]
+
+    if not grouped_rows:
+        elements.append(Paragraph("No available inventory rows found.", cell_style))
+    else:
+        stores = sorted(grouped_rows, key=_store_sort_key)
+        for store_index, store in enumerate(stores):
+            if store_index:
+                elements.append(PageBreak())
+            elements.append(Paragraph(escape(store), store_style))
+            store_rows = grouped_rows[store]
+            if normalize_key(brand_label) == "hashish":
+                sections = group_hashish_available_rows(store_rows)
+            else:
+                sections = [("Available Products", store_rows)]
+            elements.append(
+                _available_product_pdf_table(
+                    sections,
+                    doc,
+                    cell_style,
+                    header_cell_style,
+                    section_style,
+                )
+            )
+            elements.append(Spacer(1, 0.03 * inch))
+
+    doc.build(elements)
+    return str(pdf_path)
+
+
+def generate_printable_available_inventory_pdfs(
+    brand_cfgs,
+    inventory_brand_map,
+    output_dir,
+    week_start=None,
+    week_end=None,
+    status_callback=None,
+):
+    pdf_map = {}
+    pdf_output_dir = resolve_repo_path(output_dir) / "printable_available_pdfs"
+    for brand_cfg in brand_cfgs:
+        if normalize_key(brand_cfg.get("brand")) != "hashish":
+            continue
+
+        inventory_files = [
+            path for path in inventory_files_for_brand(brand_cfg, inventory_brand_map)
+            if str(path).lower().endswith((".xlsx", ".xlsm"))
+        ]
+        if not inventory_files:
+            continue
+
+        pdf_path = build_printable_available_inventory_pdf(
+            brand_label=brand_cfg["brand"],
+            inventory_files=inventory_files,
+            output_dir=pdf_output_dir,
+            week_start=week_start,
+            week_end=week_end,
+        )
+        aliases = brand_cfg.get("inventory_aliases") or [brand_cfg["inventory_folder"]]
+        brand_key = str(aliases[0]).strip().lower()
+        pdf_map.setdefault(brand_key, []).append(pdf_path)
+        emit_status(f"[PDF] Created printable available inventory: {pdf_path}", status_callback)
+
+    return pdf_map
+
+
 def write_report_links_file(links_file, uploaded_report_links, status_callback=None):
     links_path = resolve_repo_path(links_file)
     links_path.parent.mkdir(parents=True, exist_ok=True)
@@ -881,6 +1364,16 @@ def prepare_weekly_brand_credit_run(
         include_cost=include_inventory_cost,
         status_callback=status_callback,
     )
+    printable_inventory_pdfs = generate_printable_available_inventory_pdfs(
+        brand_cfgs,
+        inventory_brand_map,
+        output_dir=inventory_output_dir,
+        week_start=week_start,
+        week_end=week_end,
+        status_callback=status_callback,
+    )
+    for brand_key, pdf_paths in printable_inventory_pdfs.items():
+        inventory_brand_map.setdefault(brand_key, []).extend(pdf_paths)
 
     upload_result = {
         "folders": {},
@@ -912,6 +1405,7 @@ def prepare_weekly_brand_credit_run(
         "inventory_links_file": str(inventory_links_file),
         "inventory_output_dir": str(inventory_output_dir),
         "inventory_brand_map": inventory_brand_map,
+        "printable_inventory_pdfs": printable_inventory_pdfs,
         "upload": upload_result,
     }
 
@@ -976,13 +1470,18 @@ def parse_args(argv=None):
         help="Preview the sends without actually emailing Gmail recipients.",
     )
     parser.add_argument(
+        "--test-mode",
+        action="store_true",
+        help=f"Send only to {TEST_MODE_EMAIL}; no vendor recipients and no CCs.",
+    )
+    parser.add_argument(
         "--test-email",
-        help="Override all external recipients with one test email address while still CCing Buzz contacts.",
+        help="Override all recipients with one test email address and do not CC anyone.",
     )
     parser.add_argument(
         "--no-attachments",
         action="store_true",
-        help="Do not attach the local XLSX deal report to the email.",
+        help="Do not attach local deal reports or printable inventory PDFs to the email.",
     )
     parser.add_argument(
         "--auto",
@@ -1143,6 +1642,7 @@ def run_weekly_brand_credit_emailer(
     inventory_links_file=DEFAULT_INVENTORY_LINKS_FILE,
     inventory_overrides=None,
     dry_run=False,
+    test_mode=False,
     test_email=None,
     no_attachments=False,
     prompt_for_missing=False,
@@ -1189,6 +1689,11 @@ def run_weekly_brand_credit_emailer(
 
     failures = list((prepare_result or {}).get("upload", {}).get("failures", []))
     sends = 0
+    test_recipient = None
+    if test_mode:
+        test_recipient = TEST_MODE_EMAIL
+    elif test_email and str(test_email).strip():
+        test_recipient = str(test_email).strip()
 
     for brand_cfg in WEEKLY_BRAND_EMAILS:
         if not should_include_brand(brand_cfg, selected_brands):
@@ -1246,14 +1751,22 @@ def run_weekly_brand_credit_emailer(
             f"{brand_cfg['brand']} Brand Deals for {report_info['start_date']} to "
             f"{report_info['end_date']} and Inventory"
         )
-        attachments = [] if no_attachments else [report_info["path"]]
-        recipients = [test_email] if test_email else brand_cfg["to"]
+        if test_recipient:
+            subject = f"[TEST] {subject}"
+
+        printable_pdfs = inventory_files_for_brand(
+            brand_cfg,
+            (prepare_result or {}).get("printable_inventory_pdfs", {}),
+        )
+        attachments = [] if no_attachments else [report_info["path"], *printable_pdfs]
+        recipients = [test_recipient] if test_recipient else brand_cfg["to"]
+        cc_recipients = [] if test_recipient else BUZZ_CC
 
         send_email_with_gmail_html(
             subject=subject,
             html_body=html_body,
             recipients=recipients,
-            cc_recipients=BUZZ_CC,
+            cc_recipients=cc_recipients,
             attachments=attachments,
             dry_run=dry_run,
             status_callback=status_callback,
@@ -1290,6 +1803,7 @@ def main(argv=None):
         inventory_links_file=args.inventory_links_file,
         inventory_overrides=inventory_overrides,
         dry_run=args.dry_run,
+        test_mode=args.test_mode,
         test_email=args.test_email,
         no_attachments=args.no_attachments,
         prompt_for_missing=True,

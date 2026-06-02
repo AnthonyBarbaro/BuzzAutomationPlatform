@@ -40,6 +40,10 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
+from brand_inventory_rows import (
+    consolidate_duplicate_inventory_rows,
+    sort_inventory_rows,
+)
 from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
     build_brand_order_sections,
@@ -717,6 +721,11 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
     if "Product" in df.columns:
         df = df[~df["Product"].str.contains(r"(?i)\bsample\b|\bpromo\b", na=False)]
 
+    df["Available"] = pd.to_numeric(df["Available"], errors="coerce").fillna(0)
+    if "Cost" in df.columns:
+        df["Cost"] = pd.to_numeric(df["Cost"], errors="coerce")
+    df = consolidate_duplicate_inventory_rows(df)
+
     # Split into available/unavailable
     unavailable_df = df[df["Available"] <= MAX_AVAIL_FOR_UNAVAILABLE].copy()
     available_df   = df[df["Available"] > MAX_AVAIL_FOR_UNAVAILABLE].copy()
@@ -737,7 +746,7 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
     if selected_brands:
         # Turn each user brand into a lowercased version
         selected_lower = [b.strip().lower() for b in selected_brands]
-        available_df = available_df[available_df["Brand"].isin(selected_lower)]
+        available_df = available_df[available_df["Brand"].isin(selected_lower)].copy()
 
     # If nothing remains:
     if available_df.empty:
@@ -749,16 +758,10 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
         available_df["Strain_Type"] = available_df["Product"].apply(extract_strain_type)
 
     # Sort
-    sort_cols = []
-    if "Category" in available_df.columns:
-        sort_cols.append("Category")
-    if include_cost  and "Cost" in available_df.columns:
-        available_df["Cost"] = pd.to_numeric(available_df["Cost"], errors="coerce")
-        sort_cols.append("Cost")
-    if "Product" in available_df.columns:
-        sort_cols.append("Product")
-    if sort_cols:
-        available_df = available_df.sort_values(by=sort_cols, na_position="last")
+    available_df = sort_inventory_rows(
+        available_df,
+        include_cost_as_tiebreaker=include_cost and "Cost" in available_df.columns,
+    )
 
     # # Drop "Cost"
     # if "Cost" in available_df.columns:
@@ -770,13 +773,10 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
     if "Brand" in unavailable_df.columns and not unavailable_df.empty:
         unavailable_df.loc[:, "Brand"] = unavailable_df["Brand"].astype(str).str.strip().str.lower()
     if not unavailable_df.empty:
-        unavailable_sort_cols = []
-        if "Category" in unavailable_df.columns:
-            unavailable_sort_cols.append("Category")
-        if "Product" in unavailable_df.columns:
-            unavailable_sort_cols.append("Product")
-        if unavailable_sort_cols:
-            unavailable_df = unavailable_df.sort_values(by=unavailable_sort_cols, na_position="last")
+        unavailable_df = sort_inventory_rows(
+            unavailable_df,
+            include_cost_as_tiebreaker=include_cost and "Cost" in unavailable_df.columns,
+        )
 
     os.makedirs(out_dir, exist_ok=True)
     base_csv_name = os.path.splitext(os.path.basename(csv_path))[0]
