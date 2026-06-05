@@ -21,7 +21,16 @@ class MonthlyBrandReportsJobTests(unittest.TestCase):
 
     def test_resolve_monthly_brand_aliases(self):
         brands = monthly.resolve_monthly_brands(
-            ["Lime", "kanha", "Raw Garden", "Mary's Medicinals", "dixie", "treesap", "laff"]
+            ["Lime", "kanha", "Raw Garden", "Mary's Medicinals", "dixie", "treesap", "laff"],
+            available_brands=[
+                "Lime",
+                "KANHA",
+                "Raw Garden",
+                "Mary Medical",
+                "Dixie",
+                "TreeSap",
+                "LA FARMS",
+            ],
         )
 
         self.assertEqual(
@@ -33,6 +42,25 @@ class MonthlyBrandReportsJobTests(unittest.TestCase):
         brands = monthly.resolve_monthly_brands(["laff", "LA FARMS", "L.A.FF"])
 
         self.assertEqual(brands, ["LA FARMS"])
+
+    def test_default_monthly_brands_exclude_inactive_entries(self):
+        brands = monthly.resolve_monthly_brands()
+        self.assertNotIn("Mary Medical", brands)
+
+    def test_default_monthly_brands_skip_inactive_entries_if_config_drifts(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            brands = monthly.resolve_monthly_brands(
+                requested_brands=None,
+                available_brands=["Lime", "KANHA"],
+            )
+
+        self.assertEqual(brands, ["Lime", "KANHA"])
+        self.assertIn("Raw Garden", output.getvalue())
+
+    def test_explicit_unknown_monthly_brand_still_errors(self):
+        with self.assertRaises(ValueError):
+            monthly.resolve_monthly_brands(["Mary Medical"])
 
     def test_parse_recipients_defaults_to_test_recipient(self):
         self.assertEqual(monthly.parse_recipients(None, production=False), ["anthony@buzzcannabis.com"])
@@ -48,7 +76,7 @@ class MonthlyBrandReportsJobTests(unittest.TestCase):
         text = output.getvalue()
         self.assertEqual(exit_code, 0)
         self.assertIn("[RANGE] 2026-03-01 -> 2026-03-31", text)
-        self.assertIn("[BRANDS] Lime, KANHA, Raw Garden, Mary Medical, Dixie, TreeSap, LA FARMS", text)
+        self.assertIn("[BRANDS] Lime, KANHA, Raw Garden, Dixie, TreeSap, LA FARMS", text)
         self.assertIn("[DRY-RUN]", text)
 
 

@@ -8,6 +8,8 @@ DEFAULT_IDENTITY_COLUMNS = ("Brand", "Category", "Product")
 DEFAULT_QUANTITY_COLUMN = "Available"
 DEFAULT_COST_COLUMN = "Cost"
 SORT_PREFIX = "_inventory_sort_"
+MAX_AVAIL_FOR_UNAVAILABLE = 2
+PROMO_SAMPLE_PATTERN = re.compile(r"(?i)\bsample\b|\bpromo\b")
 
 
 def _is_missing(value):
@@ -25,6 +27,98 @@ def _safe_display_text(value):
 
 def normalize_inventory_text(value):
     return _safe_display_text(value).lower()
+
+
+def extract_strain_type(product_name):
+    if not isinstance(product_name, str):
+        return ""
+    text = " " + product_name.upper() + " "
+    if re.search(r"\bS\b", text):
+        return "S"
+    if re.search(r"\bH\b", text):
+        return "H"
+    if re.search(r"\bI\b", text):
+        return "I"
+    return ""
+
+
+def extract_product_details(product_name):
+    if not isinstance(product_name, str):
+        return "", ""
+    name_upper = product_name.upper()
+
+    weight_match = re.search(r"(\d+(\.\d+)?)G", name_upper)
+    weight = weight_match.group(0) if weight_match else ""
+    sub_type = ""
+    if " HH " in f" {name_upper} ":
+        sub_type = "HH"
+    elif " IN " in f" {name_upper} ":
+        sub_type = "IN"
+    return weight, sub_type
+
+
+def is_empty_or_numbers(value):
+    if not isinstance(value, str):
+        return True
+    value_text = value.strip()
+    return value_text == "" or value_text.isdigit()
+
+
+def inventory_columns_or_missing(df, required_columns, optional_columns=()):
+    missing = [column for column in required_columns if column not in df.columns]
+    if missing:
+        return None, missing
+
+    keep_columns = [column for column in [*required_columns, *optional_columns] if column in df.columns]
+    return df[keep_columns].copy(), []
+
+
+def remove_sample_and_promo_rows(df, product_column="Product"):
+    if df.empty or product_column not in df.columns:
+        return df.copy()
+    return df[~df[product_column].str.contains(PROMO_SAMPLE_PATTERN, na=False)].copy()
+
+
+def normalize_inventory_base_frame(df):
+    work = df.copy()
+    if "Available" in work.columns:
+        work["Available"] = pd.to_numeric(work["Available"], errors="coerce").fillna(0)
+    if "Cost" in work.columns:
+        work["Cost"] = pd.to_numeric(work["Cost"], errors="coerce")
+    return consolidate_duplicate_inventory_rows(work)
+
+
+def split_available_unavailable(df, threshold=MAX_AVAIL_FOR_UNAVAILABLE):
+    if "Available" not in df.columns:
+        return df.iloc[0:0].copy(), df.iloc[0:0].copy()
+    unavailable = df[df["Available"] <= threshold].copy()
+    available = df[df["Available"] > threshold].copy()
+    return available, unavailable
+
+
+def add_product_metadata(df, include_details=False, filter_empty_products=False):
+    work = df.copy()
+    if "Product" in work.columns:
+        work["Strain_Type"] = work["Product"].apply(extract_strain_type)
+        if include_details:
+            work[["Product_Weight", "Product_SubType"]] = work["Product"].apply(
+                lambda value: pd.Series(extract_product_details(value))
+            )
+        if filter_empty_products:
+            work = work[~work["Product"].apply(is_empty_or_numbers)].copy()
+    else:
+        work["Strain_Type"] = ""
+        if include_details:
+            work["Product_Weight"] = ""
+            work["Product_SubType"] = ""
+    return work
+
+
+def sort_inventory_report_frame(df, include_cost_as_tiebreaker=False):
+    return sort_inventory_rows(
+        df,
+        include_cost_as_tiebreaker=include_cost_as_tiebreaker and "Cost" in df.columns,
+    )
 
 
 def _first_non_empty(series):

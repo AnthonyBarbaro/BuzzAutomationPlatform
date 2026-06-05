@@ -36,8 +36,12 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from brand_inventory_rows import (
-    consolidate_duplicate_inventory_rows,
-    sort_inventory_rows,
+    add_product_metadata,
+    inventory_columns_or_missing,
+    normalize_inventory_base_frame,
+    remove_sample_and_promo_rows,
+    sort_inventory_report_frame,
+    split_available_unavailable,
 )
 from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
@@ -737,38 +741,6 @@ def write_inventory_link_manifest(
         print(f"[INFO] Wrote OTHER link list: {dated_other_path}")
         print(f"[INFO] Updated OTHER link list: {latest_other_path}")
 
-def extract_strain_type(product_name: str):
-    if not isinstance(product_name, str):
-        return ""
-    name = " " + product_name.upper() + " "
-    if re.search(r'\bS\b', name):
-        return 'S'
-    if re.search(r'\bH\b', name):
-        return 'H'
-    if re.search(r'\bI\b', name):
-        return 'I'
-    return ""
-
-def extract_product_details(product_name: str):
-    if not isinstance(product_name, str):
-        return "", ""
-    name_upper = product_name.upper()
-
-    weight_match = re.search(r'(\d+(\.\d+)?)G', name_upper)
-    weight = weight_match.group(0) if weight_match else ""
-    sub_type = ""
-    if " HH " in f" {name_upper} ":
-        sub_type = "HH"
-    elif " IN " in f" {name_upper} ":
-        sub_type = "IN"
-    return weight, sub_type
-
-def is_empty_or_numbers(val):
-    if not isinstance(val, str):
-        return True
-    val_str = val.strip()
-    return val_str == "" or val_str.isdigit()
-
 def format_excel_file(filename: str):
     """
     **ADVANCED** Excel formatting:  
@@ -885,55 +857,35 @@ def process_file(file_path, output_directory, selected_brands):
         print(f"Error reading {file_path}: {e}")
         return None, None
 
-    if not all(column in df.columns for column in INPUT_COLUMNS):
+    source_columns = list(df.columns)
+    df, missing_columns = inventory_columns_or_missing(df, INPUT_COLUMNS, ["Cost"])
+    if missing_columns:
         print(
             f"[WARN] {file_path} is missing required columns {INPUT_COLUMNS}. "
-            f"Found columns: {list(df.columns)}. Skipped."
+            f"Found columns: {source_columns}. Skipped."
         )
         return None, None
 
-    existing_cols = [c for c in INPUT_COLUMNS + ['Cost'] if c in df.columns]
-    df = df[existing_cols]
-
-    # Filter out 'promo' or 'sample'
-    if 'Product' in df.columns:
-        df = df[~df['Product'].str.contains(r'(?i)\bsample\b|\bpromo\b', na=False)]
-
-    if 'Available' not in df.columns:
-        print(f"[WARN] 'Available' not found in {file_path}, skipping.")
-        return None, None
-
-    df['Available'] = pd.to_numeric(df['Available'], errors='coerce').fillna(0)
-    if 'Cost' in df.columns:
-        df['Cost'] = pd.to_numeric(df['Cost'], errors='coerce')
-    df = consolidate_duplicate_inventory_rows(df)
-
-    unavailable_data = df[df['Available'] <= 2].copy()
-    available_data = df[df['Available'] > 2].copy()
+    df = remove_sample_and_promo_rows(df)
+    df = normalize_inventory_base_frame(df)
+    available_data, unavailable_data = split_available_unavailable(df)
 
     # If we only want certain brands:
     if 'Brand' in available_data.columns and selected_brands:
         available_data = available_data[available_data['Brand'].isin(selected_brands)].copy()
 
-    # Extract strain and product details
-    if 'Product' in available_data.columns:
-        available_data['Strain_Type'] = available_data['Product'].apply(extract_strain_type)
-        available_data[['Product_Weight','Product_SubType']] = available_data['Product'].apply(
-            lambda x: pd.Series(extract_product_details(x))
-        )
-        # Filter out empty / numeric-only products
-        available_data = available_data[~available_data['Product'].apply(is_empty_or_numbers)]
-    else:
-        available_data['Strain_Type'] = ""
-        available_data['Product_Weight'] = ""
-        available_data['Product_SubType'] = ""
+    available_data = add_product_metadata(
+        available_data,
+        include_details=True,
+        filter_empty_products=True,
+    )
 
-    available_data = sort_inventory_rows(
+    available_data = sort_inventory_report_frame(
         available_data,
         include_cost_as_tiebreaker='Cost' in available_data.columns,
     )
 
-    unavailable_data = sort_inventory_rows(
+    unavailable_data = sort_inventory_report_frame(
         unavailable_data,
         include_cost_as_tiebreaker='Cost' in unavailable_data.columns,
     )

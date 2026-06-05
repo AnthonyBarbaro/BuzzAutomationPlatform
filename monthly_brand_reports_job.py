@@ -36,7 +36,7 @@ DEFAULT_MONTHLY_BRANDS = [
     "Lime",
     "KANHA",
     "Raw Garden",
-    "Mary Medical",
+    # "Mary Medical",
     "Dixie",
     "TreeSap",
     "LA FARMS",
@@ -108,10 +108,11 @@ def resolve_monthly_brands(
     available = list(available_brands or DEFAULT_BRAND_CRITERIA.keys())
     available_lookup = {normalize_brand_name(brand): brand for brand in available}
     alias_lookup = {**available_lookup, **BRAND_ALIASES}
+    using_defaults = requested_brands is None
 
     resolved = []
     missing = []
-    for brand in requested_brands or DEFAULT_MONTHLY_BRANDS:
+    for brand in requested_brands if requested_brands is not None else DEFAULT_MONTHLY_BRANDS:
         brand_text = str(brand or "").strip()
         if not brand_text:
             continue
@@ -124,7 +125,10 @@ def resolve_monthly_brands(
             resolved.append(target)
 
     if missing:
-        raise ValueError(f"Unknown monthly brand(s): {', '.join(missing)}")
+        if using_defaults:
+            print(f"[WARN] Skipping inactive monthly brand(s): {', '.join(missing)}")
+        else:
+            raise ValueError(f"Unknown monthly brand(s): {', '.join(missing)}")
     return resolved
 
 
@@ -475,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     os.chdir(BASE_DIR)
 
     start_day, end_day = determine_report_range(args)
-    requested_brands = split_arg_values(args.brands) or DEFAULT_MONTHLY_BRANDS
+    requested_brands = split_arg_values(args.brands) or None
     brands = resolve_monthly_brands(requested_brands)
     recipients = parse_recipients(args.recipient, production=args.production)
     month_label = month_folder_name(start_day)

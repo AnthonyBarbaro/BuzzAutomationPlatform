@@ -41,8 +41,12 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from brand_inventory_rows import (
-    consolidate_duplicate_inventory_rows,
-    sort_inventory_rows,
+    add_product_metadata,
+    inventory_columns_or_missing,
+    normalize_inventory_base_frame,
+    remove_sample_and_promo_rows,
+    sort_inventory_report_frame,
+    split_available_unavailable,
 )
 from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
@@ -676,19 +680,6 @@ def advanced_format_excel(xlsx_path):
                     c.alignment = Alignment(horizontal='center', vertical='center')
     wb.save(xlsx_path)
 
-def extract_strain_type(product_name):
-    """Optional: parse 'S', 'H', 'I' from product name, if you want to track strain."""
-    if not isinstance(product_name, str):
-        return ""
-    text = " " + product_name.upper() + " "
-    if re.search(r"\bS\b", text):
-        return "S"
-    if re.search(r"\bH\b", text):
-        return "H"
-    if re.search(r"\bI\b", text):
-        return "I"
-    return ""
-
 # ----------------- CSV -> XLSX: Avail + Unavail -----------------
 def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True, order_reports_dir=None):
     """
@@ -706,29 +697,20 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
         print(f"[ERROR] reading {csv_path}: {e}")
         return {}
 
-    if not all(c in df.columns for c in REQUIRED_COLUMNS):
+    source_columns = list(df.columns)
+    df, missing_columns = inventory_columns_or_missing(df, REQUIRED_COLUMNS, OPTIONAL_COLUMNS)
+    if missing_columns:
         print(
             f"[WARN] '{csv_path}' is missing required columns {REQUIRED_COLUMNS}. "
-            f"Columns found: {list(df.columns)}. Skipping."
+            f"Columns found: {source_columns}. Skipping."
         )
         return {}
 
-    # Keep relevant columns only
-    keep_cols = [c for c in REQUIRED_COLUMNS + OPTIONAL_COLUMNS if c in df.columns]
-    df = df[keep_cols]
-
-    # Remove "sample"/"promo" lines
-    if "Product" in df.columns:
-        df = df[~df["Product"].str.contains(r"(?i)\bsample\b|\bpromo\b", na=False)]
-
-    df["Available"] = pd.to_numeric(df["Available"], errors="coerce").fillna(0)
-    if "Cost" in df.columns:
-        df["Cost"] = pd.to_numeric(df["Cost"], errors="coerce")
-    df = consolidate_duplicate_inventory_rows(df)
+    df = remove_sample_and_promo_rows(df)
+    df = normalize_inventory_base_frame(df)
 
     # Split into available/unavailable
-    unavailable_df = df[df["Available"] <= MAX_AVAIL_FOR_UNAVAILABLE].copy()
-    available_df   = df[df["Available"] > MAX_AVAIL_FOR_UNAVAILABLE].copy()
+    available_df, unavailable_df = split_available_unavailable(df, MAX_AVAIL_FOR_UNAVAILABLE)
      # Drop Cost column if disabled
     if not include_cost:
         if "Cost" in available_df.columns:
@@ -753,12 +735,10 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
         print(f"[INFO] No matching brand data in '{csv_path}' after brand filter.")
         return {}
 
-    # Example: add "Strain_Type"
-    if "Product" in available_df.columns:
-        available_df["Strain_Type"] = available_df["Product"].apply(extract_strain_type)
+    available_df = add_product_metadata(available_df)
 
     # Sort
-    available_df = sort_inventory_rows(
+    available_df = sort_inventory_report_frame(
         available_df,
         include_cost_as_tiebreaker=include_cost and "Cost" in available_df.columns,
     )
@@ -773,7 +753,7 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
     if "Brand" in unavailable_df.columns and not unavailable_df.empty:
         unavailable_df.loc[:, "Brand"] = unavailable_df["Brand"].astype(str).str.strip().str.lower()
     if not unavailable_df.empty:
-        unavailable_df = sort_inventory_rows(
+        unavailable_df = sort_inventory_report_frame(
             unavailable_df,
             include_cost_as_tiebreaker=include_cost and "Cost" in unavailable_df.columns,
         )

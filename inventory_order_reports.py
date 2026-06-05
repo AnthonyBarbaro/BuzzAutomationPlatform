@@ -587,7 +587,7 @@ def build_simple_order_table(window_frames, include_store_column=False, store_co
             "Category": _safe_display_text(row.get(category_col)) if category_col else "",
             "Product": _safe_display_text(row.get(product_col)) if product_col else "",
             "Available": _rounded_display_number(available),
-            "Par Level": _estimate_simple_par_level(available, units_7d, units_14d, units_30d),
+            "Par Level": "",
             "Cost": round(_safe_float(row.get(cost_col), 0.0), 2) if cost_col else 0.0,
             "Price": round(_safe_float(row.get(price_col), 0.0), 2) if price_col else 0.0,
             "Units Sold 7d": _rounded_display_number(units_7d),

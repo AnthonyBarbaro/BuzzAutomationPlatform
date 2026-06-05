@@ -74,7 +74,7 @@ class InventoryOrderReportAPITests(unittest.TestCase):
 
         tropical_row = detail_df.loc[detail_df["Product"] == "Brand A | Gummies 10pk | Tropical"].iloc[0]
         self.assertEqual(int(tropical_row["Available"]), 0)
-        self.assertEqual(int(tropical_row["Par Level"]), 1)
+        self.assertEqual(tropical_row["Par Level"], "")
         self.assertEqual(int(tropical_row["Units Sold 14d"]), 2)
 
 

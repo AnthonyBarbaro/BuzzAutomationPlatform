@@ -169,7 +169,7 @@ class BuildBrandOrderSectionsTests(unittest.TestCase):
         self.assertEqual(len(order_table), 2)
         first_row = order_table.iloc[0]
         self.assertEqual(first_row["Available"], 0)
-        self.assertEqual(first_row["Par Level"], 2)
+        self.assertEqual(first_row["Par Level"], "")
         self.assertEqual(first_row["Units Sold 7d"], 0)
         self.assertEqual(first_row["Units Sold 14d"], 2)
         self.assertEqual(first_row["Units Sold 30d"], 4)
