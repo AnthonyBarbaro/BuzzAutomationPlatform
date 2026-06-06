@@ -97,9 +97,10 @@ class BrandMeetingPacketGUI:
         self.generate_followup_notes_var = tk.BooleanVar(value=True)
         self.compact_pdf_mode_var = tk.BooleanVar(value=True)
         self.packet_mode_var = tk.StringVar(value="standard")
+        self.packet_style_var = tk.StringVar(value="Classic Detail")
         self.owner_top_n_var = tk.StringVar(value="20")
         self.owner_brand_cards_var = tk.BooleanVar(value=True)
-        self.owner_email_var = tk.BooleanVar(value=False)
+        self.owner_email_var = tk.BooleanVar(value=True)
         self.owner_creditflow_var = tk.BooleanVar(value=False)
         self.target_margin_var = tk.StringVar(value="35")
         self.brand_search_var = tk.StringVar()
@@ -498,7 +499,7 @@ class BrandMeetingPacketGUI:
         )
         self.btn_owner_rollup = ttk.Button(
             self.run_action_grid,
-            text="Build Owner Top Brands PDF",
+            text="Build + Email Owner Top Brands PDF",
             style="Secondary.TButton",
             command=self._on_owner_rollup,
         )
@@ -552,7 +553,7 @@ class BrandMeetingPacketGUI:
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             owner_frame,
-            text="Email to owners",
+            text="Email to Anthony",
             variable=self.owner_email_var,
             style="Store.TCheckbutton",
             command=self._update_header_summary,
@@ -883,7 +884,18 @@ class BrandMeetingPacketGUI:
         self._field_label(target_body, "Target Margin %").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         ttk.Entry(target_body, textvariable=self.target_margin_var, width=10).grid(row=0, column=1, sticky="ew", pady=(0, 8))
 
-        self._field_label(target_body, "Packet Mode").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self._field_label(target_body, "Packet Style").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        self.packet_style_combo = ttk.Combobox(
+            target_body,
+            textvariable=self.packet_style_var,
+            values=["Classic Detail", "Dashboard / Easy Read"],
+            state="readonly",
+            width=20,
+        )
+        self.packet_style_combo.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        self.packet_style_combo.bind("<<ComboboxSelected>>", self._on_packet_style_changed)
+
+        self._field_label(target_body, "Packet Mode").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         self.packet_mode_combo = ttk.Combobox(
             target_body,
             textvariable=self.packet_mode_var,
@@ -891,7 +903,7 @@ class BrandMeetingPacketGUI:
             state="readonly",
             width=12,
         )
-        self.packet_mode_combo.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        self.packet_mode_combo.grid(row=2, column=1, sticky="ew", pady=(0, 8))
         self.packet_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_header_summary())
 
         checks = [
@@ -901,7 +913,7 @@ class BrandMeetingPacketGUI:
             ("Generate Meeting Follow-Up Notes", self.generate_followup_notes_var),
             ("Compact PDF Mode", self.compact_pdf_mode_var),
         ]
-        for idx, (label, var) in enumerate(checks, start=2):
+        for idx, (label, var) in enumerate(checks, start=3):
             ttk.Checkbutton(
                 target_body,
                 text=label,
@@ -922,7 +934,7 @@ class BrandMeetingPacketGUI:
             wraplength=380,
             padx=12,
             pady=12,
-        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(14, 0))
 
         self._refresh_credit_tree()
 
@@ -2046,6 +2058,7 @@ class BrandMeetingPacketGUI:
             monthly_state = "On" if self.include_monthly_reference_var.get() else "Off"
             compact_state = "On" if self.compact_pdf_mode_var.get() else "Off"
             mode_state = self.packet_mode_var.get().title()
+            style_state = self.packet_style_var.get()
             target_state = self.target_margin_var.get().strip() or "35"
             workers_state = str(self._api_worker_count())
             next_step = ""
@@ -2055,7 +2068,7 @@ class BrandMeetingPacketGUI:
                 next_step = "  •  Next: pick at least one store in Settings."
             self.setup_summary_var.set(
                 f"Brands: {brand_count}  •  Stores: {store_count}  •  Window: {start_day.isoformat()} to {end_day.isoformat()}  •  "
-                f"Mode: {mode_state}  •  Target: {target_state}%  •  Workers: {workers_state}  •  Data: {data_state}  •  Email: {email_state}  •  XLSX: {xlsx_state}  •  "
+                f"Style: {style_state}  •  Mode: {mode_state}  •  Target: {target_state}%  •  Workers: {workers_state}  •  Data: {data_state}  •  Email: {email_state}  •  XLSX: {xlsx_state}  •  "
                 f"Credits: {credit_state}  •  CreditFlow: {creditflow_state}  •  Monthly Ref: {monthly_state}  •  Compact PDF: {compact_state}  •  Prior: {prior_state}  •  Downloads: {'Fresh pull' if self.force_refresh_var.get() else 'Saved data first'}"
                 f"{next_step}"
             )
@@ -2063,6 +2076,14 @@ class BrandMeetingPacketGUI:
             self.window_summary_var.set("Select a valid date window")
             self.window_preview_var.set("Custom dates must be valid YYYY-MM-DD values with an end date on or after the start date.")
             self.setup_summary_var.set("Fix the date window before running. Brands and stores can still be selected now.")
+
+    def _packet_layout_value(self) -> str:
+        return "dashboard" if self.packet_style_var.get().lower().startswith("dashboard") else "classic"
+
+    def _on_packet_style_changed(self, _event: tk.Event | None = None) -> None:
+        if self._packet_layout_value() == "dashboard":
+            self.include_appendix_var.set(False)
+        self._update_header_summary()
 
     def _on_window_changed(self) -> None:
         self._set_custom_date_state()
@@ -2196,6 +2217,9 @@ class BrandMeetingPacketGUI:
             packet_mode=self.packet_mode_var.get(),
             generate_followup_notes=self.generate_followup_notes_var.get(),
             compact_pdf_mode=self.compact_pdf_mode_var.get(),
+            packet_layout=self._packet_layout_value(),
+            max_products=20,
+            max_store_products=10,
         )
 
     def _queue_event(self, kind: str, payload: object = "") -> None:

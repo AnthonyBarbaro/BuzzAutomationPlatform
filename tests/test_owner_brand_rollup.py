@@ -313,6 +313,7 @@ class OwnerBrandRollupTests(unittest.TestCase):
         old_prepare_catalog_for_all_brands = bmp.prepare_catalog_for_all_brands
         old_build_catalog_merge_maps = bmp.build_catalog_merge_maps
         old_prepare_sales_df_all_brands = bmp._prepare_sales_df_all_brands
+        old_send_owner_brand_rollup_email = bmp.send_owner_brand_rollup_email
         captured = {}
         try:
             def fake_prepare_sales_exports(**kwargs):
@@ -331,6 +332,14 @@ class OwnerBrandRollupTests(unittest.TestCase):
             bmp.build_catalog_merge_maps = lambda *_args, **_kwargs: {}
             bmp._prepare_sales_df_all_brands = lambda *_args, **_kwargs: prepared_sales.copy()
 
+            def fake_send_owner_brand_rollup_email(pdf_path, start, end, summary, to_email, logger=None):
+                captured["email_pdf_exists"] = Path(pdf_path).exists()
+                captured["email_to"] = to_email
+                captured["email_start"] = start
+                captured["email_end"] = end
+
+            bmp.send_owner_brand_rollup_email = fake_send_owner_brand_rollup_email
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 artifacts = bmp.generate_owner_brand_rollup_packet(
                     start_date=start_day,
@@ -338,7 +347,6 @@ class OwnerBrandRollupTests(unittest.TestCase):
                     stores=["MV", "SV"],
                     output_root=Path(tmpdir),
                     top_n=2,
-                    email=False,
                     include_creditflow=False,
                     credit_ledger_path=str(Path(tmpdir) / "ledger.json"),
                 )
@@ -351,6 +359,10 @@ class OwnerBrandRollupTests(unittest.TestCase):
                 self.assertEqual(scorecard["brand_name"].tolist(), ["Alpha", "Beta"])
                 self.assertFalse(captured["sales_allow_export"])
                 self.assertFalse(captured["catalog_run_export"])
+                self.assertTrue(captured["email_pdf_exists"])
+                self.assertEqual(captured["email_to"], bmp.OWNER_BRAND_ROLLUP_EMAIL)
+                self.assertEqual(captured["email_start"], start_day)
+                self.assertEqual(captured["email_end"], end_day)
         finally:
             bmp.prepare_sales_exports = old_prepare_sales_exports
             bmp.prepare_catalog_exports = old_prepare_catalog_exports
@@ -359,6 +371,7 @@ class OwnerBrandRollupTests(unittest.TestCase):
             bmp.prepare_catalog_for_all_brands = old_prepare_catalog_for_all_brands
             bmp.build_catalog_merge_maps = old_build_catalog_merge_maps
             bmp._prepare_sales_df_all_brands = old_prepare_sales_df_all_brands
+            bmp.send_owner_brand_rollup_email = old_send_owner_brand_rollup_email
 
 
 if __name__ == "__main__":

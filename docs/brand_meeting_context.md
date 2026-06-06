@@ -17,7 +17,7 @@ What it owns:
 - Brand selection and search.
 - Store selection.
 - Date presets and custom windows.
-- Packet options: API/browser data mode, force refresh, email, XLSX, prior-window comparison, charts, store sections, appendix, target margin, CreditFlow, monthly reference, follow-up notes, compact PDF.
+- Packet options: API/browser data mode, force refresh, email, XLSX, prior-window comparison, charts, store sections, appendix, packet style, target margin, CreditFlow, monthly reference, follow-up notes, compact PDF.
 - Manual credit ledger editing/import/export.
 - Background worker thread and UI-safe queue for status/log updates.
 
@@ -75,7 +75,7 @@ What it does:
 9. Reconciles expected/received credits from the manual ledger and CreditFlow.
 10. Generates action items, brand health score, meeting ask, and optional follow-up notes.
 11. Writes QA/cache CSVs.
-12. Builds a compact/premium PDF by default, optional XLSX, and optional Gmail email.
+12. Builds either the classic packet or the landscape Dashboard / Easy Read packet, optional XLSX, and optional Gmail email.
 
 CLI examples:
 
@@ -87,13 +87,19 @@ CLI examples:
 .venv/bin/python brand_meeting_packet.py --brand "Raw Garden" --stores MV,LM,SV,LG,NC,WP --no-export --no-catalog-export --no-email
 ```
 
+Dashboard / Easy Read single-brand packet:
+
+```bash
+.venv/bin/python brand_meeting_packet.py --brand "Sol Flora" --stores MV,LM,SV,LG,NC,WP --no-email --packet-layout dashboard --no-appendix
+```
+
 Owner-facing top-brands review:
 
 ```bash
-.venv/bin/python brand_meeting_packet.py --owner-rollup --top-brands 20 --stores MV,LM,SV,LG,NC,WP --no-email
+.venv/bin/python brand_meeting_packet.py --owner-rollup --top-brands 20 --stores MV,LM,SV,LG,NC,WP
 ```
 
-By default the CLI emails results unless `--no-email` is passed.
+By default the CLI emails brand packets and owner top-brands reviews unless `--no-email` is passed. Owner top-brands reviews email only `anthony@buzzcannabis.com`.
 
 ## Data And Artifact Flow
 
@@ -138,6 +144,13 @@ Useful cache outputs include:
 - `store_credit_scorecards.csv`
 - `dos_trend_key_audit_30d.csv`
 - `creditflow_credits_cache.json`
+- `dashboard_brand_snapshot.csv`
+- `dashboard_product_decision_board.csv`
+- `dashboard_fast_movers.csv`
+- `dashboard_slow_movers.csv`
+- `dashboard_store_matrix.csv`
+- `dashboard_category_mix.csv`
+- `dashboard_credit_margin_summary.csv`
 - `owner_top_brands_scorecard.csv`
 - `owner_top_brands_summary.csv`
 
@@ -233,6 +246,7 @@ Small utilities:
 - GUI logs intentionally hide noisy QA/archive messages. If debugging, check terminal output and the run `cache/` folder.
 - Do not update Tk widgets directly from worker threads. Push events through the queue.
 - Email is on by default in the CLI. Use `--no-email` for test runs.
+- Dashboard packets use `--packet-layout dashboard` or `--dashboard`. Dashboard appendix tables default off unless `--include-appendix` is passed.
 - `brand_config.json` vs `brand_config2.json` is a current mismatch to resolve if scheduled brand metadata should appear in the meeting GUI.
 
 ## Testing
@@ -247,6 +261,7 @@ Useful focused tests around adjacent brand systems:
 
 ```bash
 .venv/bin/python -m unittest \
+  tests/test_brand_packet_dashboard.py \
   tests/test_brand_inventory_rows.py \
   tests/test_brand_inv_other_folder.py \
   tests/test_brand_inv_other_drive.py \

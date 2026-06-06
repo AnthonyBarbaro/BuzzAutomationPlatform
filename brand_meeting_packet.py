@@ -95,6 +95,7 @@ FILES_DIR = THIS_DIR / "files"
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 GMAIL_TOKEN = THIS_DIR / "token_gmail.json"
 DEFAULT_REPORT_EMAIL = "anthony@buzzcannabis.com"
+OWNER_BRAND_ROLLUP_EMAIL = "anthony@buzzcannabis.com"
 
 SUPPLY_PRICE_BUCKET = 0.50
 SUPPLY_COST_BUCKET = 0.25
@@ -162,6 +163,9 @@ class PacketOptions:
     packet_mode: str = "standard"
     generate_followup_notes: bool = True
     compact_pdf_mode: bool = True
+    packet_layout: str = "classic"
+    max_products: int = 20
+    max_store_products: int = 10
 
 
 @dataclass
@@ -203,6 +207,26 @@ class OwnerBrandRollupArtifacts:
     brand_count: int
     missing_sales_stores: List[str]
     missing_catalog_stores: List[str]
+
+
+@dataclass
+class ProductDecisionRow:
+    product_name: str
+    category: str
+    net_sales: float
+    units_sold: float
+    units_per_day: float
+    sales_vs_prior_pct: Optional[float]
+    margin_pct: Optional[float]
+    discount_pct: Optional[float]
+    inventory_units: float
+    inventory_value: float
+    days_supply: Optional[float]
+    sell_through_pct: Optional[float]
+    stores_selling: int
+    risk: str
+    action: str
+    recommendation: str
 
 
 # ---------------------------------------------------------------------------
@@ -5589,7 +5613,7 @@ def generate_owner_brand_rollup_packet(
     include_creditflow: bool = False,
     target_margin: Optional[float] = None,
     output_root: Optional[Path] = None,
-    email: bool = False,
+    email: bool = True,
     compact: bool = True,
     include_brand_cards: bool = True,
     api_env_file: str = DEFAULT_API_ENV_FILE,
@@ -5766,7 +5790,7 @@ def generate_owner_brand_rollup_packet(
     _log(f"[PDF] Created (Owner Top Brands Review): {out_pdf}", logger)
 
     if email:
-        send_owner_brand_rollup_email(out_pdf, start_date, end_date, summary, DEFAULT_REPORT_EMAIL, logger)
+        send_owner_brand_rollup_email(out_pdf, start_date, end_date, summary, OWNER_BRAND_ROLLUP_EMAIL, logger)
 
     return OwnerBrandRollupArtifacts(
         pdf_path=out_pdf,
@@ -6958,14 +6982,22 @@ def _enriched_product_inventory(product_60: pd.DataFrame, inv_products: pd.DataF
     if inv.empty and prod.empty:
         return pd.DataFrame()
     if inv.empty:
-        inv = pd.DataFrame(columns=["merge_key", "display_product", "units_available", "inventory_value", "trend_units_per_day_30d", "days_of_supply"])
+        inv = pd.DataFrame(columns=["merge_key", "display_product", "category_normalized", "units_available", "inventory_value", "trend_units_per_day_30d", "days_of_supply"])
     if prod.empty:
-        prod = pd.DataFrame(columns=["product_group_key", "product_group_display", "net_revenue", "units", "margin_real", "discount_rate", "category_normalized"])
+        prod = pd.DataFrame(columns=[
+            "product_group_key", "product_group_display", "net_revenue", "units", "profit_real", "margin_real",
+            "discount_rate", "category_normalized", "size_normalized", "variant_type",
+        ])
     inv_key = "merge_key" if "merge_key" in inv.columns else "display_product"
     prod_key = "product_group_key" if "product_group_key" in prod.columns else "product_group_display"
     inv[inv_key] = _series_or_default(inv, inv_key, "").fillna("").astype(str)
     prod[prod_key] = _series_or_default(prod, prod_key, "").fillna("").astype(str)
-    keep_prod = [c for c in [prod_key, "product_group_display", "net_revenue", "units", "margin_real", "discount_rate", "category_normalized"] if c in prod.columns]
+    keep_prod = [
+        c for c in [
+            prod_key, "product_group_display", "net_revenue", "units", "profit_real", "margin_real",
+            "discount_rate", "category_normalized", "size_normalized", "variant_type",
+        ] if c in prod.columns
+    ]
     out = inv.merge(prod[keep_prod], left_on=inv_key, right_on=prod_key, how="outer", suffixes=("_inv", "_sales"))
     fallback_series = pd.Series("", index=out.index)
     left_key = out[inv_key] if inv_key in out.columns else fallback_series
@@ -6978,7 +7010,7 @@ def _enriched_product_inventory(product_60: pd.DataFrame, inv_products: pd.DataF
         out["category_normalized"] if "category_normalized" in out.columns else fallback_series
     )
     out["category"] = category_series.fillna("").astype(str)
-    for col in ["net_revenue", "units", "margin_real", "discount_rate", "units_available", "inventory_value", "trend_units_per_day_30d", "days_of_supply"]:
+    for col in ["net_revenue", "units", "profit_real", "margin_real", "discount_rate", "units_available", "inventory_value", "trend_units_per_day_30d", "days_of_supply"]:
         out[col] = pd.to_numeric(_series_or_default(out, col, 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
     out["sell_through"] = out.apply(lambda r: _calc_sell_through(r.get("units", 0.0), r.get("units_available", 0.0)), axis=1)
     return out
@@ -7042,6 +7074,605 @@ def compute_fast_movers_v2(product_60: pd.DataFrame, inv_products: pd.DataFrame)
     out["fast_score"] = out["units"] + (out["trend_units_per_day_30d"] * 10)
     out["action"] = np.where((out["units_available"] <= 0) | (out["days_of_supply"].between(0.01, 21)), "Restock", "Watch depth")
     return out.sort_values(["fast_score", "net_revenue"], ascending=False)
+
+
+def _dashboard_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    if not np.isfinite(out):
+        return default
+    return out
+
+
+def _dashboard_optional_float(value: Any) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float("nan")
+    return out if np.isfinite(out) else float("nan")
+
+
+def dashboard_days_supply(units_on_hand: Any, units_per_day: Any) -> float:
+    units = _dashboard_float(units_on_hand, 0.0)
+    velocity = _dashboard_float(units_per_day, 0.0)
+    if units <= 0:
+        return 0.0
+    if velocity <= 0:
+        return float("nan")
+    return units / velocity
+
+
+def dashboard_sell_through(units_sold: Any, units_on_hand: Any) -> float:
+    sold = _dashboard_float(units_sold, 0.0)
+    on_hand = _dashboard_float(units_on_hand, 0.0)
+    denom = sold + on_hand
+    if denom <= 0:
+        return float("nan")
+    return sold / denom
+
+
+def dashboard_credit_gap_pct_sales(credit_gap: Any, net_sales: Any) -> float:
+    return safe_div(credit_gap, net_sales, 0.0)
+
+
+def _shorten_product_name(product_name: Any, max_chars: int = 44) -> str:
+    limit = max(4, int(max_chars or 44))
+    text = short_product_label(product_name, max_chars=limit)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip(" |-/") + "..."
+
+
+def _format_delta(value: Optional[float], current: Any = 0.0, prior: Any = 0.0) -> str:
+    try:
+        val = float(value) if value is not None else float("nan")
+    except Exception:
+        val = float("nan")
+    cur = _dashboard_float(current, 0.0)
+    try:
+        base = float(prior)
+    except Exception:
+        base = float("nan")
+    if not np.isfinite(val):
+        if cur > 0 and np.isfinite(base) and base == 0:
+            return "New"
+        return "n/a"
+    return pct1(val)
+
+
+def _dashboard_product_key_counts(report_df: pd.DataFrame) -> Tuple[Dict[str, int], Dict[str, date]]:
+    if report_df is None or report_df.empty:
+        return {}, {}
+    tmp = _filter_product_group_rows(report_df.copy())
+    if tmp.empty:
+        return {}, {}
+    tmp = _apply_weekly_ordering_product_identity(tmp, include_store=False)
+    key_col = "ordering_product_key" if "ordering_product_key" in tmp.columns else (
+        "product_group_key" if "product_group_key" in tmp.columns else "merge_key"
+    )
+    if key_col not in tmp.columns:
+        return {}, {}
+    tmp[key_col] = tmp[key_col].fillna("").astype(str)
+    tmp = tmp[tmp[key_col] != ""].copy()
+    if tmp.empty:
+        return {}, {}
+    if "_store_abbr" not in tmp.columns:
+        tmp["_store_abbr"] = ""
+    store_counts = tmp.groupby(key_col)["_store_abbr"].nunique().to_dict()
+    last_sales: Dict[str, date] = {}
+    if "_date" in tmp.columns:
+        dt = pd.to_datetime(tmp["_date"], errors="coerce")
+        tmp = tmp.assign(__date=dt)
+        max_dates = tmp.dropna(subset=["__date"]).groupby(key_col)["__date"].max()
+        last_sales = {str(k): v.date() for k, v in max_dates.items()}
+    return {str(k): int(v) for k, v in store_counts.items()}, last_sales
+
+
+def _classify_product_action(
+    row: Dict[str, Any],
+    target_margin: float = DEAL_TARGET_MARGIN,
+    selected_store_count: int = 0,
+) -> Tuple[str, str, str]:
+    units_per_day = _dashboard_float(row.get("units_per_day"), 0.0)
+    sales_delta = row.get("sales_vs_prior_pct")
+    sales_delta_val = _dashboard_optional_float(sales_delta)
+    margin = _dashboard_float(row.get("margin_pct"), 0.0)
+    discount = _dashboard_float(row.get("discount_pct"), 0.0)
+    on_hand = _dashboard_float(row.get("inventory_units"), 0.0)
+    inv_value = _dashboard_float(row.get("inventory_value"), 0.0)
+    days = _dashboard_optional_float(row.get("days_supply"))
+    sell = _dashboard_float(row.get("sell_through_pct"), 0.0)
+    stores = int(_dashboard_float(row.get("stores_selling"), 0.0))
+    target = _dashboard_float(target_margin, DEAL_TARGET_MARGIN)
+
+    effective_days = days if np.isfinite(days) else (999.0 if on_hand > 0 else 0.0)
+    declining = np.isfinite(sales_delta_val) and sales_delta_val < -0.20
+    healthy_margin = margin >= (target - 0.03)
+    margin_weak = margin < (target - 0.07)
+    low_coverage = selected_store_count > 0 and stores < max(2, math.ceil(selected_store_count * 0.65))
+
+    if on_hand > 0 and (effective_days >= 150 or (units_per_day <= 0.05 and sell <= 0.12 and inv_value >= 500)) and (declining or margin_weak or sell <= 0.12):
+        return "Cut / Buyback", "Critical", "Ask for buyback or stop buying until inventory clears."
+    if on_hand > 0 and (effective_days >= 75 or sell <= 0.20) and units_per_day < 0.50:
+        return "Discount / Move", "High", "Fund markdown, transfer inventory, or add promo support."
+    if units_per_day >= 1.25 and healthy_margin and effective_days <= 45 and sell >= 0.35:
+        return "Reorder / Expand", "Low", "Reorder and expand placement where store coverage is thin."
+    if units_per_day >= 0.60 and margin >= (target - 0.08) and low_coverage:
+        return "Grow with Promo", "Low", "Use promo support to expand into more stores."
+    if declining or margin_weak or discount >= 0.45:
+        return "Watch", "Medium", "Review pricing, discounting, and next buy before reordering."
+    if units_per_day > 0 or on_hand > 0:
+        return "Keep", "Low", "Maintain current depth and monitor next window."
+    return "Watch", "Medium", "No current movement. Confirm menu status and buying plan."
+
+
+def _classify_store_action(row: Dict[str, Any], target_margin: float = DEAL_TARGET_MARGIN) -> str:
+    margin = _dashboard_float(row.get("margin_pct"), 0.0)
+    discount = _dashboard_float(row.get("discount_pct"), 0.0)
+    days = _dashboard_optional_float(row.get("days_supply"))
+    sell = _dashboard_float(row.get("sell_through_pct"), 0.0)
+    sales_delta = _dashboard_optional_float(row.get("sales_vs_prior_pct"))
+    units_delta = _dashboard_optional_float(row.get("units_vs_prior_pct"))
+    target = _dashboard_float(target_margin, DEAL_TARGET_MARGIN)
+    effective_days = days if np.isfinite(days) else (999.0 if _dashboard_float(row.get("inventory_units"), 0.0) > 0 else 0.0)
+    if margin < target - 0.06:
+        return "Fix Margin"
+    if effective_days > 90 or (sell > 0 and sell < 0.18):
+        return "Move Inventory"
+    if np.isfinite(sales_delta) and sales_delta < -0.15:
+        return "Needs Promo"
+    if discount > 0.45 and margin < target:
+        return "Needs Promo"
+    if np.isfinite(sales_delta) and sales_delta > 0.15 and (not np.isfinite(units_delta) or units_delta >= -0.05):
+        return "Grow"
+    if effective_days > 60:
+        return "Reduce Buying"
+    return "Good"
+
+
+def _dashboard_action_priority(action: Any) -> int:
+    return {
+        "Cut / Buyback": 1,
+        "Discount / Move": 2,
+        "Reorder / Expand": 3,
+        "Grow with Promo": 4,
+        "Watch": 5,
+        "Keep": 6,
+    }.get(str(action), 9)
+
+
+def build_dashboard_product_decision_board(
+    product_60: pd.DataFrame,
+    inv_products: pd.DataFrame,
+    prior_product: Optional[pd.DataFrame],
+    report_days: int,
+    selected_store_count: int,
+    store_count_map: Optional[Dict[str, int]] = None,
+    last_sale_map: Optional[Dict[str, date]] = None,
+    max_products: int = 20,
+    target_margin: float = DEAL_TARGET_MARGIN,
+    include_prior_data: bool = True,
+) -> pd.DataFrame:
+    cols = [
+        "action", "risk", "product_key", "product_name", "product_short", "category", "size_type",
+        "net_sales", "gross_profit", "units_sold", "units_per_day", "sales_vs_prior_pct",
+        "margin_pct", "discount_pct", "inventory_units", "inventory_value", "days_supply",
+        "sell_through_pct", "stores_selling", "last_sale_date", "recommendation", "decision_priority",
+    ]
+    base = _enriched_product_inventory(product_60, inv_products)
+    if base.empty:
+        return pd.DataFrame(columns=cols)
+    store_count_map = store_count_map or {}
+    last_sale_map = last_sale_map or {}
+    days_n = max(1, int(report_days or 1))
+
+    for col in ["net_revenue", "units", "margin_real", "discount_rate", "units_available", "inventory_value"]:
+        base[col] = pd.to_numeric(base.get(col, 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    base["product_key"] = base.get("product_key", "").fillna("").astype(str)
+
+    prior = prior_product.copy() if prior_product is not None else pd.DataFrame()
+    if include_prior_data and prior is not None and not prior.empty:
+        prior_key = "product_group_key" if "product_group_key" in prior.columns else (
+            "merge_key" if "merge_key" in prior.columns else "product_group_display"
+        )
+        prior[prior_key] = prior[prior_key].fillna("").astype(str)
+        prior_keep = prior[[c for c in [prior_key, "net_revenue", "units", "profit_real"] if c in prior.columns]].copy()
+        prior_keep = prior_keep.rename(columns={
+            prior_key: "product_key",
+            "net_revenue": "prior_net_sales",
+            "units": "prior_units",
+            "profit_real": "prior_gross_profit",
+        })
+        base = base.merge(prior_keep, on="product_key", how="left")
+    for col in ["prior_net_sales", "prior_units", "prior_gross_profit"]:
+        if col not in base.columns:
+            base[col] = np.nan if not include_prior_data else 0.0
+        base[col] = pd.to_numeric(base[col], errors="coerce")
+        if include_prior_data:
+            base[col] = base[col].fillna(0.0)
+
+    rows: List[Dict[str, Any]] = []
+    for _, r in base.iterrows():
+        product_key = str(r.get("product_key") or "")
+        units = _dashboard_float(r.get("units"), 0.0)
+        units_per_day = safe_div(units, days_n, 0.0)
+        on_hand = _dashboard_float(r.get("units_available"), 0.0)
+        inv_value = _dashboard_float(r.get("inventory_value"), 0.0)
+        days_supply = dashboard_days_supply(on_hand, units_per_day)
+        sell = dashboard_sell_through(units, on_hand)
+        net = _dashboard_float(r.get("net_revenue"), 0.0)
+        profit = _dashboard_float(r.get("profit_real"), 0.0)
+        out = {
+            "product_key": product_key,
+            "product_name": str(r.get("product") or r.get("product_group_display") or r.get("display_product") or "Unknown"),
+            "category": str(r.get("category") or r.get("category_normalized") or "UNKNOWN"),
+            "size_type": " / ".join([str(r.get(c, "")).strip() for c in ["size_normalized", "variant_type"] if str(r.get(c, "")).strip()]),
+            "net_sales": net,
+            "gross_profit": profit,
+            "units_sold": units,
+            "units_per_day": units_per_day,
+            "sales_vs_prior_pct": pct_change(net, r.get("prior_net_sales")) if include_prior_data else float("nan"),
+            "margin_pct": _dashboard_float(r.get("margin_real"), 0.0),
+            "discount_pct": _dashboard_float(r.get("discount_rate"), 0.0),
+            "inventory_units": on_hand,
+            "inventory_value": inv_value,
+            "days_supply": days_supply,
+            "sell_through_pct": sell,
+            "stores_selling": int(store_count_map.get(product_key, 0)),
+            "last_sale_date": last_sale_map.get(product_key, ""),
+        }
+        action, risk, recommendation = _classify_product_action(out, target_margin=target_margin, selected_store_count=selected_store_count)
+        out["action"] = action
+        out["risk"] = risk
+        out["recommendation"] = recommendation
+        out["decision_priority"] = _dashboard_action_priority(action)
+        out["product_short"] = _shorten_product_name(out["product_name"], 44)
+        rows.append(out)
+
+    df = pd.DataFrame(rows, columns=cols)
+    if df.empty:
+        return df
+    df["__days_sort"] = pd.to_numeric(df["days_supply"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(999.0)
+    df = df.sort_values(
+        ["decision_priority", "inventory_value", "units_per_day", "net_sales", "__days_sort"],
+        ascending=[True, False, False, False, False],
+    ).drop(columns=["__days_sort"])
+    return df.head(max(1, int(max_products or 20))).reset_index(drop=True)
+
+
+def build_dashboard_fast_movers(decision_board: pd.DataFrame, max_products: int = 20) -> pd.DataFrame:
+    if decision_board is None or decision_board.empty:
+        return pd.DataFrame(columns=decision_board.columns if decision_board is not None else [])
+    df = decision_board.copy()
+    for col in ["units_per_day", "net_sales", "gross_profit", "sell_through_pct"]:
+        df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df["fast_score"] = (df["units_per_day"] * 100.0) + (df["net_sales"] / 100.0) + (df["gross_profit"] / 120.0) + (df["sell_through_pct"] * 25.0)
+    return df[df["units_sold"].fillna(0.0).astype(float) > 0].sort_values(["fast_score", "net_sales"], ascending=False).head(max(1, int(max_products or 20))).reset_index(drop=True)
+
+
+def build_dashboard_slow_movers(decision_board: pd.DataFrame, max_products: int = 20) -> pd.DataFrame:
+    if decision_board is None or decision_board.empty:
+        return pd.DataFrame(columns=decision_board.columns if decision_board is not None else [])
+    df = decision_board.copy()
+    risk_order = {"Critical": 1, "High": 2, "Medium": 3, "Low": 4}
+    df["risk_priority"] = df["risk"].map(risk_order).fillna(9)
+    df["days_sort"] = pd.to_numeric(df.get("days_supply", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(999.0)
+    mask = df["risk"].isin(["Critical", "High", "Medium"]) | df["action"].isin(["Cut / Buyback", "Discount / Move", "Watch"])
+    return df[mask].sort_values(["risk_priority", "inventory_value", "days_sort"], ascending=[True, False, False]).head(max(1, int(max_products or 20))).reset_index(drop=True)
+
+
+def build_dashboard_store_matrix(
+    store_60: pd.DataFrame,
+    store_sales_packets: Dict[str, Dict[str, Any]],
+    selected_store_codes: Sequence[str],
+    inv_store: pd.DataFrame,
+    total_net_sales: float,
+    target_margin: float = DEAL_TARGET_MARGIN,
+) -> pd.DataFrame:
+    cols = [
+        "store", "net_sales", "sales_share_pct", "sales_vs_prior_pct", "units", "units_vs_prior_pct",
+        "margin_pct", "discount_pct", "inventory_value", "inventory_units", "days_supply",
+        "sell_through_pct", "fastest_product", "slowest_product", "store_action",
+    ]
+    store_df = store_60.copy() if store_60 is not None else pd.DataFrame()
+    if not store_df.empty and "_store_abbr" in store_df.columns:
+        store_df["_store_abbr"] = store_df["_store_abbr"].fillna("").astype(str).str.upper()
+        store_df = store_df.set_index("_store_abbr", drop=False)
+    inv_df = inv_store.copy() if inv_store is not None else pd.DataFrame()
+    if not inv_df.empty and "_store_abbr" in inv_df.columns:
+        inv_df["_store_abbr"] = inv_df["_store_abbr"].fillna("").astype(str).str.upper()
+        inv_df = inv_df.set_index("_store_abbr", drop=False)
+    rows: List[Dict[str, Any]] = []
+    for abbr in order_store_codes(selected_store_codes):
+        sales_row = store_df.loc[abbr] if abbr in getattr(store_df, "index", []) else {}
+        inv_row = inv_df.loc[abbr] if abbr in getattr(inv_df, "index", []) else {}
+        pkt = store_sales_packets.get(abbr, {}) if store_sales_packets else {}
+        metrics = ((pkt.get("window_metrics", {}) or {}).get("report") or {})
+        prior = ((pkt.get("window_metrics", {}) or {}).get("prior_report") or {})
+        inv = pkt.get("inventory", {}) or {}
+        net = _dashboard_float(metrics.get("net_revenue", getattr(sales_row, "net_revenue", 0.0)), 0.0)
+        units = _dashboard_float(metrics.get("items", getattr(sales_row, "items", 0.0)), 0.0)
+        inv_units = _dashboard_float(inv.get("units_available", getattr(inv_row, "units_available", 0.0)), 0.0)
+        inv_value = _dashboard_float(inv.get("inventory_value", getattr(inv_row, "inventory_value", 0.0)), 0.0)
+        days_supply = _dashboard_optional_float(inv.get("days_of_supply", getattr(inv_row, "days_of_supply", np.nan)))
+        sell = dashboard_sell_through(units, inv_units)
+        product = pkt.get("product_60", pd.DataFrame())
+        fastest = ""
+        if product is not None and not product.empty:
+            fast_df = product.copy()
+            fast_df["units"] = pd.to_numeric(fast_df.get("units", 0.0), errors="coerce").fillna(0.0)
+            fastest = str(fast_df.sort_values(["units", "net_revenue"], ascending=False).iloc[0].get("product_group_display", ""))
+        risk_df = compute_slow_movers_v2(product, pkt.get("inventory_products", pd.DataFrame()))
+        slowest = str(risk_df.iloc[0].get("product", "")) if risk_df is not None and not risk_df.empty else ""
+        out = {
+            "store": abbr,
+            "net_sales": net,
+            "sales_share_pct": safe_div(net, total_net_sales, 0.0),
+            "sales_vs_prior_pct": pct_change(net, prior.get("net_revenue", 0.0)),
+            "units": units,
+            "units_vs_prior_pct": pct_change(units, prior.get("items", 0.0)),
+            "margin_pct": _dashboard_float(metrics.get("margin_real"), 0.0),
+            "discount_pct": _dashboard_float(metrics.get("discount_rate"), 0.0),
+            "inventory_value": inv_value,
+            "inventory_units": inv_units,
+            "days_supply": days_supply,
+            "sell_through_pct": sell,
+            "fastest_product": _shorten_product_name(fastest, 34),
+            "slowest_product": _shorten_product_name(slowest, 34),
+        }
+        out["store_action"] = _classify_store_action(out, target_margin=target_margin)
+        rows.append(out)
+    return pd.DataFrame(rows, columns=cols)
+
+
+def build_dashboard_category_mix(
+    category_60: pd.DataFrame,
+    inv_category: pd.DataFrame,
+    product_60: pd.DataFrame,
+    total_net_sales: float,
+    report_days: int,
+    target_margin: float = DEAL_TARGET_MARGIN,
+) -> pd.DataFrame:
+    cols = [
+        "category", "net_sales", "sales_share_pct", "units", "margin_pct", "discount_pct",
+        "inventory_value", "inventory_units", "days_supply", "sell_through_pct", "top_product", "category_action",
+    ]
+    cat = category_60.copy() if category_60 is not None else pd.DataFrame()
+    inv = inv_category.copy() if inv_category is not None else pd.DataFrame()
+    if cat.empty and inv.empty:
+        return pd.DataFrame(columns=cols)
+    if "category_normalized" not in cat.columns:
+        cat["category_normalized"] = ""
+    if "category_normalized" not in inv.columns:
+        inv["category_normalized"] = ""
+    cat["category_normalized"] = cat["category_normalized"].fillna("").astype(str)
+    inv["category_normalized"] = inv["category_normalized"].fillna("").astype(str)
+    merged = cat.merge(inv, on="category_normalized", how="outer", suffixes=("", "_inv"))
+    prod = product_60.copy() if product_60 is not None else pd.DataFrame()
+    top_map: Dict[str, str] = {}
+    if not prod.empty and "category_normalized" in prod.columns:
+        prod["category_normalized"] = prod["category_normalized"].fillna("").astype(str)
+        prod["net_revenue"] = pd.to_numeric(prod.get("net_revenue", 0.0), errors="coerce").fillna(0.0)
+        for cat_name, part in prod.sort_values("net_revenue", ascending=False).groupby("category_normalized"):
+            top_map[str(cat_name)] = str(part.iloc[0].get("product_group_display", ""))
+    rows: List[Dict[str, Any]] = []
+    for _, r in merged.iterrows():
+        category = str(r.get("category_normalized") or "UNKNOWN")
+        net = _dashboard_float(r.get("net_revenue"), 0.0)
+        units = _dashboard_float(r.get("items"), _dashboard_float(r.get("units"), 0.0))
+        inv_units = _dashboard_float(r.get("units_available"), 0.0)
+        units_per_day = safe_div(units, max(1, int(report_days or 1)), 0.0)
+        days_supply = dashboard_days_supply(inv_units, units_per_day)
+        sell = dashboard_sell_through(units, inv_units)
+        margin = _dashboard_float(r.get("margin_real"), 0.0)
+        discount = _dashboard_float(r.get("discount_rate"), 0.0)
+        if margin < target_margin - 0.06:
+            action = "Fix Margin"
+        elif inv_units > 0 and (_dashboard_optional_float(days_supply) > 90 or _dashboard_float(sell, 0.0) < 0.18):
+            action = "Reduce"
+        elif net > 0 and margin >= target_margin:
+            action = "Grow"
+        else:
+            action = "Watch"
+        rows.append({
+            "category": category,
+            "net_sales": net,
+            "sales_share_pct": safe_div(net, total_net_sales, 0.0),
+            "units": units,
+            "margin_pct": margin,
+            "discount_pct": discount,
+            "inventory_value": _dashboard_float(r.get("inventory_value"), 0.0),
+            "inventory_units": inv_units,
+            "days_supply": days_supply,
+            "sell_through_pct": sell,
+            "top_product": _shorten_product_name(top_map.get(category, ""), 36),
+            "category_action": action,
+        })
+    return pd.DataFrame(rows, columns=cols).sort_values(["net_sales", "inventory_value"], ascending=False).reset_index(drop=True)
+
+
+def build_dashboard_credit_margin_summary(
+    report_metrics: Dict[str, Any],
+    prior_metrics: Dict[str, Any],
+    inv_overview: Dict[str, Any],
+    credit_summary: Dict[str, Any],
+    target_margin: float,
+    selected_store_codes: Sequence[str],
+) -> pd.DataFrame:
+    net = _dashboard_float(report_metrics.get("net_revenue"), 0.0)
+    units = _dashboard_float(report_metrics.get("items"), 0.0)
+    profit = _dashboard_float(report_metrics.get("profit_real", report_metrics.get("profit")), 0.0)
+    margin = _dashboard_float(report_metrics.get("margin_real"), 0.0)
+    discount = _dashboard_float(report_metrics.get("discount_rate"), 0.0)
+    inv_units = _dashboard_float(inv_overview.get("units"), 0.0)
+    sell = dashboard_sell_through(units, inv_units)
+    credit_gap = _dashboard_float(credit_summary.get("credit_gap"), 0.0)
+    return pd.DataFrame([{
+        "net_sales": net,
+        "units_sold": units,
+        "gross_profit": profit,
+        "real_margin_pct": margin,
+        "target_margin_pct": target_margin,
+        "margin_gap_pp": pp_change(margin, target_margin),
+        "discount_pct": discount,
+        "inventory_value": _dashboard_float(inv_overview.get("inventory_value"), 0.0),
+        "inventory_units": inv_units,
+        "days_supply": _dashboard_optional_float(inv_overview.get("days_of_supply")),
+        "sell_through_pct": sell,
+        "credit_gap": credit_gap,
+        "credit_gap_pct_sales": dashboard_credit_gap_pct_sales(credit_gap, net),
+        "stores_active": len([s for s in selected_store_codes if str(s).strip()]),
+        "sales_vs_prior_pct": pct_change(net, prior_metrics.get("net_revenue", 0.0)),
+        "units_vs_prior_pct": pct_change(units, prior_metrics.get("items", 0.0)),
+        "profit_vs_prior_pct": pct_change(profit, prior_metrics.get("profit_real", prior_metrics.get("profit", 0.0))),
+        "margin_change_pp": pp_change(margin, prior_metrics.get("margin_real", 0.0)),
+        "manual_expected_credit": _dashboard_float(credit_summary.get("manual_expected_credit", credit_summary.get("ledger_expected_credit")), 0.0),
+        "manual_received_credit": _dashboard_float(credit_summary.get("manual_received_credit", credit_summary.get("ledger_received_credit")), 0.0),
+        "creditflow_expected_credit": _dashboard_float(credit_summary.get("creditflow_expected_credit"), 0.0),
+        "creditflow_received_credit": _dashboard_float(credit_summary.get("creditflow_received_credit"), 0.0),
+    }])
+
+
+def _classify_brand_status(snapshot_row: Dict[str, Any], target_margin: float = DEAL_TARGET_MARGIN) -> str:
+    margin = _dashboard_float(snapshot_row.get("real_margin_pct"), 0.0)
+    margin_gap = margin - _dashboard_float(target_margin, DEAL_TARGET_MARGIN)
+    discount = _dashboard_float(snapshot_row.get("discount_pct"), 0.0)
+    days = _dashboard_optional_float(snapshot_row.get("days_supply"))
+    credit_gap = _dashboard_float(snapshot_row.get("credit_gap"), 0.0)
+    credit_gap_pct = _dashboard_float(snapshot_row.get("credit_gap_pct_sales"), 0.0)
+    sales_delta = _dashboard_optional_float(snapshot_row.get("sales_vs_prior_pct"))
+    sell = _dashboard_float(snapshot_row.get("sell_through_pct"), 0.0)
+    if credit_gap >= 1000 or credit_gap_pct >= 0.08 or margin_gap < -0.08:
+        return "Fix"
+    if np.isfinite(days) and days > 120 and sell < 0.15:
+        return "Exit / Buyback"
+    if np.isfinite(days) and days > 75:
+        return "Reduce"
+    if margin_gap < -0.04 or discount > 0.45 or (np.isfinite(sales_delta) and sales_delta < -0.15):
+        return "Watch"
+    if np.isfinite(sales_delta) and sales_delta > 0.12 and margin >= target_margin:
+        return "Grow"
+    return "Healthy"
+
+
+def _dashboard_brand_ask(status: str, snapshot_row: Dict[str, Any], meeting_ask: str) -> str:
+    if str(meeting_ask or "").strip():
+        return str(meeting_ask).strip()
+    credit_gap = _dashboard_float(snapshot_row.get("credit_gap"), 0.0)
+    margin_gap = _dashboard_float(snapshot_row.get("margin_gap_pp"), 0.0)
+    if credit_gap > 0:
+        return f"Ask brand for {money0(credit_gap)} in credit support and a promo plan for slow inventory."
+    if margin_gap < -0.04:
+        return f"Margin is below target by {abs(margin_gap) * 100:.1f}pp. Fix cost, price, or discount support before the next reorder."
+    if status == "Grow":
+        return "Grow the fastest products in under-covered stores and protect margin on the next buy."
+    if status in {"Reduce", "Exit / Buyback"}:
+        return "Reduce future buys and discuss buyback, markdown, or transfer support for stuck inventory."
+    return "Confirm next promo calendar, reorder timing, and support for any slow products."
+
+
+def build_dashboard_packet_data(
+    *,
+    product_60: pd.DataFrame,
+    inv_products: pd.DataFrame,
+    prior_product: pd.DataFrame,
+    report_df: pd.DataFrame,
+    report_days: int,
+    selected_store_codes: Sequence[str],
+    store_60: pd.DataFrame,
+    store_sales_packets: Dict[str, Dict[str, Any]],
+    inv_store: pd.DataFrame,
+    category_60: pd.DataFrame,
+    inv_category: pd.DataFrame,
+    window_metrics: Dict[str, Dict[str, float]],
+    inv_overview: Dict[str, float],
+    credit_summary: Dict[str, Any],
+    target_margin: float,
+    max_products: int = 20,
+    include_prior_data: bool = True,
+    meeting_ask: str = "",
+) -> Dict[str, Any]:
+    store_count_map, last_sale_map = _dashboard_product_key_counts(report_df)
+    snapshot = build_dashboard_credit_margin_summary(
+        window_metrics.get("report", {}),
+        window_metrics.get("prior_report", {}),
+        inv_overview,
+        credit_summary,
+        target_margin,
+        selected_store_codes,
+    )
+    if not snapshot.empty and not include_prior_data:
+        for col in ["sales_vs_prior_pct", "units_vs_prior_pct", "profit_vs_prior_pct", "margin_change_pp"]:
+            snapshot.loc[:, col] = np.nan
+    product_decisions = build_dashboard_product_decision_board(
+        product_60,
+        inv_products,
+        prior_product,
+        report_days=report_days,
+        selected_store_count=len(selected_store_codes),
+        store_count_map=store_count_map,
+        last_sale_map=last_sale_map,
+        max_products=max_products,
+        target_margin=target_margin,
+        include_prior_data=include_prior_data,
+    )
+    fast_movers = build_dashboard_fast_movers(product_decisions, max_products=max_products)
+    slow_movers = build_dashboard_slow_movers(product_decisions, max_products=max_products)
+    store_matrix = build_dashboard_store_matrix(
+        store_60,
+        store_sales_packets,
+        selected_store_codes,
+        inv_store,
+        total_net_sales=_dashboard_float(window_metrics.get("report", {}).get("net_revenue"), 0.0),
+        target_margin=target_margin,
+    )
+    if not include_prior_data and not store_matrix.empty:
+        store_matrix.loc[:, ["sales_vs_prior_pct", "units_vs_prior_pct"]] = np.nan
+    category_mix = build_dashboard_category_mix(
+        category_60,
+        inv_category,
+        product_60,
+        total_net_sales=_dashboard_float(window_metrics.get("report", {}).get("net_revenue"), 0.0),
+        report_days=report_days,
+        target_margin=target_margin,
+    )
+    status = _classify_brand_status(snapshot.iloc[0].to_dict(), target_margin) if not snapshot.empty else "Watch"
+    ask = _dashboard_brand_ask(status, snapshot.iloc[0].to_dict() if not snapshot.empty else {}, meeting_ask)
+    snapshot = snapshot.copy()
+    if snapshot.empty:
+        snapshot = pd.DataFrame([{}])
+    snapshot.loc[:, "brand_status"] = status
+    snapshot.loc[:, "meeting_ask"] = ask
+    return {
+        "snapshot": snapshot,
+        "product_decision_board": product_decisions,
+        "fast_movers": fast_movers,
+        "slow_movers": slow_movers,
+        "store_matrix": store_matrix,
+        "category_mix": category_mix,
+        "credit_margin_summary": snapshot.copy(),
+        "brand_status": status,
+        "meeting_ask": ask,
+    }
+
+
+def write_dashboard_cache(cache_dir: Path, dashboard_data: Dict[str, Any], logger: Optional[Callable[[str], None]] = None) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {
+        "dashboard_brand_snapshot.csv": dashboard_data.get("snapshot", pd.DataFrame()),
+        "dashboard_product_decision_board.csv": dashboard_data.get("product_decision_board", pd.DataFrame()),
+        "dashboard_fast_movers.csv": dashboard_data.get("fast_movers", pd.DataFrame()),
+        "dashboard_slow_movers.csv": dashboard_data.get("slow_movers", pd.DataFrame()),
+        "dashboard_store_matrix.csv": dashboard_data.get("store_matrix", pd.DataFrame()),
+        "dashboard_category_mix.csv": dashboard_data.get("category_mix", pd.DataFrame()),
+        "dashboard_credit_margin_summary.csv": dashboard_data.get("credit_margin_summary", pd.DataFrame()),
+    }
+    for name, df in outputs.items():
+        out_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        out_df.to_csv(cache_dir / name, index=False)
+    _log(f"[QA] Wrote dashboard cache CSVs to {cache_dir}", logger)
 
 
 def _premium_action_rows(action_items: Sequence[Dict[str, Any]], top_n: int) -> List[List[Any]]:
@@ -7693,6 +8324,422 @@ def build_brand_packet_premium_pdf(
         build_appendix_v2(story, product_60, category_60, credit_reconciliation, inventory_risk, mode)
 
     footer = _footer(f"Brand Review - {brand} - {mode.title()}", end_day)
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+
+
+def _dashboard_section(story: List[Any], title: str, flowables: List[Any], page_break: bool = True) -> None:
+    theme = build_brand_packet_theme_v2()
+    story.append(Paragraph(title, theme["section_v2"]))
+    story.extend(flowables)
+    if page_break:
+        story.append(PageBreak())
+
+
+def _dashboard_header(brand: str, start_day: date, end_day: date, stores: Sequence[str], generated_at: str) -> Table:
+    theme = build_brand_packet_theme_v2()
+    left = [
+        _p(brand, theme["deck_title"]),
+        _p(f"{start_day.isoformat()} to {end_day.isoformat()} | Stores: {', '.join(stores) or 'All'}", theme["deck_subtitle"]),
+    ]
+    right = [
+        _p("DASHBOARD / EASY READ", theme["card_label"]),
+        _p(f"Generated: {generated_at}", theme["tiny_v2"]),
+    ]
+    table = Table([[left, right]], colWidths=[6.7 * inch, 3.6 * inch])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("LINEBELOW", (0, 0), (-1, -1), 1.1, colors.HexColor("#2F6B5D")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return table
+
+
+def _dashboard_metric_grid(cards: List[Table], cols: int = 6) -> Table:
+    rows: List[List[Any]] = []
+    for i in range(0, len(cards), cols):
+        row = cards[i:i + cols]
+        while len(row) < cols:
+            row.append("")
+        rows.append(row)
+    table = Table(rows, colWidths=[1.70 * inch] * cols, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    return table
+
+
+def _dashboard_card(label: str, value: Any, note: str = "", accent: str = "#2F6B5D") -> Table:
+    theme = build_brand_packet_theme_v2()
+    data = [[_p(label.upper(), theme["card_label"])], [_p(value, theme["card_value"])], [_p(note, theme["card_note"])]]
+    table = Table(data, colWidths=[1.62 * inch], rowHeights=[0.18 * inch, 0.28 * inch, 0.22 * inch])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F5F7F6")),
+        ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor("#D7DEE0")),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.3, colors.HexColor(accent)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    return table
+
+
+def _dashboard_rows_products(df: pd.DataFrame, max_rows: int, include_last_sale: bool = False) -> List[List[Any]]:
+    headers = [
+        "Action", "Product", "Cat", "Sales", "Units", "U/Day", "Sales +/-", "Margin",
+        "Disc", "On Hand", "DOS", "Sell", "Stores", "Recommendation",
+    ]
+    if include_last_sale:
+        headers.insert(-1, "Last Sale")
+    rows: List[List[Any]] = [headers]
+    if df is not None and not df.empty:
+        for _, r in df.head(max_rows).iterrows():
+            row = [
+                str(r.get("action", "")),
+                _shorten_product_name(r.get("product_name", r.get("product_short", "")), 42),
+                _dashboard_category_short(r.get("category", "")),
+                money0(r.get("net_sales", 0.0)),
+                int0(r.get("units_sold", 0.0)),
+                f"{_dashboard_float(r.get('units_per_day'), 0.0):.1f}",
+                _format_delta(r.get("sales_vs_prior_pct"), r.get("net_sales", 0.0), 0.0),
+                pct1(r.get("margin_pct", 0.0)),
+                pct1(r.get("discount_pct", 0.0)),
+                int0(r.get("inventory_units", 0.0)),
+                _format_days_supply_v2(r.get("days_supply", np.nan), r.get("units_per_day", 0.0), r.get("inventory_units", 0.0)),
+                pct1(r.get("sell_through_pct", 0.0)),
+                int0(r.get("stores_selling", 0.0)),
+                str(r.get("recommendation", "")),
+            ]
+            if include_last_sale:
+                row.insert(-1, str(r.get("last_sale_date", "") or "n/a"))
+            rows.append(row)
+    if len(rows) == 1:
+        filler = ["No product rows available."] + [""] * (len(headers) - 1)
+        rows.append(filler)
+    return rows
+
+
+def _dashboard_snapshot_decision_rows(df: pd.DataFrame, max_rows: int = 5) -> List[List[Any]]:
+    rows = [["Action", "Product", "Sales", "On Hand", "DOS", "Recommendation"]]
+    if df is not None and not df.empty:
+        for _, r in df.head(max_rows).iterrows():
+            rows.append([
+                str(r.get("action", "")),
+                _shorten_product_name(r.get("product_name", ""), 44),
+                money0(r.get("net_sales", 0.0)),
+                int0(r.get("inventory_units", 0.0)),
+                _format_days_supply_v2(r.get("days_supply", np.nan), r.get("units_per_day", 0.0), r.get("inventory_units", 0.0)),
+                str(r.get("recommendation", "")),
+            ])
+    if len(rows) == 1:
+        rows.append(["No product actions available.", "", "", "", "", ""])
+    return rows
+
+
+def _dashboard_category_short(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    return {
+        "OUNCES": "OZ",
+        "HALVES": "HALF",
+        "QUARTERS": "QTR",
+        "EIGHTHS": "8TH",
+        "PREROLLS": "PRL",
+        "PRE-ROLLS": "PRL",
+        "PREROLL": "PRL",
+        "PRE-ROLL": "PRL",
+        "CONCENTRATES": "CONC",
+        "BEVERAGES": "DRINK",
+        "TINCTURES": "TINCT",
+    }.get(text, str(value or "")[:12])
+
+
+def _dashboard_action_short(value: Any) -> str:
+    text = str(value or "").strip()
+    return {
+        "Move Inventory": "Move Inv",
+        "Reduce Buying": "Reduce Buy",
+        "Needs Promo": "Promo",
+    }.get(text, text)
+
+
+def _dashboard_fast_rows(df: pd.DataFrame, sort_col: str, max_rows: int) -> List[List[Any]]:
+    rows = [["Product", "Cat", "Sales", "Units", "U/Day", "Margin", "On Hand", "DOS", "Action"]]
+    if df is not None and not df.empty:
+        work = df.copy()
+        work[sort_col] = pd.to_numeric(work.get(sort_col, 0.0), errors="coerce").fillna(0.0)
+        for _, r in work.sort_values(sort_col, ascending=False).head(max_rows).iterrows():
+            rows.append([
+                _shorten_product_name(r.get("product_name", ""), 32),
+                _dashboard_category_short(r.get("category", "")),
+                money0(r.get("net_sales", 0.0)),
+                int0(r.get("units_sold", 0.0)),
+                f"{_dashboard_float(r.get('units_per_day'), 0.0):.1f}",
+                pct1(r.get("margin_pct", 0.0)),
+                int0(r.get("inventory_units", 0.0)),
+                _format_days_supply_v2(r.get("days_supply", np.nan), r.get("units_per_day", 0.0), r.get("inventory_units", 0.0)),
+                str(r.get("action", "")),
+            ])
+    if len(rows) == 1:
+        rows.append(["No fast movers available.", "", "", "", "", "", "", "", ""])
+    return rows
+
+
+def _dashboard_store_rows(store_matrix: pd.DataFrame) -> List[List[Any]]:
+    rows = [[
+        "Store", "Sales", "Share", "Sales +/-", "Units", "Units +/-", "Margin", "Disc",
+        "Inv $", "DOS", "Sell", "Fastest", "Slowest", "Action",
+    ]]
+    if store_matrix is not None and not store_matrix.empty:
+        for _, r in store_matrix.iterrows():
+            rows.append([
+                str(r.get("store", "")),
+                money0(r.get("net_sales", 0.0)),
+                pct1(r.get("sales_share_pct", 0.0)),
+                _format_delta(r.get("sales_vs_prior_pct"), r.get("net_sales", 0.0), 0.0),
+                int0(r.get("units", 0.0)),
+                _format_delta(r.get("units_vs_prior_pct"), r.get("units", 0.0), 0.0),
+                pct1(r.get("margin_pct", 0.0)),
+                pct1(r.get("discount_pct", 0.0)),
+                money0(r.get("inventory_value", 0.0)),
+                _format_days_supply_v2(r.get("days_supply", np.nan), units_on_hand=r.get("inventory_units", 0.0)),
+                pct1(r.get("sell_through_pct", 0.0)),
+                str(r.get("fastest_product", "")),
+                str(r.get("slowest_product", "")),
+                _dashboard_action_short(r.get("store_action", "")),
+            ])
+    if len(rows) == 1:
+        rows.append(["No store rows available."] + [""] * 13)
+    return rows
+
+
+def _dashboard_category_rows(category_mix: pd.DataFrame) -> List[List[Any]]:
+    rows = [["Category", "Sales", "Share", "Units", "Margin", "Disc", "Inv $", "DOS", "Sell", "Top Product", "Action"]]
+    if category_mix is not None and not category_mix.empty:
+        for _, r in category_mix.head(12).iterrows():
+            rows.append([
+                str(r.get("category", "")),
+                money0(r.get("net_sales", 0.0)),
+                pct1(r.get("sales_share_pct", 0.0)),
+                int0(r.get("units", 0.0)),
+                pct1(r.get("margin_pct", 0.0)),
+                pct1(r.get("discount_pct", 0.0)),
+                money0(r.get("inventory_value", 0.0)),
+                _format_days_supply_v2(r.get("days_supply", np.nan), units_on_hand=r.get("inventory_units", 0.0)),
+                pct1(r.get("sell_through_pct", 0.0)),
+                str(r.get("top_product", "")),
+                str(r.get("category_action", "")),
+            ])
+    if len(rows) == 1:
+        rows.append(["No category rows available."] + [""] * 10)
+    return rows
+
+
+def _dashboard_credit_rows(summary: pd.DataFrame, credit_reconciliation: pd.DataFrame, top_n: int = 10) -> List[List[Any]]:
+    rows = [["Source", "Type", "Scope", "Expected", "Received", "Gap", "Status", "Action"]]
+    if credit_reconciliation is not None and not credit_reconciliation.empty:
+        for _, r in credit_reconciliation.head(top_n).iterrows():
+            gap = _dashboard_float(r.get("Gap"), 0.0)
+            rows.append([
+                str(r.get("Source", "")),
+                str(r.get("Type", "")),
+                str(r.get("Scope", r.get("Store", ""))),
+                money0(r.get("Expected", 0.0)),
+                money0(r.get("Received", 0.0)),
+                money0(gap),
+                str(r.get("Status", "")),
+                "Collect support" if gap > 0 else "Verify",
+            ])
+    if len(rows) == 1:
+        snap = summary.iloc[0].to_dict() if summary is not None and not summary.empty else {}
+        rows.append([
+            "Summary", "Credits", "Brand", money0(snap.get("manual_expected_credit", 0.0)),
+            money0(snap.get("manual_received_credit", 0.0)), money0(snap.get("credit_gap", 0.0)), "Open" if snap.get("credit_gap", 0.0) else "None", "Review",
+        ])
+    return rows
+
+
+def build_brand_packet_dashboard_pdf(
+    out_pdf: Path,
+    brand: str,
+    start_day: date,
+    end_day: date,
+    selected_store_codes: Sequence[str],
+    options: PacketOptions,
+    dashboard_data: Dict[str, Any],
+    credit_reconciliation: Optional[pd.DataFrame] = None,
+    daily_60: Optional[pd.DataFrame] = None,
+    store_sales_packets: Optional[Dict[str, Dict[str, Any]]] = None,
+    missing_sales_stores: Sequence[str] = (),
+    missing_catalog_stores: Sequence[str] = (),
+) -> None:
+    osnap.setup_fonts()
+    theme = build_brand_packet_theme_v2()
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    doc = SimpleDocTemplate(
+        str(out_pdf),
+        pagesize=landscape(letter),
+        leftMargin=0.32 * inch,
+        rightMargin=0.32 * inch,
+        topMargin=0.30 * inch,
+        bottomMargin=0.38 * inch,
+        pageCompression=1,
+        title=f"Brand Dashboard - {brand}",
+        author="Buzz Automation",
+    )
+    story: List[Any] = []
+    generated_at = datetime.now(ZoneInfo(REPORT_TZ)).strftime("%b %d, %Y %I:%M %p")
+    story.append(_dashboard_header(brand, start_day, end_day, selected_store_codes, generated_at))
+    story.append(Spacer(1, 0.08 * inch))
+
+    snapshot_df = dashboard_data.get("snapshot", pd.DataFrame())
+    snap = snapshot_df.iloc[0].to_dict() if snapshot_df is not None and not snapshot_df.empty else {}
+    decisions = dashboard_data.get("product_decision_board", pd.DataFrame())
+    status = str(dashboard_data.get("brand_status") or snap.get("brand_status") or "Watch")
+    status_color = "#2F6B5D" if status in {"Grow", "Healthy"} else "#D6B800" if status in {"Watch", "Reduce"} else "#B54034"
+    cards = [
+        _dashboard_card("Brand Status", status, "single-brand read", status_color),
+        _dashboard_card("Net Sales", money0(snap.get("net_sales", 0.0)), f"vs prior {_format_delta(snap.get('sales_vs_prior_pct'), snap.get('net_sales', 0.0), 0.0)}"),
+        _dashboard_card("Units Sold", int0(snap.get("units_sold", 0.0)), f"vs prior {_format_delta(snap.get('units_vs_prior_pct'), snap.get('units_sold', 0.0), 0.0)}"),
+        _dashboard_card("Gross Profit", money0(snap.get("gross_profit", 0.0)), f"vs prior {_format_delta(snap.get('profit_vs_prior_pct'), snap.get('gross_profit', 0.0), 0.0)}"),
+        _dashboard_card("Real Margin", pct1(snap.get("real_margin_pct", 0.0)), f"gap {_owner_margin_gap_label(snap.get('margin_gap_pp', 0.0))}"),
+        _dashboard_card("Target Margin", pct1(snap.get("target_margin_pct", DEAL_TARGET_MARGIN)), "goal"),
+        _dashboard_card("Discount", pct1(snap.get("discount_pct", 0.0)), "gross discount rate", "#D6B800" if _dashboard_float(snap.get("discount_pct"), 0.0) > 0.35 else "#2F6B5D"),
+        _dashboard_card("Inventory Value", money0(snap.get("inventory_value", 0.0)), f"{int0(snap.get('inventory_units', 0.0))} units"),
+        _dashboard_card("Days Supply", _format_days_supply_v2(snap.get("days_supply", np.nan), units_on_hand=snap.get("inventory_units", 0.0)), "current pace"),
+        _dashboard_card("Sell-Through", pct1(snap.get("sell_through_pct", 0.0)), "sold / sold+on hand"),
+        _dashboard_card("Credit Gap", money0(snap.get("credit_gap", 0.0)), f"{pct1(snap.get('credit_gap_pct_sales', 0.0))} of sales", "#B54034" if _dashboard_float(snap.get("credit_gap"), 0.0) > 0 else "#2F6B5D"),
+        _dashboard_card("Stores Active", int0(snap.get("stores_active", 0.0)), "selected stores"),
+    ]
+    story.append(_dashboard_metric_grid(cards, cols=6))
+    story.append(Spacer(1, 0.08 * inch))
+    warning_lines = []
+    if missing_sales_stores:
+        warning_lines.append(f"Missing sales: {', '.join(missing_sales_stores)}")
+    if missing_catalog_stores:
+        warning_lines.append(f"Missing catalog: {', '.join(missing_catalog_stores)}")
+    ask_lines = [str(dashboard_data.get("meeting_ask") or snap.get("meeting_ask") or "Confirm next steps with brand.")]
+    if warning_lines:
+        ask_lines.extend(warning_lines)
+    story.append(_panel("MEETING ASK", ask_lines, width=10.2 * inch, accent=status_color))
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(Paragraph("Top Decision Flags", theme["small_v2"]))
+    story.append(build_premium_table(
+        _dashboard_snapshot_decision_rows(decisions, max_rows=5),
+        [0.95 * inch, 2.05 * inch, 0.78 * inch, 0.72 * inch, 0.64 * inch, 4.15 * inch],
+        money_cols=[2],
+        status_cols=[0],
+    ))
+    story.append(PageBreak())
+
+    _dashboard_section(story, "Product Decision Board", [
+        build_premium_table(
+            _dashboard_rows_products(decisions, max_rows=max(1, int(options.max_products or 20))),
+            [0.78 * inch, 1.48 * inch, 0.52 * inch, 0.62 * inch, 0.42 * inch, 0.45 * inch, 0.58 * inch, 0.55 * inch, 0.48 * inch, 0.52 * inch, 0.50 * inch, 0.48 * inch, 0.43 * inch, 2.00 * inch],
+            money_cols=[3],
+            pct_cols=[6, 7, 8, 11],
+            status_cols=[0],
+        ),
+    ])
+
+    fast = dashboard_data.get("fast_movers", pd.DataFrame())
+    fast_tables = [
+        build_premium_table(_dashboard_fast_rows(fast, "units_per_day", 5), [1.05 * inch, 0.42 * inch, 0.48 * inch, 0.34 * inch, 0.36 * inch, 0.42 * inch, 0.38 * inch, 0.42 * inch, 0.58 * inch], money_cols=[2], pct_cols=[5]),
+        build_premium_table(_dashboard_fast_rows(fast, "net_sales", 5), [1.05 * inch, 0.42 * inch, 0.48 * inch, 0.34 * inch, 0.36 * inch, 0.42 * inch, 0.38 * inch, 0.42 * inch, 0.58 * inch], money_cols=[2], pct_cols=[5]),
+        build_premium_table(_dashboard_fast_rows(fast, "gross_profit", 5), [1.05 * inch, 0.42 * inch, 0.48 * inch, 0.34 * inch, 0.36 * inch, 0.42 * inch, 0.38 * inch, 0.42 * inch, 0.58 * inch], money_cols=[2], pct_cols=[5]),
+        build_premium_table(_dashboard_fast_rows(fast, "sell_through_pct", 5), [1.05 * inch, 0.42 * inch, 0.48 * inch, 0.34 * inch, 0.36 * inch, 0.42 * inch, 0.38 * inch, 0.42 * inch, 0.58 * inch], money_cols=[2], pct_cols=[5]),
+    ]
+    fast_grid = Table([
+        [Paragraph("Top Units / Day", theme["small_v2"]), Paragraph("Top Sales", theme["small_v2"])],
+        [fast_tables[0], fast_tables[1]],
+        [Paragraph("Top Profit", theme["small_v2"]), Paragraph("Top Sell-Through", theme["small_v2"])],
+        [fast_tables[2], fast_tables[3]],
+    ], colWidths=[5.05 * inch, 5.05 * inch])
+    fast_grid.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+    _dashboard_section(story, "Fast Movers", [fast_grid])
+
+    slow = dashboard_data.get("slow_movers", pd.DataFrame())
+    _dashboard_section(story, "Slow Movers + Inventory Risk", [
+        build_premium_table(
+            _dashboard_rows_products(slow, max_rows=max(1, int(options.max_products or 20)), include_last_sale=True),
+            [0.75 * inch, 1.40 * inch, 0.50 * inch, 0.58 * inch, 0.40 * inch, 0.42 * inch, 0.55 * inch, 0.52 * inch, 0.46 * inch, 0.48 * inch, 0.48 * inch, 0.46 * inch, 0.46 * inch, 0.62 * inch, 1.52 * inch],
+            money_cols=[3],
+            pct_cols=[6, 7, 8, 11],
+            status_cols=[0],
+        ),
+    ])
+
+    store_matrix = dashboard_data.get("store_matrix", pd.DataFrame())
+    store_flows: List[Any] = []
+    if store_sales_packets:
+        store_flows.extend([_chart_image(chart_location_net_profit(store_sales_packets), 10.0 * inch, 2.25 * inch), Spacer(1, 0.06 * inch)])
+    store_flows.append(build_premium_table(
+        _dashboard_store_rows(store_matrix),
+        [0.42 * inch, 0.58 * inch, 0.48 * inch, 0.55 * inch, 0.40 * inch, 0.55 * inch, 0.50 * inch, 0.48 * inch, 0.58 * inch, 0.48 * inch, 0.45 * inch, 1.25 * inch, 1.25 * inch, 0.82 * inch],
+        money_cols=[1, 8],
+        pct_cols=[2, 3, 5, 6, 7, 10],
+        status_cols=[0, 13],
+    ))
+    _dashboard_section(story, "Store Performance Matrix", store_flows)
+
+    category_mix = dashboard_data.get("category_mix", pd.DataFrame())
+    chart_cat = BytesIO()
+    if category_mix is not None and not category_mix.empty:
+        chart_df = category_mix.rename(columns={"category": "category_normalized", "net_sales": "net_revenue"})
+        chart_cat = chart_rank_barh(chart_df.head(8), "category_normalized", "net_revenue", "Sales by Category", value_kind="money")
+    _dashboard_section(story, "Category / Product Group Mix", [
+        Table([[_chart_image(chart_cat, 4.55 * inch, 2.45 * inch), build_premium_table(
+            _dashboard_category_rows(category_mix),
+            [0.62 * inch, 0.52 * inch, 0.38 * inch, 0.34 * inch, 0.38 * inch, 0.34 * inch, 0.45 * inch, 0.38 * inch, 0.34 * inch, 0.92 * inch, 0.55 * inch],
+            money_cols=[1, 6],
+            pct_cols=[2, 4, 5, 8],
+            status_cols=[10],
+        )]], colWidths=[4.75 * inch, 5.45 * inch]),
+    ])
+
+    credit_summary_df = dashboard_data.get("credit_margin_summary", snapshot_df)
+    credit_snap = credit_summary_df.iloc[0].to_dict() if credit_summary_df is not None and not credit_summary_df.empty else snap
+    margin_cards = [
+        _dashboard_card("Real Margin", pct1(credit_snap.get("real_margin_pct", 0.0)), f"profit {money0(credit_snap.get('gross_profit', 0.0))}"),
+        _dashboard_card("Target", pct1(credit_snap.get("target_margin_pct", DEAL_TARGET_MARGIN)), f"gap {_owner_margin_gap_label(credit_snap.get('margin_gap_pp', 0.0))}"),
+        _dashboard_card("Discount", pct1(credit_snap.get("discount_pct", 0.0)), "discount pressure"),
+        _dashboard_card("Manual Expected", money0(credit_snap.get("manual_expected_credit", 0.0)), "ledger"),
+        _dashboard_card("Manual Received", money0(credit_snap.get("manual_received_credit", 0.0)), "ledger"),
+        _dashboard_card("CreditFlow Expected", money0(credit_snap.get("creditflow_expected_credit", 0.0)), "ERP"),
+        _dashboard_card("CreditFlow Received", money0(credit_snap.get("creditflow_received_credit", 0.0)), "ERP"),
+        _dashboard_card("Credit Gap", money0(credit_snap.get("credit_gap", 0.0)), f"{pct1(credit_snap.get('credit_gap_pct_sales', 0.0))} of sales"),
+    ]
+    _dashboard_section(story, "Margin, Discount, and Credit Support", [
+        _dashboard_metric_grid(margin_cards, cols=4),
+        Spacer(1, 0.08 * inch),
+        _panel("ASK FROM BRAND", [str(dashboard_data.get("meeting_ask") or "Confirm support plan.")], width=10.2 * inch, accent="#D6B800"),
+        Spacer(1, 0.08 * inch),
+        build_premium_table(
+            _dashboard_credit_rows(credit_summary_df, credit_reconciliation if credit_reconciliation is not None else pd.DataFrame()),
+            [0.82 * inch, 1.0 * inch, 1.1 * inch, 0.82 * inch, 0.82 * inch, 0.72 * inch, 0.72 * inch, 1.05 * inch],
+            money_cols=[3, 4, 5],
+            status_cols=[6],
+        ),
+    ], page_break=bool(options.include_product_appendix))
+
+    if options.include_product_appendix:
+        story.append(Paragraph("Appendix / Dashboard Product Detail", theme["section_v2"]))
+        story.append(build_premium_table(
+            _dashboard_rows_products(decisions, max_rows=min(50, max(1, int(options.max_products or 20)))),
+            [0.78 * inch, 1.48 * inch, 0.52 * inch, 0.62 * inch, 0.42 * inch, 0.45 * inch, 0.58 * inch, 0.55 * inch, 0.48 * inch, 0.52 * inch, 0.50 * inch, 0.48 * inch, 0.43 * inch, 2.00 * inch],
+            money_cols=[3],
+            pct_cols=[6, 7, 8, 11],
+            status_cols=[0],
+        ))
+
+    footer = _footer(f"Brand Dashboard - {brand}", end_day)
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
 
 
@@ -10077,6 +11124,7 @@ def generate_brand_meeting_packet(
     category_14 = summarize_group(last14_df, "category_normalized")
     product_60 = summarize_product_groups(report_df)
     product_14 = summarize_product_groups(last14_df)
+    prior_product = summarize_product_groups(prior_df) if options.include_prior_window_data and not prior_df.empty else pd.DataFrame()
     product_60 = add_supply_to_product_groups(product_60, all_pg_units_day_map, all_pg_dos_map)
     product_14 = add_supply_to_product_groups(product_14, all_pg_units_day_map, all_pg_dos_map)
     product_60 = attach_catalog_price_cost_to_product_groups(product_60, catalog_brand)
@@ -10359,6 +11407,28 @@ def generate_brand_meeting_packet(
         targets=brand_targets,
     )
     meeting_ask = generate_meeting_ask(credit_summary, action_items)
+    dashboard_data: Dict[str, Any] = {}
+    if str(options.packet_layout or "classic").lower() == "dashboard":
+        dashboard_data = build_dashboard_packet_data(
+            product_60=product_60,
+            inv_products=inv_products,
+            prior_product=prior_product,
+            report_df=report_df,
+            report_days=window_days(report_start, report_end),
+            selected_store_codes=selected_store_codes,
+            store_60=store_60,
+            store_sales_packets=store_sales_packets,
+            inv_store=inv_store,
+            category_60=category_60,
+            inv_category=inv_category,
+            window_metrics=window_metrics,
+            inv_overview=inv_overview,
+            credit_summary=credit_summary,
+            target_margin=target_margin,
+            max_products=max(1, int(options.max_products or 20)),
+            include_prior_data=bool(options.include_prior_window_data and prior_window_covered),
+            meeting_ask=meeting_ask,
+        )
 
     # Persist cache CSVs for debugging / quick QA
     try:
@@ -10436,49 +11506,74 @@ def generate_brand_meeting_packet(
         dos_key_audit.to_csv(p_dos_audit, index=False)
         _log(f"[QA] Wrote DOS key audit: {p_dos_audit}", logger)
         _log(f"[QA] Cache files: {p_sales}, {p_pg60}, {p_inv}", logger)
+        if dashboard_data:
+            write_dashboard_cache(paths.cache_dir, dashboard_data, logger)
     except Exception:
         pass
 
-    quick_pdf_name = safe_filename(
-        f"Brand Packet - {brand} - {start_day.isoformat()}_to_{end_day.isoformat()} - Quick Store Dashboards.pdf"
-    )
+    if str(options.packet_layout or "classic").lower() == "dashboard":
+        quick_pdf_name = safe_filename(
+            f"Brand Dashboard - {brand} - {start_day.isoformat()}_to_{end_day.isoformat()}.pdf"
+        )
+    else:
+        quick_pdf_name = safe_filename(
+            f"Brand Packet - {brand} - {start_day.isoformat()}_to_{end_day.isoformat()} - Quick Store Dashboards.pdf"
+        )
     out_quick_pdf = paths.pdf_dir / quick_pdf_name
 
-    pdf_builder = build_brand_packet_premium_pdf if options.compact_pdf_mode else build_brand_packet_quick_pdf
-    pdf_builder(
-        out_pdf=out_quick_pdf,
-        brand=brand,
-        start_day=start_day,
-        end_day=end_day,
-        options=options,
-        windows=windows,
-        window_metrics=window_metrics,
-        prior_window_covered=prior_window_covered,
-        daily_60=daily_60,
-        store_60=store_60,
-        category_60=category_60,
-        product_60=product_60,
-        movers_store=movers_store,
-        movers_category=movers_category,
-        movers_product=movers_product,
-        inv_overview=inv_overview,
-        inv_products=inv_products,
-        inv_category=inv_category,
-        inv_store=inv_store,
-        store_sales_packets=store_sales_packets,
-        missing_sales_stores=missing_sales_stores,
-        missing_catalog_stores=missing_catalog_stores,
-        credit_summary=credit_summary,
-        credit_reconciliation=credit_reconciliation,
-        action_items=action_items,
-        monthly_reference=monthly_reference,
-        health_score=health_score,
-        health_status=health_status,
-        health_reason=health_reason,
-        meeting_ask=meeting_ask,
-        store_credit_scorecard=store_credit_scorecard,
-    )
-    _log(f"[PDF] Created ({'Premium Compact' if options.compact_pdf_mode else 'Quick Store Dashboards'}): {out_quick_pdf}", logger)
+    layout = str(options.packet_layout or "classic").lower()
+    if layout == "dashboard":
+        build_brand_packet_dashboard_pdf(
+            out_pdf=out_quick_pdf,
+            brand=brand,
+            start_day=start_day,
+            end_day=end_day,
+            selected_store_codes=selected_store_codes,
+            options=options,
+            dashboard_data=dashboard_data,
+            credit_reconciliation=credit_reconciliation,
+            daily_60=daily_60,
+            store_sales_packets=store_sales_packets,
+            missing_sales_stores=missing_sales_stores,
+            missing_catalog_stores=missing_catalog_stores,
+        )
+        _log(f"[PDF] Created (Dashboard Easy Read): {out_quick_pdf}", logger)
+    else:
+        pdf_builder = build_brand_packet_premium_pdf if options.compact_pdf_mode else build_brand_packet_quick_pdf
+        pdf_builder(
+            out_pdf=out_quick_pdf,
+            brand=brand,
+            start_day=start_day,
+            end_day=end_day,
+            options=options,
+            windows=windows,
+            window_metrics=window_metrics,
+            prior_window_covered=prior_window_covered,
+            daily_60=daily_60,
+            store_60=store_60,
+            category_60=category_60,
+            product_60=product_60,
+            movers_store=movers_store,
+            movers_category=movers_category,
+            movers_product=movers_product,
+            inv_overview=inv_overview,
+            inv_products=inv_products,
+            inv_category=inv_category,
+            inv_store=inv_store,
+            store_sales_packets=store_sales_packets,
+            missing_sales_stores=missing_sales_stores,
+            missing_catalog_stores=missing_catalog_stores,
+            credit_summary=credit_summary,
+            credit_reconciliation=credit_reconciliation,
+            action_items=action_items,
+            monthly_reference=monthly_reference,
+            health_score=health_score,
+            health_status=health_status,
+            health_reason=health_reason,
+            meeting_ask=meeting_ask,
+            store_credit_scorecard=store_credit_scorecard,
+        )
+        _log(f"[PDF] Created ({'Premium Compact' if options.compact_pdf_mode else 'Quick Store Dashboards'}): {out_quick_pdf}", logger)
 
     out_xlsx: Optional[Path] = None
     if options.generate_xlsx:
@@ -10592,7 +11687,7 @@ def parse_cli_args() -> argparse.Namespace:
     p.add_argument("--owner-brand-cards", dest="owner_brand_cards", action="store_true", help="Include compact brand cards in the owner rollup (default).")
     p.add_argument("--no-owner-brand-cards", dest="owner_brand_cards", action="store_false", help="Skip compact brand cards in the owner rollup.")
     p.set_defaults(owner_brand_cards=True)
-    p.add_argument("--owner-email", action="store_true", help="Email the owner top-brands review after it is built.")
+    p.add_argument("--owner-email", action="store_true", help="Email the owner top-brands review after it is built (default; use --no-email to skip).")
     p.add_argument("--owner-output-root", type=str, default="", help="Output root for owner rollups. Defaults to --output-dir.")
     p.add_argument("--owner-creditflow", action="store_true", help="Pull CreditFlow credits for reviewed owner-rollup brands.")
     p.add_argument("--sort-by", choices=["sales"], default="sales", help="Owner rollup sort field. Currently only sales is supported.")
@@ -10600,6 +11695,13 @@ def parse_cli_args() -> argparse.Namespace:
     p.add_argument("--no-charts", action="store_true", help="Skip charts in PDF.")
     p.add_argument("--no-store-sections", action="store_true", help="Skip store-level sections.")
     p.add_argument("--no-product-appendix", action="store_true", help="Skip full product appendix.")
+    p.add_argument("--packet-layout", choices=["dashboard", "classic"], default="classic", help="Single-brand PDF layout. Use dashboard for the landscape easy-read packet. Default: classic.")
+    p.add_argument("--dashboard", dest="packet_layout", action="store_const", const="dashboard", help="Shortcut for --packet-layout dashboard.")
+    p.add_argument("--include-appendix", dest="appendix_enabled", action="store_true", help="Include appendix tables in dashboard/classic packet output.")
+    p.add_argument("--no-appendix", dest="appendix_enabled", action="store_false", help="Skip appendix tables in dashboard/classic packet output.")
+    p.set_defaults(appendix_enabled=None)
+    p.add_argument("--max-products", type=int, default=20, help="Maximum product rows in dashboard product sections. Default: 20.")
+    p.add_argument("--max-store-products", type=int, default=10, help="Maximum product rows in dashboard store sections. Default: 10.")
     p.add_argument("--with-kickbacks", action="store_true", help="Enable deal kickback adjustments (default: OFF).")
     p.add_argument("--no-kickbacks", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--xlsx", action="store_true", help="Also generate XLSX workbook.")
@@ -10672,7 +11774,7 @@ def main() -> None:
             include_creditflow=bool(args.owner_creditflow),
             target_margin=target_margin,
             output_root=owner_root,
-            email=bool(args.owner_email),
+            email=bool(args.email_results),
             compact=bool(args.compact_pdf_mode),
             include_brand_cards=bool(args.owner_brand_cards),
             api_env_file=str(args.env_file or DEFAULT_API_ENV_FILE),
@@ -10683,13 +11785,19 @@ def main() -> None:
         )
         return
 
+    packet_layout = str(args.packet_layout or "classic").lower()
+    if args.appendix_enabled is None:
+        include_product_appendix = bool(not args.no_product_appendix and packet_layout != "dashboard")
+    else:
+        include_product_appendix = bool(args.appendix_enabled and not args.no_product_appendix)
+
     options = PacketOptions(
         run_export=bool((args.use_api or args.run_export) and not args.no_export),
         run_catalog_export=bool((not args.no_catalog_export) and ((not args.use_api) or not args.no_export)),
         use_api=bool(args.use_api),
         api_env_file=str(args.env_file or DEFAULT_API_ENV_FILE),
         include_store_sections=not args.no_store_sections,
-        include_product_appendix=not args.no_product_appendix,
+        include_product_appendix=include_product_appendix,
         include_charts=not args.no_charts,
         include_prior_window_data=not args.no_prior_data,
         include_kickback_adjustments=bool(args.with_kickbacks and not args.no_kickbacks),
@@ -10707,6 +11815,9 @@ def main() -> None:
         packet_mode=str(args.packet_mode or "standard"),
         generate_followup_notes=bool(args.generate_followup_notes),
         compact_pdf_mode=bool(args.compact_pdf_mode),
+        packet_layout=packet_layout,
+        max_products=max(1, int(args.max_products or 20)),
+        max_store_products=max(1, int(args.max_store_products or 10)),
     )
 
     generate_brand_meeting_packet(
