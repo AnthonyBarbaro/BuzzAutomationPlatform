@@ -48,17 +48,31 @@ class FakePermissions:
 class FakeFiles:
     def __init__(self):
         self.created = []
+        self.deleted = []
+        self.list_responses = []
         self.next_id = 1
 
-    def list(self, q, spaces="drive", fields=None):
-        return FakeRequest(lambda: {"files": []})
+    def list(self, q, spaces="drive", fields=None, pageToken=None):
+        def callback():
+            if self.list_responses:
+                return self.list_responses.pop(0)
+            return {"files": []}
 
-    def create(self, body, fields="id"):
+        return FakeRequest(callback)
+
+    def create(self, body, media_body=None, fields="id"):
         def callback():
             folder_id = f"folder-{self.next_id}"
             self.next_id += 1
             self.created.append({"id": folder_id, "body": dict(body)})
             return {"id": folder_id}
+
+        return FakeRequest(callback)
+
+    def delete(self, fileId):
+        def callback():
+            self.deleted.append(fileId)
+            return {}
 
         return FakeRequest(callback)
 
@@ -129,22 +143,20 @@ class BrandInvOtherFolderTests(unittest.TestCase):
         self.assertTrue(args.other_only)
         self.assertTrue(args.no_refresh)
 
-    def test_other_folder_email_intro_explains_first_link_and_sharing(self):
-        intro = emailer.build_other_folder_email_intro(
-            "https://drive.google.com/drive/folders/other",
-            other_folder_name="OTHER",
-            other_domain="buzzcannabis.com",
+    def test_all_brand_links_section_lists_every_brand_without_other_link(self):
+        section = emailer.build_all_brand_links_email_section(
+            {
+                "Raw Garden": "https://drive.google.com/drive/folders/raw",
+                "710 Labs": "https://drive.google.com/drive/folders/710",
+            }
         )
-        email_fragment = intro + "<p>Link: <a href='https://drive.google.com/drive/folders/brand'>brand</a></p>"
 
-        self.assertLess(
-            email_fragment.index("https://drive.google.com/drive/folders/other"),
-            email_fragment.index("https://drive.google.com/drive/folders/brand"),
-        )
-        self.assertIn("First link", intro)
-        self.assertIn("not listed below", intro)
-        self.assertIn("buzzcannabis.com", intro)
-        self.assertIn("anyone with that direct brand-folder", intro)
+        self.assertIn("All generated brand folders", section)
+        self.assertIn("710 Labs", section)
+        self.assertIn("Raw Garden", section)
+        self.assertIn("https://drive.google.com/drive/folders/710", section)
+        self.assertNotIn("OTHER - all generated brand folders", section)
+        self.assertNotIn("First link", section)
 
     def test_inventory_email_subject_stays_simple(self):
         self.assertEqual(
@@ -215,6 +227,22 @@ class BrandInvOtherFolderTests(unittest.TestCase):
         )
         self.assertIn("OTHER (buzzcannabis.com users only): https://drive.google.com/drive/folders/other", other_links_text)
         self.assertIn("710 Labs: https://drive.google.com/drive/folders/710", other_links_text)
+
+    def test_clear_drive_folder_contents_deletes_existing_children(self):
+        service = FakeDriveService()
+        service.files_api.list_responses = [
+            {
+                "files": [
+                    {"id": "old-1", "name": "old one.xlsx"},
+                    {"id": "old-2", "name": "old two.xlsx"},
+                ]
+            }
+        ]
+
+        deleted = emailer.clear_drive_folder_contents(service, "brand-folder", "Hashish")
+
+        self.assertEqual(deleted, 2)
+        self.assertEqual(service.files_api.deleted, ["old-1", "old-2"])
 
 
 if __name__ == "__main__":

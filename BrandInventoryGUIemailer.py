@@ -8,8 +8,8 @@ GUI that:
 2) Loads brand names found in the CSV 'Brand' column (lowercased and trimmed).
 3) Filters data to the selected brand(s) & splits them into "Available" (>2) and "Unavailable" (<=2),
    generating one XLSX per brand with advanced Excel formatting.
-4) Uploads each brand’s XLSX to a date-based folder in Google Drive: 
-     INVENTORY -> <YYYY-MM-DD> -> <brandName>  (folder is made public).
+4) Uploads each brand’s XLSX to a stable public Google Drive folder:
+     INVENTORY -> <brandName>.
 5) Sends an HTML email with each brand's public Drive folder link to the specified recipients.
 
 Packages needed:
@@ -48,6 +48,7 @@ from brand_inventory_rows import (
     sort_inventory_report_frame,
     split_available_unavailable,
 )
+from drive_folder_refresh import clear_drive_folder_contents
 from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
     build_brand_order_sections,
@@ -472,13 +473,24 @@ def gmail_authenticate():
 
 def make_folder_public(drive_service, folder_id):
     """Make the given folder ID publicly viewable."""
+    try:
+        existing = drive_service.permissions().list(
+            fileId=folder_id,
+            fields="permissions(id,type,role)",
+        ).execute()
+        for permission in existing.get("permissions", []):
+            if permission.get("type") == "anyone" and permission.get("role") == "reader":
+                return
+    except Exception as e:
+        print(f"[WARN] Could not inspect existing folder permissions: {e}")
+
     permission = {"type": "anyone", "role": "reader"}
     drive_service.permissions().create(fileId=folder_id, body=permission).execute()
 
 def find_or_create_folder(drive_service, folder_name, parent_id=None, make_public=False):
     """
     Find or create a folder named folder_name under parent_id.
-    If newly created and make_public=True, sets public read permission.
+    If make_public=True, ensures public read permission.
     Returns folder_id or None on error.
     """
     from googleapiclient.errors import HttpError
@@ -495,7 +507,13 @@ def find_or_create_folder(drive_service, folder_name, parent_id=None, make_publi
         return None
 
     if folders:
-        return folders[0]["id"]
+        folder_id = folders[0]["id"]
+        if make_public:
+            try:
+                make_folder_public(drive_service, folder_id)
+            except Exception as e:
+                print(f"[ERROR] Could not make existing folder public: {e}")
+        return folder_id
 
     meta = {
         "name": folder_name,
@@ -804,8 +822,7 @@ def upload_brand_reports_to_drive(brand_reports_map):
     """
     brand_reports_map: { brand_name_lower: [list_of_xlsx_paths] }
     1) Create/find top-level "INVENTORY"
-    2) Create date subfolder "YYYY-MM-DD"
-    3) For each brand, create brand folder (public), upload
+    2) For each brand, create/find a stable brand folder (public), clear old contents, upload
     Return: { brand_name_lower: "https://drive.google.com/drive/folders/<id>"}
     """
     drive_svc = drive_authenticate()
@@ -814,19 +831,18 @@ def upload_brand_reports_to_drive(brand_reports_map):
         print("[ERROR] Could not find/create top-level folder. Aborting.")
         return {}
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    date_id = find_or_create_folder(drive_svc, date_str, parent_id=top_id)
-    if not date_id:
-        print("[ERROR] Could not create/find date subfolder. Aborting.")
-        return {}
-
     brand_links = {}
     for brand_lower, xlsx_list in brand_reports_map.items():
-        brand_id = find_or_create_folder(drive_svc, brand_lower, parent_id=date_id, make_public=True)
+        brand_id = find_or_create_folder(drive_svc, brand_lower, parent_id=top_id, make_public=True)
         if not brand_id:
             print(f"[ERROR] Could not create folder for {brand_lower}")
             continue
 
+        clear_drive_folder_contents(
+            drive_svc,
+            brand_id,
+            folder_label=f"{DRIVE_PARENT_FOLDER_NAME}/{brand_lower}",
+        )
         for xfile in xlsx_list:
             try:
                 upload_file_to_drive(drive_svc, xfile, brand_id)

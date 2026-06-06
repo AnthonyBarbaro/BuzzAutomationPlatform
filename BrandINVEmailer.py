@@ -11,8 +11,8 @@ Combined script that:
    - Each scheduled brand gets its own public subfolder for vendor emails.
    - An optional OTHER folder holds public child folders for every generated brand,
      while the OTHER folder itself is restricted to the Buzz Cannabis domain.
-5. Sends an HTML email to the brand's recipients with a single publicly shareable
-   Drive folder link (since the folder is public, all files are accessible).
+5. Sends an HTML email to the brand's recipients with the scheduled brand links
+   and a bottom list of every generated brand folder link.
 
 Requires:
 - credentials.json (for Google OAuth Drive + Gmail)
@@ -43,6 +43,7 @@ from brand_inventory_rows import (
     sort_inventory_report_frame,
     split_available_unavailable,
 )
+from drive_folder_refresh import clear_drive_folder_contents
 from dutchie_api_reports import STORE_CODES, canonical_env_map, resolve_store_keys
 from inventory_order_reports import (
     build_brand_order_sections,
@@ -620,6 +621,11 @@ def upload_other_brand_reports_to_drive(service, generated_files, date_folder_id
             continue
 
         other_brand_links[brand_name] = drive_folder_link(brand_folder_id)
+        clear_drive_folder_contents(
+            service,
+            brand_folder_id,
+            folder_label=f"{other_folder_name}/{brand_name}",
+        )
         for file_path in files:
             try:
                 upload_file_to_drive(service, file_path, brand_folder_id)
@@ -631,35 +637,30 @@ def upload_other_brand_reports_to_drive(service, generated_files, date_folder_id
     return other_folder_link, other_brand_links
 
 
-def build_other_folder_email_intro(
-    other_folder_link=None,
-    other_folder_name=DEFAULT_OTHER_FOLDER_NAME,
-    other_domain=DEFAULT_OTHER_FOLDER_DOMAIN,
-):
-    """
-    Build the optional first email link for Buzz users to browse every brand.
-    """
-    if not other_folder_link:
+def build_all_brand_links_email_section(brand_links, heading="All generated brand folders"):
+    if not brand_links:
         return ""
 
-    escaped_name = html.escape(str(other_folder_name or DEFAULT_OTHER_FOLDER_NAME))
-    escaped_domain = html.escape(str(other_domain or DEFAULT_OTHER_FOLDER_DOMAIN))
-    escaped_link = html.escape(str(other_folder_link), quote=True)
-    visible_link = html.escape(str(other_folder_link))
+    rows = []
+    for brand_name, link in sorted(brand_links.items(), key=lambda item: item[0].lower()):
+        escaped_brand = html.escape(str(brand_name))
+        escaped_link = html.escape(str(link), quote=True)
+        visible_link = html.escape(str(link))
+        rows.append(
+            "<tr>"
+            f"<td style=\"padding:4px 10px 4px 0; white-space:nowrap;\"><strong>{escaped_brand}</strong></td>"
+            f"<td style=\"padding:4px 0;\"><a href=\"{escaped_link}\">{visible_link}</a></td>"
+            "</tr>"
+        )
+
+    escaped_heading = html.escape(str(heading))
+    rows_html = "\n".join(rows)
     return f"""
-          <h3>{escaped_name} - all generated brand folders</h3>
-          <p><strong>First link:</strong> <a href="{escaped_link}">{visible_link}</a></p>
-          <p>
-            Use this when someone needs an inventory report for a brand that is
-            not listed below. The {escaped_name} folder is only viewable by
-            Buzz Cannabis users signed into a {escaped_domain} Google account.
-          </p>
-          <p>
-            Inside {escaped_name}, each brand has its own folder. Those child
-            brand folders are viewable by anyone with that direct brand-folder
-            link, so open {escaped_name}, choose the brand, then share that
-            brand folder link with the person who needs it.
-          </p>
+          <hr>
+          <h3>{escaped_heading}</h3>
+          <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+            {rows_html}
+          </table>
         """
 
 
@@ -1199,6 +1200,11 @@ def main(argv=None):
             if not brand_folder_id:
                 print(f"[ERROR] Could not create/find Drive folder for {folder_name}.")
                 continue
+            clear_drive_folder_contents(
+                drive_service,
+                brand_folder_id,
+                folder_label=f"{DRIVE_PARENT_FOLDER_NAME}/{date_str}/{folder_name}",
+            )
             link = drive_folder_link(brand_folder_id)
             brand_folder_links[folder_name] = link
 
@@ -1310,10 +1316,8 @@ def main(argv=None):
                 brand_lines.append(f"<p>No link found for {f_name}</p>")
 
         brand_html = "\n".join(brand_lines)
-        other_intro_html = build_other_folder_email_intro(
-            other_folder_link=other_folder_link,
-            other_folder_name=other_settings.get("folder_name", DEFAULT_OTHER_FOLDER_NAME),
-            other_domain=other_settings.get("domain", DEFAULT_OTHER_FOLDER_DOMAIN),
+        all_brand_links_html = build_all_brand_links_email_section(
+            other_brand_folder_links or brand_folder_links
         )
         subject = build_inventory_email_subject(today_name)
         html_body = f"""
@@ -1321,10 +1325,10 @@ def main(argv=None):
         <body>
           <p>Hello,</p>
           <p>Below are your brand inventory reports for <strong>{today_name}</strong>.</p>
-          {other_intro_html}
           {order_note}
           {brand_html}
           <p>All files in the listed brand folders are viewable by anyone with the link.</p>
+          {all_brand_links_html}
           <p>Regards,<br>Buzz Cannabis</p>
         </body>
         </html>
