@@ -8,7 +8,7 @@ from getInventoryOrderReport_api import build_inventory_order_report_frame
 from inventory_order_reports import build_brand_order_sections, order_report_filename
 
 
-FIXTURE_ROOT = Path(__file__).resolve().parent / "tests" / "fixtures" / "weekly_store_ordering" / "MV"
+FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "weekly_store_ordering" / "MV"
 
 
 class InventoryOrderReportAPITests(unittest.TestCase):

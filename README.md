@@ -45,7 +45,7 @@ This repository is a Python automation stack (not a web backend) that:
 - `margin_report.py` - GUI margin reporting with scenario analysis
 - `margin_floor_report.py` - CLI margin floor report by brand
 - `marginCalc.py` - quick GUI margin calculator
-- `discount.py` - one-off discount anomaly report
+- `other-scripts/discount.py` - one-off discount anomaly report
 
 ### Email and delivery
 - `owner_emailer.py` - owner snapshot email formatting/sending

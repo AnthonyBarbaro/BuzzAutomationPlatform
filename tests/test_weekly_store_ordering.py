@@ -26,7 +26,7 @@ from weekly_store_ordering_sheet import (
 from weekly_store_ordering_sheets import build_readme_rows, build_sheet_matrix, build_summary_rows, merge_preserved_review_columns, move_latest_tabs_next_to_readme
 
 
-FIXTURE_ROOT = Path(__file__).resolve().parent / "tests" / "fixtures" / "weekly_store_ordering"
+FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "weekly_store_ordering"
 
 
 class WeeklyStoreOrderingTests(unittest.TestCase):
