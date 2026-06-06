@@ -97,6 +97,10 @@ class BrandMeetingPacketGUI:
         self.generate_followup_notes_var = tk.BooleanVar(value=True)
         self.compact_pdf_mode_var = tk.BooleanVar(value=True)
         self.packet_mode_var = tk.StringVar(value="standard")
+        self.owner_top_n_var = tk.StringVar(value="20")
+        self.owner_brand_cards_var = tk.BooleanVar(value=True)
+        self.owner_email_var = tk.BooleanVar(value=False)
+        self.owner_creditflow_var = tk.BooleanVar(value=False)
         self.target_margin_var = tk.StringVar(value="35")
         self.brand_search_var = tk.StringVar()
         self.custom_brand_var = tk.StringVar()
@@ -492,6 +496,12 @@ class BrandMeetingPacketGUI:
             style="Secondary.TButton",
             command=self._on_all_store_slow_movers,
         )
+        self.btn_owner_rollup = ttk.Button(
+            self.run_action_grid,
+            text="Build Owner Top Brands PDF",
+            style="Secondary.TButton",
+            command=self._on_owner_rollup,
+        )
 
         self.progress = ttk.Progressbar(actions_body, mode="indeterminate")
         self.progress.grid(row=1, column=0, sticky="ew", pady=(14, 8))
@@ -514,6 +524,46 @@ class BrandMeetingPacketGUI:
             wraplength=360,
             anchor="w",
         ).grid(row=3, column=0, sticky="ew", pady=(6, 0))
+
+        owner_frame = tk.Frame(
+            actions_body,
+            bg=self.colors["card_alt"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+            padx=10,
+            pady=8,
+        )
+        owner_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        owner_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(
+            owner_frame,
+            text="Owner Top N",
+            bg=self.colors["card_alt"],
+            fg=self.colors["text"],
+            font=self.fonts["small"],
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(owner_frame, textvariable=self.owner_top_n_var, width=6).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(
+            owner_frame,
+            text="Include brand cards",
+            variable=self.owner_brand_cards_var,
+            style="Store.TCheckbutton",
+            command=self._update_header_summary,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            owner_frame,
+            text="Email to owners",
+            variable=self.owner_email_var,
+            style="Store.TCheckbutton",
+            command=self._update_header_summary,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(
+            owner_frame,
+            text="Pull CreditFlow",
+            variable=self.owner_creditflow_var,
+            style="Store.TCheckbutton",
+            command=self._update_header_summary,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._layout_run_actions(stacked=False)
 
         self.brand_queue_card, _, queue_body = self._make_card(
@@ -1139,7 +1189,7 @@ class BrandMeetingPacketGUI:
         if not stacked:
             self.run_action_grid.grid_columnconfigure(1, weight=1)
 
-        for button in (self.btn_all, self.btn_download, self.btn_build, self.btn_build_email, self.btn_all_store_slow):
+        for button in (self.btn_all, self.btn_download, self.btn_build, self.btn_build_email, self.btn_all_store_slow, self.btn_owner_rollup):
             button.grid_forget()
 
         if stacked:
@@ -1147,7 +1197,8 @@ class BrandMeetingPacketGUI:
             self.btn_download.grid(row=1, column=0, sticky="ew", pady=(0, 8))
             self.btn_build.grid(row=2, column=0, sticky="ew", pady=(0, 8))
             self.btn_build_email.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-            self.btn_all_store_slow.grid(row=4, column=0, sticky="ew")
+            self.btn_all_store_slow.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+            self.btn_owner_rollup.grid(row=5, column=0, sticky="ew")
             return
 
         self.btn_all.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
@@ -1155,6 +1206,7 @@ class BrandMeetingPacketGUI:
         self.btn_build.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
         self.btn_build_email.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.btn_all_store_slow.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.btn_owner_rollup.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
     def _layout_store_toggles(self, columns: int) -> None:
         columns = max(1, columns)
@@ -2208,6 +2260,8 @@ class BrandMeetingPacketGUI:
             return "Starting store SKU cut report", "info"
         if raw.startswith("[START] Building all-store slow mover report"):
             return "Starting all-store slow mover report", "info"
+        if raw.startswith("[START] Building owner top brands review"):
+            return "Starting owner top brands review", "info"
         if raw.startswith("[RUN] Build-only mode:"):
             return "Building packet from cached files only", "info"
         if raw.startswith("[RUN] Build + Email (No Download):"):
@@ -2216,6 +2270,8 @@ class BrandMeetingPacketGUI:
             return "Running the store-by-store SKU cut report across all stores", "info"
         if raw.startswith("[RUN] All-store slow mover report:"):
             return "Running all-store slow mover report across all stores", "info"
+        if raw.startswith("[RUN] Owner top brands review:"):
+            return "Running owner top brands review", "info"
         if raw.startswith("[SALES] Reusing"):
             return "Using saved sales files from this run", "info"
         if raw.startswith("[SALES] Seeded"):
@@ -2262,6 +2318,8 @@ class BrandMeetingPacketGUI:
             return "Store SKU cut PDF created", "success"
         if raw.startswith("[PDF] Created (All-Store Slow Movers):"):
             return "All-store slow mover PDF created", "success"
+        if raw.startswith("[PDF] Created (Owner Top Brands Review):"):
+            return "Owner top brands PDF created", "success"
         if raw.startswith("[PDF] Created"):
             return "PDF packet created", "success"
         if raw.startswith("[XLSX] Created"):
@@ -2270,10 +2328,14 @@ class BrandMeetingPacketGUI:
             return "Store SKU cut workbook created", "success"
         if raw.startswith("[DONE] All-store slow mover report ready:"):
             return "All-store slow mover workbook created", "success"
+        if raw.startswith("[DONE] Owner top brands review ready:"):
+            return "Owner top brands review created", "success"
         if raw.startswith("[EMAIL] Sent store SKU cut report to"):
             return "Store SKU cut email sent", "success"
         if raw.startswith("[EMAIL] Sent all-store slow mover report to"):
             return "All-store slow mover email sent", "success"
+        if raw.startswith("[EMAIL] Sent owner top brands review to"):
+            return "Owner top brands email sent", "success"
         if raw.startswith("[EMAIL] Sent packet to"):
             return "Packet email sent", "success"
         if raw == "Done ✅":
@@ -2322,6 +2384,7 @@ class BrandMeetingPacketGUI:
         self.btn_build_email.configure(state=state)
         self.btn_all.configure(state=state)
         self.btn_all_store_slow.configure(state=state)
+        self.btn_owner_rollup.configure(state=state)
 
     def _run_background(self, fn, start_message: str, finish_message: str) -> None:
         if self.worker_running:
@@ -2515,6 +2578,59 @@ class BrandMeetingPacketGUI:
             _task,
             start_message=start_message,
             finish_message="Full run finished",
+        )
+
+    def _on_owner_rollup(self) -> None:
+        def _task() -> None:
+            start_day, end_day = self._resolve_window()
+            stores = self._selected_store_codes()
+            if not stores:
+                raise ValueError("Select at least one store.")
+            output_root = Path(self.output_dir_var.get().strip() or bmp.DEFAULT_OUTPUT_ROOT).expanduser().resolve()
+            try:
+                top_n = max(1, int(str(self.owner_top_n_var.get()).strip() or "20"))
+            except ValueError as exc:
+                raise ValueError("Owner Top N must be a whole number.") from exc
+            try:
+                target_margin = float(self.target_margin_var.get().strip() or "35")
+            except ValueError:
+                target_margin = 35.0
+            if target_margin > 1:
+                target_margin = target_margin / 100.0
+
+            self._queue_log("[RUN] Owner top brands review: building one cross-brand owner PDF.")
+            artifacts = bmp.generate_owner_brand_rollup_packet(
+                start_date=start_day,
+                end_date=end_day,
+                stores=stores,
+                top_n=top_n,
+                use_api=self.use_api_var.get(),
+                run_export=self.force_refresh_var.get(),
+                no_export=not (self.use_api_var.get() or self.force_refresh_var.get()),
+                no_catalog_export=False,
+                force_refresh=self.force_refresh_var.get(),
+                include_prior_data=self.include_prior_var.get(),
+                include_creditflow=self.owner_creditflow_var.get(),
+                target_margin=target_margin,
+                output_root=output_root,
+                email=self.owner_email_var.get(),
+                compact=self.compact_pdf_mode_var.get(),
+                include_brand_cards=self.owner_brand_cards_var.get(),
+                api_workers=self._api_worker_count(),
+                credit_ledger_path=str(self.credit_ledger_path),
+                logger=self._queue_log,
+            )
+            self._queue_log(f"[DONE] Owner top brands review ready: {artifacts.pdf_path}")
+
+        start_message = (
+            "Building owner top brands review with API data..."
+            if self.use_api_var.get()
+            else "Building owner top brands review from saved or refreshed files..."
+        )
+        self._run_background(
+            _task,
+            start_message=start_message,
+            finish_message="Owner top brands review finished",
         )
 
     def _on_all_store_slow_movers(self) -> None:
