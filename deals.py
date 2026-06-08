@@ -363,7 +363,7 @@ DEFAULT_BRAND_CRITERIA = {
     #     'kickback': 0.30,
     #     'brands': ['710']
     # },
-    "Blem": {
+    "BLEM": {
         'vendors': ['SSAL HORTICULTURE LLC','LB Atlantis LLC'],
         'days': ['Thursday'],
         'discount': 0.50,
@@ -426,7 +426,7 @@ DEFAULT_BRAND_CRITERIA = {
     },
     "Turn": {
         'vendors': ['Garden Of Weeden','Garden Of Weeden Inc.','Hilife Group MV , LLC'],
-        'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+        'days': ['Friday','Saturday','Sunday'],
         'discount': 0.50,
         'kickback': 0.30,
         'brands': ['Turn |']
@@ -558,11 +558,6 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.3,
            'kickback': 0.0,
            'brands': ['Sol Flora']},
-    # 'Planta': {'vendors': ['Higher Logic LLC','Garden Of Weeden Inc.','Garden Of Weeden'],
-    #        'days': ['Monday','Sunday'],
-    #        'discount': 0.5,
-    #        'kickback': 0.3,
-    #        'brands': ['Planta |']},
     'Sauce': {'vendors': ['Garden Of Weeden','Garden Of Weeden Inc.'],
            'days': ['Friday'],
            'discount': 0.5,
@@ -629,7 +624,6 @@ DEFAULT_BRAND_CRITERIA = {
                {
                    'rule_name': 'Good Good - Other days (30/0)',
                    'days': ['Monday','Wednesday','Thursday','Friday','Saturday','Sunday'],
-                   #'days': ['Thursday','Friday','Saturday','Sunday'],
                    'discount': 0.3,
                    'kickback': 0.0,
                },
@@ -651,6 +645,18 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.50,
            'kickback': 0.30,
            'brands': ['Traditional |']},
+    'Moods': {
+        #'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+           'days': ['Saturday'], #june 1 start
+           'discount': 0.50,
+           'kickback': 0.30,
+           'brands': ['Moods |']},
+    'PBR-NYF-StIdes': {
+        #'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+           'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+           'discount': 0.50,
+           'kickback': 0.0,
+           'brands': ['PBR |', 'NYF |', 'St. Ides |']},
 }
 
 brand_criteria = DEFAULT_BRAND_CRITERIA

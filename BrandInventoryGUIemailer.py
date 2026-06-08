@@ -8,8 +8,8 @@ GUI that:
 2) Loads brand names found in the CSV 'Brand' column (lowercased and trimmed).
 3) Filters data to the selected brand(s) & splits them into "Available" (>2) and "Unavailable" (<=2),
    generating one XLSX per brand with advanced Excel formatting.
-4) Uploads each brand’s XLSX to a stable public Google Drive folder:
-     INVENTORY -> <brandName>.
+4) Uploads each brand’s XLSX to a dated public Google Drive folder:
+     INVENTORY -> <YYYY-MM-DD> -> <brandName>.
 5) Sends an HTML email with each brand's public Drive folder link to the specified recipients.
 
 Packages needed:
@@ -74,6 +74,7 @@ except Exception:
 
 # File where we store the chosen input & output dirs.
 CONFIG_FILE = "config.txt"
+BRAND_GROUP_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brand_config2.json")
 
 # Google Drive parent folder name
 DRIVE_PARENT_FOLDER_NAME = "INVENTORY"
@@ -111,6 +112,7 @@ DEFAULT_GUI_CONFIG = {
     "fetch_order_reports": True,
     "emails": "",
     "include_cost": True,
+    "include_par_levels": True,
     "prefer_catalog_api": True,
     "auto_update_on_launch": True,
     "auto_load_brands_after_update": True,
@@ -219,6 +221,94 @@ def is_order_report_filename(filename):
     return bool(ORDER_REPORT_FILE_PATTERN.match(str(filename or "")))
 
 
+def normalize_brand_group_key(value):
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def brand_group_match_keys(value):
+    raw_text = str(value or "").strip()
+    if not raw_text:
+        return set()
+
+    candidates = {raw_text}
+    candidates.update(part.strip() for part in re.findall(r"\(([^)]+)\)", raw_text) if part.strip())
+    without_parentheses = re.sub(r"\([^)]*\)", " ", raw_text).strip()
+    if without_parentheses:
+        candidates.add(without_parentheses)
+
+    keys = set()
+    for candidate in candidates:
+        normalized = normalize_brand_group_key(candidate)
+        if normalized:
+            keys.add(normalized)
+            keys.add(normalized.replace(" ", ""))
+    return keys
+
+
+def load_brand_group_options(config_path=BRAND_GROUP_CONFIG_FILE):
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return []
+
+    items = data.get("brands", []) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+
+    groups = []
+    used_labels = set()
+    for idx, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        synonyms = item.get("brand_synonyms") or []
+        if not synonyms and item.get("brand"):
+            synonyms = [item.get("brand")]
+        synonyms = [str(value).strip() for value in synonyms if str(value or "").strip()]
+        if not synonyms:
+            continue
+
+        base_label = str(item.get("folder_name") or synonyms[0]).strip() or f"Group {idx}"
+        label = base_label
+        suffix = 2
+        while label in used_labels:
+            label = f"{base_label} ({suffix})"
+            suffix += 1
+        used_labels.add(label)
+
+        groups.append(
+            {
+                "label": label,
+                "synonyms": synonyms,
+            }
+        )
+    return groups
+
+
+def match_brand_group_to_loaded_brands(group, loaded_brands):
+    synonyms = (group or {}).get("synonyms", [])
+    synonym_keys = set()
+    for synonym in synonyms:
+        synonym_keys.update(brand_group_match_keys(synonym))
+
+    matched = []
+    for brand in loaded_brands or []:
+        if brand_group_match_keys(brand) & synonym_keys:
+            matched.append(brand)
+
+    matched_keys = set()
+    for brand in matched:
+        matched_keys.update(brand_group_match_keys(brand))
+
+    missing = [
+        synonym
+        for synonym in synonyms
+        if not (brand_group_match_keys(synonym) & matched_keys)
+    ]
+    return sorted(set(matched)), missing
+
+
 def list_catalog_csv_files(directory):
     if not directory or not os.path.isdir(directory):
         return []
@@ -315,6 +405,8 @@ def load_config():
                     cfg["emails"] = value
                 elif key == "include_cost":
                     cfg["include_cost"] = parse_bool_value(value, True)
+                elif key == "include_par_levels":
+                    cfg["include_par_levels"] = parse_bool_value(value, True)
                 elif key == "prefer_catalog_api":
                     cfg["prefer_catalog_api"] = parse_bool_value(value, True)
                 elif key == "auto_update_on_launch":
@@ -404,6 +496,7 @@ def save_config(
     fetch_order_reports=True,
     emails="",
     include_cost=True,
+    include_par_levels=True,
     prefer_catalog_api=True,
     auto_update_on_launch=True,
     auto_load_brands_after_update=True,
@@ -425,6 +518,7 @@ def save_config(
             f.write(f"fetch_order_reports={'1' if fetch_order_reports else '0'}\n")
             f.write(f"emails={emails.strip()}\n")
             f.write(f"include_cost={'1' if include_cost else '0'}\n")
+            f.write(f"include_par_levels={'1' if include_par_levels else '0'}\n")
             f.write(f"prefer_catalog_api={'1' if prefer_catalog_api else '0'}\n")
             f.write(f"auto_update_on_launch={'1' if auto_update_on_launch else '0'}\n")
             f.write(f"auto_load_brands_after_update={'1' if auto_load_brands_after_update else '0'}\n")
@@ -699,7 +793,14 @@ def advanced_format_excel(xlsx_path):
     wb.save(xlsx_path)
 
 # ----------------- CSV -> XLSX: Avail + Unavail -----------------
-def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True, order_reports_dir=None):
+def generate_brand_reports(
+    csv_path,
+    out_dir,
+    selected_brands,
+    include_cost=True,
+    order_reports_dir=None,
+    include_par_levels=True,
+):
     """
     Splits CSV rows into:
       - Available: Available>2
@@ -798,6 +899,7 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
             order_reports_dir or os.path.dirname(csv_path),
             brand_aliases=[brand_name_lower],
             store_code=store_code,
+            include_par_levels=include_par_levels,
         )
 
         # Ensure output directory exists (extra safety)
@@ -818,11 +920,12 @@ def generate_brand_reports(csv_path, out_dir, selected_brands, include_cost=True
 
     return brand_map
 
-def upload_brand_reports_to_drive(brand_reports_map):
+def upload_brand_reports_to_drive(brand_reports_map, date_folder_name=None):
     """
     brand_reports_map: { brand_name_lower: [list_of_xlsx_paths] }
     1) Create/find top-level "INVENTORY"
-    2) For each brand, create/find a stable brand folder (public), clear old contents, upload
+    2) Create/find today's date folder under INVENTORY
+    3) For each brand, create/find a brand folder under the date folder (public), clear old contents, upload
     Return: { brand_name_lower: "https://drive.google.com/drive/folders/<id>"}
     """
     drive_svc = drive_authenticate()
@@ -831,24 +934,30 @@ def upload_brand_reports_to_drive(brand_reports_map):
         print("[ERROR] Could not find/create top-level folder. Aborting.")
         return {}
 
+    date_folder_name = str(date_folder_name or datetime.now().strftime("%Y-%m-%d")).strip()
+    date_id = find_or_create_folder(drive_svc, date_folder_name, parent_id=top_id)
+    if not date_id:
+        print(f"[ERROR] Could not find/create date folder '{date_folder_name}'. Aborting.")
+        return {}
+
     brand_links = {}
     for brand_lower, xlsx_list in brand_reports_map.items():
-        brand_id = find_or_create_folder(drive_svc, brand_lower, parent_id=top_id, make_public=True)
+        brand_id = find_or_create_folder(drive_svc, brand_lower, parent_id=date_id, make_public=True)
         if not brand_id:
-            print(f"[ERROR] Could not create folder for {brand_lower}")
+            print(f"[ERROR] Could not create folder for {brand_lower} under {date_folder_name}")
             continue
 
         clear_drive_folder_contents(
             drive_svc,
             brand_id,
-            folder_label=f"{DRIVE_PARENT_FOLDER_NAME}/{brand_lower}",
+            folder_label=f"{DRIVE_PARENT_FOLDER_NAME}/{date_folder_name}/{brand_lower}",
         )
         for xfile in xlsx_list:
             try:
                 upload_file_to_drive(drive_svc, xfile, brand_id)
-                print(f"[DRIVE] Uploaded {os.path.basename(xfile)} => {brand_lower}")
+                print(f"[DRIVE] Uploaded {os.path.basename(xfile)} => {date_folder_name}/{brand_lower}")
             except Exception as e:
-                print(f"[ERROR] Uploading {xfile} => {brand_lower}: {e}")
+                print(f"[ERROR] Uploading {xfile} => {date_folder_name}/{brand_lower}: {e}")
 
         link = f"https://drive.google.com/drive/folders/{brand_id}"
         brand_links[brand_lower] = link
@@ -882,6 +991,8 @@ class LegacyBrandInventoryGUI:
         self.quick_jump_last_ts = 0.0
 
         cfg = load_config()
+        self.brand_groups = load_brand_group_options()
+        self.brand_groups_by_label = {group["label"]: group for group in self.brand_groups}
 
         self.master.title("Buzz Brand Inventory Studio")
         self.master.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
@@ -893,7 +1004,9 @@ class LegacyBrandInventoryGUI:
         self.emails_var = tk.StringVar(value=cfg.get("emails", ""))
         self.fetch_order_reports_var = tk.BooleanVar(value=cfg.get("fetch_order_reports", True))
         self.include_cost_var = tk.BooleanVar(value=cfg.get("include_cost", True))
+        self.include_par_levels_var = tk.BooleanVar(value=cfg.get("include_par_levels", True))
         self.prefer_catalog_api_var = tk.BooleanVar(value=cfg.get("prefer_catalog_api", True))
+        self.brand_group_var = tk.StringVar()
         self.brand_search_var = tk.StringVar()
 
         self.status_var = tk.StringVar(value="Ready to refresh exports and build reports.")
@@ -1417,6 +1530,13 @@ class LegacyBrandInventoryGUI:
             style="Card.TCheckbutton",
         ).grid(row=4, column=0, sticky="w", pady=(12, 0))
 
+        ttk.Checkbutton(
+            body,
+            text="Include calculated Par Level values in Order tabs",
+            variable=self.include_par_levels_var,
+            style="Card.TCheckbutton",
+        ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+
         tk.Label(
             body,
             text="These preferences auto-save as you work, and Save Settings on the Workspace tab stores them immediately.",
@@ -1425,7 +1545,7 @@ class LegacyBrandInventoryGUI:
             font=("Segoe UI", 8),
             wraplength=520,
             justify="left",
-        ).grid(row=5, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=6, column=0, sticky="w", pady=(10, 0))
 
     def _build_run_actions_card(self, body):
         body.grid_columnconfigure(0, weight=1)
@@ -1661,13 +1781,34 @@ class LegacyBrandInventoryGUI:
 
         tk.Label(
             toolbar_body,
+            text="Group",
+            bg=self.colors["card"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 9, "bold"),
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.brand_group_combo = ttk.Combobox(
+            toolbar_body,
+            textvariable=self.brand_group_var,
+            values=[group["label"] for group in self.brand_groups],
+            state="readonly",
+        )
+        self.brand_group_combo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(8, 8), pady=(10, 0))
+        ttk.Button(
+            toolbar_body,
+            text="Apply Group",
+            style="Quiet.TButton",
+            command=self.select_brand_group,
+        ).grid(row=1, column=4, sticky="ew", padx=(8, 0), pady=(10, 0))
+
+        tk.Label(
+            toolbar_body,
             textvariable=self.brand_hint_var,
             bg=self.colors["card"],
             fg=self.colors["muted"],
             font=("Segoe UI", 8),
             wraplength=760,
             justify="left",
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
         tk.Label(
             toolbar_body,
             textvariable=self.brand_load_status_var,
@@ -1676,7 +1817,7 @@ class LegacyBrandInventoryGUI:
             font=("Segoe UI", 8),
             wraplength=760,
             justify="left",
-        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         browser_card, browser_body = self._create_card(
             self.brands_tab,
@@ -1892,6 +2033,7 @@ class LegacyBrandInventoryGUI:
             self.prefer_catalog_api_var,
             self.fetch_order_reports_var,
             self.include_cost_var,
+            self.include_par_levels_var,
         ):
             var.trace_add("write", lambda *_: self._schedule_autosave())
 
@@ -2429,6 +2571,7 @@ class LegacyBrandInventoryGUI:
             self.fetch_order_reports_var.get(),
             emails=self.emails_var.get().strip(),
             include_cost=self.include_cost_var.get(),
+            include_par_levels=self.include_par_levels_var.get(),
             prefer_catalog_api=self.prefer_catalog_api_var.get(),
             task_eta_seconds=getattr(self, "task_eta_seconds", {}),
         )
@@ -2490,6 +2633,39 @@ class LegacyBrandInventoryGUI:
         if folder:
             self.output_dir_var.set(folder)
             self.append_log(f"Selected output folder: {folder}")
+
+    def select_brand_group(self):
+        label = self.brand_group_var.get().strip()
+        group = self.brand_groups_by_label.get(label)
+        if not group:
+            messagebox.showwarning("No Group Selected", "Choose a brand group first.")
+            return
+        if not self.all_brands:
+            messagebox.showwarning("No Brands Loaded", "Load brands before applying a group.")
+            return
+
+        matched, missing = match_brand_group_to_loaded_brands(group, self.all_brands)
+        self.selected_brand_names = set(matched)
+        if self.brand_search_var.get():
+            self.brand_search_var.set("")
+        else:
+            self.filter_brand_list()
+        self._update_brand_summary()
+
+        if not matched:
+            messagebox.showwarning(
+                "No Group Matches",
+                f"No loaded brands matched {label}. Refresh/load brands or check brand_config2.json.",
+            )
+            return
+
+        detail = f"Selected {len(matched)} brand(s) from {label}."
+        if missing:
+            detail += f" Missing from loaded brands: {', '.join(missing[:8])}"
+            if len(missing) > 8:
+                detail += f" and {len(missing) - 8} more"
+        self.append_log(detail)
+        self._set_status("Brand group applied.", detail)
 
     def select_all_brands(self):
         if not self.filtered_brands:
@@ -2966,6 +3142,7 @@ class LegacyBrandInventoryGUI:
                     selected_brands,
                     include_cost=self.include_cost_var.get(),
                     order_reports_dir=in_dir,
+                    include_par_levels=self.include_par_levels_var.get(),
                 )
                 for b_name, xlsx_list in brand_map.items():
                     if b_name not in all_brand_map:
@@ -3085,6 +3262,8 @@ class BrandInventoryGUI:
     def __init__(self, master):
         self.master = master
         self.cfg = load_config()
+        self.brand_groups = load_brand_group_options()
+        self.brand_groups_by_label = {group["label"]: group for group in self.brand_groups}
         self.colors = theme_palette(self.cfg.get("theme", DEFAULT_GUI_CONFIG["theme"]))
         self.all_brands = []
         self.filtered_brands = []
@@ -3130,7 +3309,9 @@ class BrandInventoryGUI:
         self.emails_var = tk.StringVar(value=cfg.get("emails", ""))
         self.fetch_order_reports_var = tk.BooleanVar(value=cfg.get("fetch_order_reports", True))
         self.include_cost_var = tk.BooleanVar(value=cfg.get("include_cost", True))
+        self.include_par_levels_var = tk.BooleanVar(value=cfg.get("include_par_levels", True))
         self.prefer_catalog_api_var = tk.BooleanVar(value=cfg.get("prefer_catalog_api", True))
+        self.brand_group_var = tk.StringVar()
         self.auto_update_on_launch_var = tk.BooleanVar(value=cfg.get("auto_update_on_launch", True))
         auto_load_brands = cfg.get(
             "auto_load_brands_after_update",
@@ -3411,6 +3592,16 @@ class BrandInventoryGUI:
         ttk.Button(toolbar, text="Clear", style="Ghost.TButton", command=self._clear_brand_search).grid(row=0, column=2, padx=6)
         ttk.Button(toolbar, text="Select Visible", style="Secondary.TButton", command=self.select_all_brands).grid(row=0, column=3, padx=6)
         ttk.Button(toolbar, text="Clear Selected", style="Danger.TButton", command=self.clear_selected_brands).grid(row=0, column=4, padx=(6, 12))
+        ttk.Label(toolbar, text="Group", style="SectionTitle.TLabel").grid(row=1, column=0, padx=(12, 8), pady=(0, 12))
+        self.brand_group_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.brand_group_var,
+            values=[group["label"] for group in self.brand_groups],
+            width=42,
+            state="readonly",
+        )
+        self.brand_group_combo.grid(row=1, column=1, sticky="ew", pady=(0, 12))
+        ttk.Button(toolbar, text="Apply Group", style="Secondary.TButton", command=self.select_brand_group).grid(row=1, column=2, padx=6, pady=(0, 12))
 
         stats = tk.Frame(screen, bg=self.colors["bg"])
         stats.grid(row=1, column=0, sticky="ew", pady=10)
@@ -3510,7 +3701,8 @@ class BrandInventoryGUI:
         self._check_row(workflow, 0, "Prefer Dutchie API", self.prefer_catalog_api_var)
         self._check_row(workflow, 1, "Refresh order reports", self.fetch_order_reports_var)
         self._check_row(workflow, 2, "Include Cost column", self.include_cost_var)
-        self._check_row(workflow, 3, "Open output folder after reports complete", self.open_output_after_complete_var)
+        self._check_row(workflow, 3, "Include calculated Par Level values", self.include_par_levels_var)
+        self._check_row(workflow, 4, "Open output folder after reports complete", self.open_output_after_complete_var)
 
         email_card, email = self._section_card(content, "Email")
         email_card.grid(row=3, column=0, sticky="ew", pady=(0, 12))
@@ -3542,6 +3734,7 @@ class BrandInventoryGUI:
             self.emails_var,
             self.fetch_order_reports_var,
             self.include_cost_var,
+            self.include_par_levels_var,
             self.prefer_catalog_api_var,
             self.auto_update_on_launch_var,
             self.auto_load_brands_after_update_var,
@@ -3852,6 +4045,38 @@ class BrandInventoryGUI:
             self._toggle_brand(focused)
         return "break"
 
+    def select_brand_group(self):
+        label = self.brand_group_var.get().strip()
+        group = self.brand_groups_by_label.get(label)
+        if not group:
+            self.show_toast("Choose a brand group first.", "warning")
+            return
+        if not self.all_brands:
+            self.show_toast("Load brands before applying a group.", "warning")
+            self._set_status("No brands loaded", "Load brands before applying a brand group.", state="Warning")
+            return
+
+        matched, missing = match_brand_group_to_loaded_brands(group, self.all_brands)
+        self.selected_brand_names = set(matched)
+        self.brand_search_var.set("")
+        self.selected_only_var.set(True)
+        self.filter_brand_list()
+
+        if not matched:
+            self._set_status("No group matches", f"No loaded brands matched {label}.", state="Warning")
+            self.show_toast("No loaded brands matched that group.", "warning")
+            return
+
+        detail = f"{len(matched)} brand(s) selected from {label}"
+        if missing:
+            missing_text = ", ".join(missing[:8])
+            if len(missing) > 8:
+                missing_text += f" and {len(missing) - 8} more"
+            detail += f"; missing: {missing_text}"
+        self.append_log(detail)
+        self._set_status("Brand group applied", detail, state="Complete")
+        self.show_toast(f"Selected {len(matched)} brand(s)", "success")
+
     def select_all_brands(self):
         self.selected_brand_names.update(self.filtered_brands)
         self.filter_brand_list()
@@ -3882,6 +4107,7 @@ class BrandInventoryGUI:
             fetch_order_reports=self.fetch_order_reports_var.get(),
             emails=self.emails_var.get().strip(),
             include_cost=self.include_cost_var.get(),
+            include_par_levels=self.include_par_levels_var.get(),
             prefer_catalog_api=self.prefer_catalog_api_var.get(),
             auto_update_on_launch=self.auto_update_on_launch_var.get(),
             auto_load_brands_after_update=self.auto_load_brands_after_update_var.get(),
@@ -4066,7 +4292,16 @@ class BrandInventoryGUI:
             result["brands_result"] = self._scan_brand_library_worker(ctx, input_dir)
         return result
 
-    def _generate_reports_worker(self, ctx, input_dir, output_dir, selected_brands, include_cost, emails):
+    def _generate_reports_worker(
+        self,
+        ctx,
+        input_dir,
+        output_dir,
+        selected_brands,
+        include_cost,
+        include_par_levels,
+        emails,
+    ):
         all_brand_map = {}
         catalog_files = list_catalog_csv_files(input_dir)
         if not catalog_files:
@@ -4079,6 +4314,7 @@ class BrandInventoryGUI:
                 selected_brands,
                 include_cost=include_cost,
                 order_reports_dir=input_dir,
+                include_par_levels=include_par_levels,
             )
             for brand, files in brand_map.items():
                 all_brand_map.setdefault(brand, []).extend(files)
@@ -4529,6 +4765,7 @@ class BrandInventoryGUI:
                 output_dir,
                 selected_brands,
                 self.include_cost_var.get(),
+                self.include_par_levels_var.get(),
                 emails,
             ),
             on_complete=self._on_generate_complete,

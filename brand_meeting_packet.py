@@ -7117,6 +7117,14 @@ def dashboard_credit_gap_pct_sales(credit_gap: Any, net_sales: Any) -> float:
     return safe_div(credit_gap, net_sales, 0.0)
 
 
+def dashboard_pp_change(current_percent: Any, prior_percent: Any) -> float:
+    cur = _dashboard_optional_float(current_percent)
+    prior = _dashboard_optional_float(prior_percent)
+    if not np.isfinite(cur) or not np.isfinite(prior):
+        return float("nan")
+    return cur - prior
+
+
 def _shorten_product_name(product_name: Any, max_chars: int = 44) -> str:
     limit = max(4, int(max_chars or 44))
     text = short_product_label(product_name, max_chars=limit)
@@ -7427,6 +7435,97 @@ def build_dashboard_store_matrix(
     return pd.DataFrame(rows, columns=cols)
 
 
+def build_dashboard_store_weekly_metrics(
+    report_df: pd.DataFrame,
+    selected_store_codes: Sequence[str],
+) -> pd.DataFrame:
+    cols = [
+        "store", "week_start", "week_label", "net_sales", "prior_week_net_sales",
+        "sales_vs_prior_week_pct", "sales_vs_store_avg_pct", "units_sold", "prior_week_units",
+        "units_vs_prior_week_pct", "tickets", "real_margin_pct", "margin_change_pp",
+        "discount_pct", "gross_profit",
+    ]
+    if report_df is None or report_df.empty or "_store_abbr" not in report_df.columns or "_date" not in report_df.columns:
+        return pd.DataFrame(columns=cols)
+
+    tmp = report_df.copy()
+    tmp["_store_abbr"] = tmp["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+    selected = [str(s).upper().strip() for s in selected_store_codes if str(s).strip()]
+    if selected:
+        tmp = tmp[tmp["_store_abbr"].isin(selected)].copy()
+    else:
+        selected = order_store_codes(tmp["_store_abbr"].dropna().astype(str).unique().tolist())
+    tmp = tmp[tmp["_store_abbr"] != ""].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+
+    dt = pd.to_datetime(tmp["_date"], errors="coerce")
+    tmp = tmp.assign(__date=dt.dt.date)
+    tmp = tmp.dropna(subset=["__date"]).copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=cols)
+    tmp["week_start"] = tmp["__date"].apply(lambda d: d - timedelta(days=d.weekday()))
+
+    for col in ["_net", "_gross", "_qty", "_disc_total", "_profit_real"]:
+        if col not in tmp.columns:
+            tmp[col] = 0.0
+        tmp[col] = pd.to_numeric(tmp[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if "_tx_key" not in tmp.columns:
+        tmp["_tx_key"] = ""
+
+    weekly = tmp.groupby(["_store_abbr", "week_start"], as_index=False).agg(
+        net_sales=("_net", "sum"),
+        gross_sales=("_gross", "sum"),
+        units_sold=("_qty", "sum"),
+        tickets=("_tx_key", "nunique"),
+        discount=("_disc_total", "sum"),
+        gross_profit=("_profit_real", "sum"),
+    )
+    if weekly.empty:
+        return pd.DataFrame(columns=cols)
+    ordered_stores = order_store_codes(selected or weekly["_store_abbr"].dropna().astype(str).unique().tolist())
+    first_week = min(tmp["week_start"])
+    last_week = max(tmp["week_start"])
+    all_weeks: List[date] = []
+    cur_week = first_week
+    while cur_week <= last_week:
+        all_weeks.append(cur_week)
+        cur_week = cur_week + timedelta(days=7)
+    full_grid = pd.DataFrame(
+        [(store, week) for store in ordered_stores for week in all_weeks],
+        columns=["_store_abbr", "week_start"],
+    )
+    weekly = full_grid.merge(weekly, on=["_store_abbr", "week_start"], how="left")
+    for col in ["net_sales", "gross_sales", "units_sold", "tickets", "discount", "gross_profit"]:
+        weekly[col] = pd.to_numeric(weekly.get(col, 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    weekly["real_margin_pct"] = weekly["gross_profit"] / weekly["net_sales"].replace({0: np.nan})
+    approx_gross = (weekly["net_sales"] + weekly["discount"]).replace({0: np.nan})
+    weekly["discount_pct"] = np.where(
+        weekly["gross_sales"] > 0,
+        weekly["discount"] / weekly["gross_sales"].replace({0: np.nan}),
+        weekly["discount"] / approx_gross,
+    )
+    weekly = weekly.replace([np.inf, -np.inf], np.nan)
+
+    weekly["_rank"] = weekly["_store_abbr"].map(lambda s: STORE_ORDER_RANK.get(str(s).upper(), 999))
+    weekly = weekly.sort_values(["_rank", "_store_abbr", "week_start"], ascending=[True, True, True]).reset_index(drop=True)
+    grp = weekly.groupby("_store_abbr", sort=False)
+    weekly["prior_week_net_sales"] = grp["net_sales"].shift(1)
+    weekly["prior_week_units"] = grp["units_sold"].shift(1)
+    weekly["prior_week_margin_pct"] = grp["real_margin_pct"].shift(1)
+    weekly["sales_vs_prior_week_pct"] = weekly.apply(lambda r: pct_change(r["net_sales"], r["prior_week_net_sales"]), axis=1)
+    weekly["units_vs_prior_week_pct"] = weekly.apply(lambda r: pct_change(r["units_sold"], r["prior_week_units"]), axis=1)
+    weekly["__store_avg"] = grp["net_sales"].transform("mean")
+    weekly["sales_vs_store_avg_pct"] = weekly.apply(
+        lambda r: safe_div(float(r["net_sales"]) - float(r["__store_avg"]), r["__store_avg"], 0.0),
+        axis=1,
+    )
+    weekly["margin_change_pp"] = weekly.apply(lambda r: dashboard_pp_change(r["real_margin_pct"], r["prior_week_margin_pct"]), axis=1)
+    weekly["week_label"] = weekly["week_start"].apply(lambda d: f"{d:%b} {d.day}" if hasattr(d, "strftime") else str(d))
+    weekly = weekly.rename(columns={"_store_abbr": "store"})
+    return weekly[cols].reset_index(drop=True)
+
+
 def build_dashboard_category_mix(
     category_60: pd.DataFrame,
     inv_category: pd.DataFrame,
@@ -7630,6 +7729,7 @@ def build_dashboard_packet_data(
     )
     if not include_prior_data and not store_matrix.empty:
         store_matrix.loc[:, ["sales_vs_prior_pct", "units_vs_prior_pct"]] = np.nan
+    store_weekly = build_dashboard_store_weekly_metrics(report_df, selected_store_codes)
     category_mix = build_dashboard_category_mix(
         category_60,
         inv_category,
@@ -7651,6 +7751,7 @@ def build_dashboard_packet_data(
         "fast_movers": fast_movers,
         "slow_movers": slow_movers,
         "store_matrix": store_matrix,
+        "store_weekly_metrics": store_weekly,
         "category_mix": category_mix,
         "credit_margin_summary": snapshot.copy(),
         "brand_status": status,
@@ -7666,6 +7767,7 @@ def write_dashboard_cache(cache_dir: Path, dashboard_data: Dict[str, Any], logge
         "dashboard_fast_movers.csv": dashboard_data.get("fast_movers", pd.DataFrame()),
         "dashboard_slow_movers.csv": dashboard_data.get("slow_movers", pd.DataFrame()),
         "dashboard_store_matrix.csv": dashboard_data.get("store_matrix", pd.DataFrame()),
+        "dashboard_store_weekly_metrics.csv": dashboard_data.get("store_weekly_metrics", pd.DataFrame()),
         "dashboard_category_mix.csv": dashboard_data.get("category_mix", pd.DataFrame()),
         "dashboard_credit_margin_summary.csv": dashboard_data.get("credit_margin_summary", pd.DataFrame()),
     }
@@ -8032,11 +8134,12 @@ def build_margin_truth_page_v2(
     if daily_60 is not None and not daily_60.empty:
         flows.append(Spacer(1, 0.07 * inch))
         flows.append(_chart_image(chart_daily_brand_sales(daily_60, "Daily Brand Sales"), 7.35 * inch, 2.05 * inch))
-    if str(mode or "").lower() == "quick":
+    if str(mode or "").lower() in {"quick", "standard"}:
         flows.append(Spacer(1, 0.08 * inch))
-        flows.append(Paragraph("Detailed Brand Asks", theme["small_v2"]))
+        flows.append(Paragraph("What The Brand Can Do Better", theme["small_v2"]))
+        action_top_n = 5 if str(mode or "").lower() == "quick" else 3
         flows.append(build_premium_table(
-            _premium_action_rows(action_items or [], top_n=5),
+            _premium_action_rows(action_items or [], top_n=action_top_n),
             [0.55 * inch, 0.85 * inch, 1.35 * inch, 2.65 * inch, 1.1 * inch, 0.75 * inch],
             status_cols=[0],
             money_cols=[5],
@@ -8083,10 +8186,14 @@ def build_store_scorecards_page_v2(story: List[Any], store_credit_scorecard: pd.
     flowables.append(build_premium_table(rows, [0.42 * inch, 0.72 * inch, 0.42 * inch, 0.52 * inch, 0.52 * inch, 0.66 * inch, 0.58 * inch, 0.68 * inch, 0.48 * inch, 0.68 * inch, 0.85 * inch], money_cols=[1, 5, 7], pct_cols=[3, 4, 6], status_cols=[9]))
     if len(rows) <= 1:
         flowables.append(Paragraph("No store-level rows were available for this brand/window.", theme["small_v2"]))
-    _section_page(story, "Store Scorecards", flowables)
+    _section_page(story, "Store Scorecards", flowables, page_break=False)
 
 
-def build_location_performance_overview_v2(story: List[Any], store_sales_packets: Dict[str, Dict[str, Any]]) -> None:
+def build_location_performance_overview_v2(
+    story: List[Any],
+    store_sales_packets: Dict[str, Dict[str, Any]],
+    store_weekly_metrics: Optional[pd.DataFrame] = None,
+) -> None:
     if not store_sales_packets:
         return
     flows: List[Any] = [
@@ -8133,7 +8240,7 @@ def build_product_category_page_v2(story: List[Any], category_60: pd.DataFrame, 
         build_premium_table(product_rows, [2.55 * inch, 0.8 * inch, 0.78 * inch, 0.52 * inch, 0.7 * inch, 0.65 * inch, 0.55 * inch], money_cols=[2], pct_cols=[4, 5]),
         Spacer(1, 0.06 * inch),
         _panel("PRODUCT SIGNALS", insights[:3], width=7.45 * inch),
-    ])
+    ], page_break=False)
 
 
 def build_inventory_sellthrough_page_v2(story: List[Any], inv_overview: Dict[str, float], inventory_risk: pd.DataFrame, fast_movers: pd.DataFrame, slow_movers: pd.DataFrame, mode: str) -> None:
@@ -8157,9 +8264,80 @@ def build_inventory_sellthrough_page_v2(story: List[Any], inv_overview: Dict[str
         Paragraph("Fast Movers", build_brand_packet_theme_v2()["small_v2"]),
         build_premium_table(fast_rows, [1.95 * inch, 0.7 * inch, 0.45 * inch, 0.55 * inch, 0.65 * inch, 0.5 * inch, 0.85 * inch], money_cols=[1], pct_cols=[4]),
         Spacer(1, 0.07 * inch),
+        CondPageBreak(3.0 * inch),
         Paragraph("Slow Movers / Inventory Risk", build_brand_packet_theme_v2()["small_v2"]),
         build_premium_table(slow_rows, [1.95 * inch, 0.7 * inch, 0.45 * inch, 0.55 * inch, 0.65 * inch, 0.5 * inch, 0.85 * inch], money_cols=[1], pct_cols=[4]),
-    ])
+    ], page_break=False)
+
+
+def _store_weekly_card(row: Dict[str, Any], width: float = 2.42 * inch) -> Table:
+    theme = build_brand_packet_theme_v2()
+    delta = _dashboard_optional_float(row.get("sales_vs_prior_week_pct"))
+    if not np.isfinite(delta):
+        accent = "#7B8794"
+    elif delta >= 0.10:
+        accent = "#2F6B5D"
+    elif delta <= -0.10:
+        accent = "#B54034"
+    else:
+        accent = "#D6B800"
+    week = str(row.get("week_label", "") or row.get("week_start", "") or "Week")
+    data = [
+        [_p(week.upper(), theme["card_label"])],
+        [_p(money0(row.get("net_sales", 0.0)), theme["card_value"])],
+        [_p(
+            f"vs prior {_format_delta(row.get('sales_vs_prior_week_pct'), row.get('net_sales', 0.0), row.get('prior_week_net_sales', 0.0))}"
+            f" | vs avg {_dashboard_format_pct(row.get('sales_vs_store_avg_pct', 0.0))}",
+            theme["card_note"],
+        )],
+        [_p(
+            f"Units {int0(row.get('units_sold', 0.0))}"
+            f" ({_format_delta(row.get('units_vs_prior_week_pct'), row.get('units_sold', 0.0), row.get('prior_week_units', 0.0))})",
+            theme["card_note"],
+        )],
+        [_p(
+            f"Margin {_dashboard_format_pct(row.get('real_margin_pct'))}"
+            f" ({_dashboard_format_pp_delta(row.get('margin_change_pp'))}) | Disc {_dashboard_format_pct(row.get('discount_pct'))}",
+            theme["card_note"],
+        )],
+    ]
+    card = Table(data, colWidths=[width], rowHeights=[0.15 * inch, 0.22 * inch, 0.16 * inch, 0.16 * inch, 0.17 * inch])
+    card.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F7F8FA")),
+        ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor("#D7DEE0")),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.4, colors.HexColor(accent)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+    ]))
+    return card
+
+
+def _store_weekly_card_grid(store_weekly: pd.DataFrame) -> Table:
+    if store_weekly is None or store_weekly.empty:
+        return _panel("WEEKLY SALES TREND", ["No weekly store metrics available."], width=7.45 * inch)
+    work = store_weekly.copy()
+    if "week_start" in work.columns:
+        work["week_start"] = pd.to_datetime(work["week_start"], errors="coerce")
+    work = work.sort_values("week_start", ascending=True)
+    cards = [_store_weekly_card(r.to_dict()) for _, r in work.iterrows()]
+    rows: List[List[Any]] = []
+    for i in range(0, len(cards), 3):
+        row = cards[i:i + 3]
+        while len(row) < 3:
+            row.append("")
+        rows.append(row)
+    grid = Table(rows, colWidths=[2.48 * inch] * 3, hAlign="LEFT")
+    grid.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return grid
 
 
 def build_store_detail_page_v2(story: List[Any], abbr: str, pkt: Dict[str, Any], mode: str, credit_summary: Dict[str, Any]) -> None:
@@ -8168,6 +8346,7 @@ def build_store_detail_page_v2(story: List[Any], abbr: str, pkt: Dict[str, Any],
     metrics = wm.get("report", {}) or {}
     inv = pkt.get("inventory", {}) or {}
     daily = pkt.get("daily", pd.DataFrame())
+    weekly = pkt.get("weekly_metrics", pd.DataFrame())
     category = pkt.get("category_60", pd.DataFrame())
     product = pkt.get("product_60", pd.DataFrame())
     inv_products = pkt.get("inventory_products", pd.DataFrame())
@@ -8192,6 +8371,9 @@ def build_store_detail_page_v2(story: List[Any], abbr: str, pkt: Dict[str, Any],
     top_flowables: List[Any] = [
         _metric_grid(cards, cols=6),
         Spacer(1, 0.06 * inch),
+        Paragraph("Weekly Sales Trend", theme["small_v2"]),
+        _store_weekly_card_grid(weekly),
+        Spacer(1, 0.06 * inch),
         trend_chart,
         Spacer(1, 0.05 * inch),
         Table([
@@ -8203,7 +8385,7 @@ def build_store_detail_page_v2(story: List[Any], abbr: str, pkt: Dict[str, Any],
         Spacer(1, 0.06 * inch),
         _panel("STORE ASK", [f"{abbr}: {_store_needed_from_brand(pd.Series({'status': 'Watch', 'discount_rate': metrics.get('discount_rate', 0.0), 'days_of_supply': inv.get('days_of_supply', 0.0), 'margin_real': metrics.get('margin_real', 0.0)}))}."], width=7.45 * inch),
     ]
-    _section_page(story, f"{abbr} Store Detail", top_flowables)
+    _section_page(story, f"{abbr} Store Detail", top_flowables, page_break=False)
 
     detail_flowables: List[Any] = [
         Paragraph("Top Product Groups", theme["small_v2"]),
@@ -8273,6 +8455,7 @@ def build_brand_packet_premium_pdf(
     store_sales_packets: Dict[str, Dict[str, Any]],
     missing_sales_stores: Sequence[str],
     missing_catalog_stores: Sequence[str],
+    store_weekly_metrics: Optional[pd.DataFrame] = None,
     credit_summary: Optional[Dict[str, Any]] = None,
     credit_reconciliation: Optional[pd.DataFrame] = None,
     action_items: Optional[Sequence[Dict[str, Any]]] = None,
@@ -8311,10 +8494,10 @@ def build_brand_packet_premium_pdf(
     story: List[Any] = []
     build_cover_dashboard_v2(story, brand, start_day, end_day, options, order_store_codes(list(store_sales_packets.keys()) or list(store_60.get("_store_abbr", []))), generated_at, report_metrics, credit_summary, inv_overview, inventory_risk, action_items, health_score, health_status, health_reason, meeting_ask)
     build_margin_truth_page_v2(story, credit_summary, credit_reconciliation, meeting_ask, mode, action_items=action_items, daily_60=daily_60)
-    if mode != "quick":
+    if mode == "deep":
         build_brand_action_page_v2(story, action_items, mode)
     build_store_scorecards_page_v2(story, store_credit_scorecard, mode)
-    build_location_performance_overview_v2(story, store_sales_packets)
+    build_location_performance_overview_v2(story, store_sales_packets, store_weekly_metrics)
     build_product_category_page_v2(story, category_60, product_60, mode)
     build_inventory_sellthrough_page_v2(story, inv_overview, inventory_risk, fast_movers, slow_movers, mode)
     if mode in {"standard", "deep"} and options.include_store_sections:
@@ -8520,6 +8703,52 @@ def _dashboard_store_rows(store_matrix: pd.DataFrame) -> List[List[Any]]:
     return rows
 
 
+def _dashboard_format_pp_delta(value: Any) -> str:
+    val = _dashboard_optional_float(value)
+    if not np.isfinite(val):
+        return "n/a"
+    return osnap.pp1(val) if hasattr(osnap, "pp1") else f"{val * 100.0:+.1f}pp"
+
+
+def _dashboard_format_pct(value: Any) -> str:
+    val = _dashboard_optional_float(value)
+    if not np.isfinite(val):
+        return "n/a"
+    return pct1(val)
+
+
+def _dashboard_store_weekly_rows(store_weekly: pd.DataFrame) -> List[List[Any]]:
+    rows = [[
+        "Store", "Week", "Sales", "vs PW", "vs Avg", "Units", "Units vs PW",
+        "Real Margin", "Margin +/-", "Disc", "Tickets",
+    ]]
+    if store_weekly is not None and not store_weekly.empty:
+        work = store_weekly.copy()
+        if "store" not in work.columns:
+            work["store"] = ""
+        work["_rank"] = work["store"].fillna("").astype(str).str.upper().map(lambda s: STORE_ORDER_RANK.get(s, 999))
+        if "week_start" in work.columns:
+            work["week_start"] = pd.to_datetime(work["week_start"], errors="coerce")
+        work = work.sort_values(["_rank", "store", "week_start"], ascending=[True, True, True])
+        for _, r in work.iterrows():
+            rows.append([
+                str(r.get("store", "")),
+                str(r.get("week_label", "")),
+                money0(r.get("net_sales", 0.0)),
+                _format_delta(r.get("sales_vs_prior_week_pct"), r.get("net_sales", 0.0), r.get("prior_week_net_sales", 0.0)),
+                _dashboard_format_pct(r.get("sales_vs_store_avg_pct", 0.0)),
+                int0(r.get("units_sold", 0.0)),
+                _format_delta(r.get("units_vs_prior_week_pct"), r.get("units_sold", 0.0), r.get("prior_week_units", 0.0)),
+                _dashboard_format_pct(r.get("real_margin_pct")),
+                _dashboard_format_pp_delta(r.get("margin_change_pp")),
+                _dashboard_format_pct(r.get("discount_pct")),
+                int0(r.get("tickets", 0.0)),
+            ])
+    if len(rows) == 1:
+        rows.append(["No weekly store metrics available."] + [""] * 10)
+    return rows
+
+
 def _dashboard_category_rows(category_mix: pd.DataFrame) -> List[List[Any]]:
     rows = [["Category", "Sales", "Share", "Units", "Margin", "Disc", "Inv $", "DOS", "Sell", "Top Product", "Action"]]
     if category_mix is not None and not category_mix.empty:
@@ -8688,6 +8917,17 @@ def build_brand_packet_dashboard_pdf(
         status_cols=[0, 13],
     ))
     _dashboard_section(story, "Store Performance Matrix", store_flows)
+
+    store_weekly = dashboard_data.get("store_weekly_metrics", pd.DataFrame())
+    _dashboard_section(story, "Store Week-by-Week Trends", [
+        build_premium_table(
+            _dashboard_store_weekly_rows(store_weekly),
+            [0.55 * inch, 0.82 * inch, 0.96 * inch, 0.72 * inch, 0.72 * inch, 0.60 * inch, 0.78 * inch, 0.78 * inch, 0.72 * inch, 0.62 * inch, 0.58 * inch],
+            money_cols=[2],
+            pct_cols=[3, 4, 6, 7, 8, 9],
+            status_cols=[0],
+        ),
+    ])
 
     category_mix = dashboard_data.get("category_mix", pd.DataFrame())
     chart_cat = BytesIO()
@@ -9565,6 +9805,7 @@ def build_brand_packet_quick_pdf(
     store_sales_packets: Dict[str, Dict[str, Any]],
     missing_sales_stores: Sequence[str],
     missing_catalog_stores: Sequence[str],
+    store_weekly_metrics: Optional[pd.DataFrame] = None,
     credit_summary: Optional[Dict[str, Any]] = None,
     credit_reconciliation: Optional[pd.DataFrame] = None,
     action_items: Optional[Sequence[Dict[str, Any]]] = None,
@@ -11134,6 +11375,7 @@ def generate_brand_meeting_packet(
 
     daily_60 = summarize_daily(report_df)
     weekly_60 = summarize_weekly(report_df)
+    store_weekly_metrics = build_dashboard_store_weekly_metrics(report_df, selected_store_codes)
 
     kickback_rules = summarize_kickback_rules(report_df)
 
@@ -11257,6 +11499,9 @@ def generate_brand_meeting_packet(
             "inventory": inv_metrics,
             "inventory_products": s_inv_products,
             "daily": summarize_daily(s_report),
+            "weekly_metrics": store_weekly_metrics[
+                store_weekly_metrics.get("store", pd.Series(dtype=str)).fillna("").astype(str).str.upper() == str(abbr).upper()
+            ].copy() if store_weekly_metrics is not None and not store_weekly_metrics.empty else pd.DataFrame(),
             "category_60": summarize_group(s_report, "category_normalized"),
             "category_14": summarize_group(s_last14, "category_normalized"),
             "product_60": s_product_60,
@@ -11455,6 +11700,7 @@ def generate_brand_meeting_packet(
         _credit_source_summary(credit_reconciliation).to_csv(p_credit_source, index=False)
         pd.DataFrame(action_items).to_csv(p_actions, index=False)
         store_credit_scorecard.to_csv(p_store_credit, index=False)
+        store_weekly_metrics.to_csv(paths.cache_dir / "dashboard_store_weekly_metrics.csv", index=False)
 
         # DOS QA files: shows the trend keys and how sales/inventory align.
         sales_q_grp = pd.DataFrame(columns=["supply_base_key", "supply_merge_key", "units_sold"])
@@ -11561,6 +11807,7 @@ def generate_brand_meeting_packet(
             inv_category=inv_category,
             inv_store=inv_store,
             store_sales_packets=store_sales_packets,
+            store_weekly_metrics=store_weekly_metrics,
             missing_sales_stores=missing_sales_stores,
             missing_catalog_stores=missing_catalog_stores,
             credit_summary=credit_summary,

@@ -169,10 +169,104 @@ class BuildBrandOrderSectionsTests(unittest.TestCase):
         self.assertEqual(len(order_table), 2)
         first_row = order_table.iloc[0]
         self.assertEqual(first_row["Available"], 0)
-        self.assertEqual(first_row["Par Level"], "")
+        self.assertEqual(order_table["Par Level"].tolist(), [5, 5])
         self.assertEqual(first_row["Units Sold 7d"], 0)
         self.assertEqual(first_row["Units Sold 14d"], 2)
         self.assertEqual(first_row["Units Sold 30d"], 4)
+
+    def test_calculated_par_levels_round_up_to_five_unit_increments(self):
+        base_rows = [
+            {
+                "Brand": "710 Labs",
+                "Category": "Concentrate",
+                "Product Name": "710 | LRO Badder 1g | Banana Punch",
+                "SKU": "SKU-1",
+                "Quantity on Hand": 0,
+                "Quantity Sold": 0,
+                "Last Wholesale Cost": 22.5,
+                "Price": 57,
+            },
+            {
+                "Brand": "710 Labs",
+                "Category": "Concentrate",
+                "Product Name": "710 | LRO Badder 1g | Do Lato",
+                "SKU": "SKU-2",
+                "Quantity on Hand": 4,
+                "Quantity Sold": 2,
+                "Last Wholesale Cost": 22.5,
+                "Price": 57,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.write_window(tmpdir, 7, base_rows)
+            rows_14d = [dict(row, **{"Quantity Sold": qty}) for row, qty in zip(base_rows, [2, 2])]
+            rows_30d = [dict(row, **{"Quantity Sold": qty}) for row, qty in zip(base_rows, [4, 5])]
+            self.write_window(tmpdir, 14, rows_14d)
+            self.write_window(tmpdir, 30, rows_30d)
+
+            sections = build_brand_order_sections(
+                tmpdir,
+                ["710 Labs"],
+                store_code="MV",
+                include_par_levels=True,
+            )
+
+        order_table = sections["Order"]["table"]
+        self.assertEqual(order_table["Par Level"].tolist(), [5, 5])
+
+    def test_can_explicitly_blank_par_levels(self):
+        rows = [
+            {
+                "Brand": "710 Labs",
+                "Category": "Concentrate",
+                "Product Name": "710 | LRO Badder 1g | Banana Punch",
+                "SKU": "SKU-1",
+                "Quantity on Hand": 0,
+                "Quantity Sold": 4,
+                "Last Wholesale Cost": 22.5,
+                "Price": 57,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.write_window(tmpdir, 14, rows)
+            sections = build_brand_order_sections(
+                tmpdir,
+                ["710 Labs"],
+                store_code="MV",
+                include_par_levels=False,
+            )
+
+        order_table = sections["Order"]["table"]
+        self.assertEqual(order_table["Par Level"].tolist(), [""])
+
+    def test_stockout_window_does_not_drag_par_level_down(self):
+        row = {
+            "Brand": "710 Labs",
+            "Category": "Concentrate",
+            "Product Name": "710 | LRO Badder 1g | Sold Out Again",
+            "SKU": "SKU-STOCKOUT",
+            "Quantity on Hand": 0,
+            "Quantity Sold": 0,
+            "Last Wholesale Cost": 22.5,
+            "Price": 57,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.write_window(tmpdir, 7, [row])
+            self.write_window(tmpdir, 14, [dict(row, **{"Quantity Sold": 10})])
+            self.write_window(tmpdir, 30, [dict(row, **{"Quantity Sold": 20})])
+
+            sections = build_brand_order_sections(
+                tmpdir,
+                ["710 Labs"],
+                store_code="MV",
+                include_par_levels=True,
+            )
+
+        order_table = sections["Order"]["table"]
+        self.assertEqual(order_table.iloc[0]["Par Level"], 15)
 
 
 if __name__ == "__main__":

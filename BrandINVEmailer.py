@@ -928,6 +928,7 @@ def process_file(file_path, output_directory, selected_brands):
                     INPUT_DIRECTORY,
                     brand_aliases=[brand_name],
                     store_code=store_code,
+                    include_par_levels=True,
                 )
                 with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
                     brand_data.to_excel(writer, index=False, sheet_name="Available")

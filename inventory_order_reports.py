@@ -75,6 +75,7 @@ SIMPLE_ORDER_PAR_WEIGHTS = {
     14: 0.3,
     30: 0.2,
 }
+SIMPLE_ORDER_PAR_INCREMENT = 5
 SIMPLE_ORDER_HEADER_FILL = PatternFill(
     start_color="1F4E78",
     end_color="1F4E78",
@@ -337,6 +338,16 @@ def _ceil_non_negative(value):
     return max(0, int(math.ceil(float(value))))
 
 
+def _ceil_to_increment(value, increment=SIMPLE_ORDER_PAR_INCREMENT):
+    if pd.isna(value):
+        return 0
+    numeric = max(0.0, _safe_float(value, 0.0))
+    increment = max(1, int(increment or 1))
+    if numeric <= 0:
+        return 0
+    return int(math.ceil(numeric / increment) * increment)
+
+
 def _safe_float(value, default=0.0):
     try:
         if pd.isna(value):
@@ -504,19 +515,41 @@ def _estimate_simple_par_level(available, units_sold_7d, units_sold_14d, units_s
         return 0
 
     target_days = SIMPLE_ORDER_TARGET_COVER_DAYS
+    sold_by_window = {
+        7: units_sold_7d,
+        14: units_sold_14d,
+        30: units_sold_30d,
+    }
     projected = {
         7: units_sold_7d * (target_days / 7.0),
         14: units_sold_14d * (target_days / 14.0),
         30: units_sold_30d * (target_days / 30.0),
     }
-    weight_total = sum(SIMPLE_ORDER_PAR_WEIGHTS.values()) or 1.0
+
+    stockout_likely = available <= 0 and any(units > 0 for units in sold_by_window.values())
+    weighted_windows = [
+        days
+        for days in SIMPLE_ORDER_PAR_WEIGHTS
+        if not stockout_likely or sold_by_window.get(days, 0.0) > 0
+    ]
+    weight_total = sum(SIMPLE_ORDER_PAR_WEIGHTS.get(days, 0.0) for days in weighted_windows) or 1.0
     projected_target = sum(
         projected[days] * SIMPLE_ORDER_PAR_WEIGHTS.get(days, 0.0)
-        for days in SIMPLE_ORDER_PAR_WEIGHTS
+        for days in weighted_windows
     ) / weight_total
 
-    if units_sold_7d <= 0 and units_sold_14d <= 0 and units_sold_30d > 0:
+    if not stockout_likely and units_sold_7d <= 0 and units_sold_14d <= 0 and units_sold_30d > 0:
         projected_target *= 0.6
+
+    if stockout_likely:
+        # Empty current stock censors demand; preserve the strongest available
+        # sales window instead of letting a no-inventory week drag par down.
+        active_projections = [
+            projected[days]
+            for days, units in sold_by_window.items()
+            if units > 0
+        ]
+        projected_target = max([projected_target, *active_projections])
 
     projected_floor = max(projected_target, projected[14])
     if projected_floor > 0:
@@ -530,7 +563,7 @@ def _estimate_simple_par_level(available, units_sold_7d, units_sold_14d, units_s
         uplift = min(0.25, max(0.0, (1.0 - coverage_ratio) * sell_pressure * 0.25))
         projected_target *= 1.0 + uplift
 
-    return _ceil_non_negative(projected_target)
+    return _ceil_to_increment(projected_target)
 
 
 def _quantity_sold_by_key(df):
@@ -544,7 +577,7 @@ def _quantity_sold_by_key(df):
     return work.groupby("_order_join_key")["_quantity_sold"].sum().to_dict()
 
 
-def build_simple_order_table(window_frames, include_store_column=False, store_code=""):
+def build_simple_order_table(window_frames, include_store_column=False, store_code="", include_par_levels=True):
     prepared_frames = []
     for days in sorted(window_frames, reverse=True):
         frame = window_frames.get(days)
@@ -582,12 +615,17 @@ def build_simple_order_table(window_frames, include_store_column=False, store_co
         units_14d = _safe_float(sold_by_window.get(14, {}).get(key, 0.0), 0.0)
         units_30d = _safe_float(sold_by_window.get(30, {}).get(key, 0.0), 0.0)
         available = _safe_float(row.get(qoh_col), 0.0) if qoh_col else 0.0
+        par_level = (
+            _estimate_simple_par_level(available, units_7d, units_14d, units_30d)
+            if include_par_levels
+            else ""
+        )
         result_row = {
             "Brand": _safe_display_text(row.get(brand_col)) if brand_col else "",
             "Category": _safe_display_text(row.get(category_col)) if category_col else "",
             "Product": _safe_display_text(row.get(product_col)) if product_col else "",
             "Available": _rounded_display_number(available),
-            "Par Level": "",
+            "Par Level": par_level,
             "Cost": round(_safe_float(row.get(cost_col), 0.0), 2) if cost_col else 0.0,
             "Price": round(_safe_float(row.get(price_col), 0.0), 2) if price_col else 0.0,
             "Units Sold 7d": _rounded_display_number(units_7d),
@@ -1271,7 +1309,7 @@ def format_order_sheet(ws):
     return True
 
 
-def build_brand_order_sections(order_reports_dir, brand_aliases, store_code=None):
+def build_brand_order_sections(order_reports_dir, brand_aliases, store_code=None, include_par_levels=True):
     sections = OrderedDict()
     discovered = discover_order_report_files(order_reports_dir)
     wanted_store = canonical_store_code(store_code) if store_code else ""
@@ -1319,6 +1357,7 @@ def build_brand_order_sections(order_reports_dir, brand_aliases, store_code=None
             window_frames,
             include_store_column=include_store_column,
             store_code=store,
+            include_par_levels=include_par_levels,
         )
         if not table.empty:
             table_frames.append(table)

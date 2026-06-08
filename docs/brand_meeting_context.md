@@ -93,6 +93,8 @@ Dashboard / Easy Read single-brand packet:
 .venv/bin/python brand_meeting_packet.py --brand "Sol Flora" --stores MV,LM,SV,LG,NC,WP --no-email --packet-layout dashboard --no-appendix
 ```
 
+Classic Standard packets include compact weekly sales cards inside each store detail section.
+
 Owner-facing top-brands review:
 
 ```bash
@@ -149,6 +151,7 @@ Useful cache outputs include:
 - `dashboard_fast_movers.csv`
 - `dashboard_slow_movers.csv`
 - `dashboard_store_matrix.csv`
+- `dashboard_store_weekly_metrics.csv`
 - `dashboard_category_mix.csv`
 - `dashboard_credit_margin_summary.csv`
 - `owner_top_brands_scorecard.csv`
