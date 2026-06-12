@@ -566,7 +566,7 @@ DEFAULT_BRAND_CRITERIA = {
     'Cannabiotix (CBX)': {
            'days': ['Tuesday'],
            'discount': 0.5,
-           'kickback': 0.3,
+           'kickback': 0.25,
             'excluded_phrases': ['14G'],
            'brands': ['CBX |']},
     'Heirbloom': {
