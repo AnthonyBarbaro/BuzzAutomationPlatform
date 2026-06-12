@@ -6,7 +6,8 @@
     "LM",
     "WP",
     "SV",
-    "NC"
+    "NC",
+    "SE"
   ],
   "spreadsheet_url_env": "WEEKLY_STORE_ORDERING_SHEET_URL",
   "spreadsheet_url_file": "weekly_store_ordering_sheet_url.txt",

@@ -66,6 +66,7 @@ from brand_meeting_insights import (
 from brand_meeting_targets import get_brand_targets, load_targets
 from dutchie_api_reports import (
     DEFAULT_API_WORKERS,
+    STORE_CODES,
     canonical_env_map as dutchie_canonical_env_map,
     create_session as dutchie_create_session,
     local_date_range_to_utc_strings as dutchie_local_date_range_to_utc_strings,
@@ -593,10 +594,11 @@ def _changed_files_after(folder: Path, before: Dict[str, Tuple[int, float]], suf
 
 
 def _store_name_from_abbr(abbr: str) -> str:
+    code_text = str(abbr or "").upper().strip()
     for store_name, code in store_abbr_map.items():
-        if code == abbr:
+        if str(code or "").upper().strip() == code_text:
             return store_name
-    return abbr
+    return STORE_CODES.get(code_text, abbr)
 
 
 def _abbr_from_store_name(store_name: str) -> Optional[str]:

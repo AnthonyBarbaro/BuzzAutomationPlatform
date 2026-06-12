@@ -17,8 +17,8 @@ from dutchie_api_reports import (
 class DutchieApiReportsTests(unittest.TestCase):
     def test_parse_store_codes_supports_spaces_and_commas(self):
         self.assertEqual(
-            parse_store_codes(["mv, lg", "lm", "MV"]),
-            ["MV", "LG", "LM"],
+            parse_store_codes(["mv, lg", "lm", "se", "MV"]),
+            ["MV", "LG", "LM", "SE"],
         )
 
     def test_parse_report_names_deduplicates_values(self):

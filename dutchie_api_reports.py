@@ -49,6 +49,7 @@ STORE_CODES = OrderedDict(
         ("WP", "Wildomar Palomar"),
         ("SV", "Sorrento Valley"),
         ("NC", "National City"),
+        ("SE", "Santee"),
     ]
 )
 
