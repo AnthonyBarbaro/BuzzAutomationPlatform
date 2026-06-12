@@ -1460,7 +1460,7 @@ def _resolve_requested_stores(env_file: str, raw_store_args: list[str] | None) -
     requested_store_codes = parse_store_codes(raw_store_args) or configured_store_codes
     if not requested_store_codes:
         raise SystemExit(
-            "No Dutchie stores were selected or discovered. Add store keys to .env or pass --stores mv lg lm wp sv nc."
+            "No Dutchie stores were selected or discovered. Add store keys to .env or pass --stores mv lg lm wp sv nc se."
         )
 
     store_keys = resolve_store_keys(env_map, requested_store_codes)
@@ -1489,7 +1489,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stores",
         nargs="*",
-        help="Store codes to include, for example: mv lg lm wp sv nc",
+        help="Store codes to include, for example: mv lg lm wp sv nc se",
     )
     parser.add_argument(
         "--timezone",

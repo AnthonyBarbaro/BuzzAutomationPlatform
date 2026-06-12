@@ -708,7 +708,7 @@ def parse_args():
     parser.add_argument(
         "--stores",
         nargs="*",
-        help="Optional list of store codes like MV LG LM.",
+        help="Optional list of store codes like MV LG LM SE.",
     )
     parser.add_argument(
         "--workers",

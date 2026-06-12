@@ -911,9 +911,23 @@ def print_unknown_vendors(brand: str, criteria: dict, dataframes: list):
             files_list = ", ".join(sorted(files))
             print(f"   - {v}: {files_list}")
         print(f"👉 Consider adding to brand_criteria['{brand}']['vendors']\n")
-DEFAULT_STORES = ["MV", "LM", "SV", "LG", "NC", "WP"]
+DEFAULT_STORES = ["MV", "LM", "SV", "LG", "NC", "WP", "SE"]
+STORE_LABELS = {
+    "MV": "Mission Valley",
+    "LM": "La Mesa",
+    "SV": "Sorrento Valley",
+    "LG": "Lemon Grove",
+    "NC": "National City",
+    "WP": "Wildomar Palomar",
+    "SE": "Santee",
+}
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 ALL_DAYS_SET = set(DAY_ORDER)
+
+
+def store_label_for_code(store_code: str) -> str:
+    code = str(store_code or "").upper().strip()
+    return STORE_LABELS.get(code, code)
 
 def normalize_rules(criteria):
     """
@@ -1207,17 +1221,10 @@ def run_deals_reports(
                     os.remove(dest_path)
                 shutil.move(full_path, dest_path)
 
-    # Read store files (process_file already returns empty DF if missing)
-    mv_data = process_file("files/salesMV.xlsx")
-    lm_data = process_file("files/salesLM.xlsx")
-    sv_data = process_file("files/salesSV.xlsx")
-    lg_data = process_file("files/salesLG.xlsx")
-    nc_data = process_file("files/salesNC.xlsx")
-    wp_data = process_file("files/salesWP.xlsx")
-
+    # Read store files (process_file already returns empty DF if missing).
     store_data = {
-        "MV": mv_data, "LM": lm_data, "SV": sv_data,
-        "LG": lg_data, "NC": nc_data, "WP": wp_data
+        store_code: process_file(f"files/sales{store_code}.xlsx")
+        for store_code in DEFAULT_STORES
     }
 
     consolidated_summary = []
@@ -1242,7 +1249,7 @@ def run_deals_reports(
                 print_unknown_vendors(
                     brand,
                     {"vendors": list(_dbg_vendors), "brands": list(_dbg_brands), "days": list(_dbg_days)},
-                    [mv_data, lm_data, sv_data, lg_data, nc_data, wp_data],
+                    list(store_data.values()),
                 )
         except Exception:
             pass
@@ -1250,30 +1257,22 @@ def run_deals_reports(
         # --- NEW: apply multiple rules per brand and combine into ONE report ---
         brand_store_data, rule_data, rules = build_brand_store_data(brand, criteria, store_data)
 
-
-        mv_brand_data = brand_store_data["MV"]
-        lm_brand_data = brand_store_data["LM"]
-        sv_brand_data = brand_store_data["SV"]
-        lg_brand_data = brand_store_data["LG"]
-        nc_brand_data = brand_store_data["NC"]
-        wp_brand_data = brand_store_data["WP"]
+        brand_store_data = {
+            store_code: brand_store_data.get(store_code, pd.DataFrame())
+            for store_code in DEFAULT_STORES
+        }
 
         print(
             f"DEBUG: {brand} - After rule filtering => "
-            f"MV: {mv_brand_data.shape}, LM: {lm_brand_data.shape}, "
-            f"SV: {sv_brand_data.shape}, LG: {lg_brand_data.shape}, "
-            f"NC: {nc_brand_data.shape}, WP: {wp_brand_data.shape}"
+            + ", ".join(f"{store_code}: {frame.shape}" for store_code, frame in brand_store_data.items())
         )
 
-        if (
-            mv_brand_data.empty and lm_brand_data.empty and sv_brand_data.empty and
-            lg_brand_data.empty and nc_brand_data.empty and wp_brand_data.empty
-        ):
+        if all(frame.empty for frame in brand_store_data.values()):
             print(f"DEBUG: No data remains for brand '{brand}'. Skipping.")
             continue
 
         # ---- Date range across all stores used for this brand ----
-        store_dfs = [mv_brand_data, lm_brand_data, sv_brand_data, lg_brand_data, nc_brand_data, wp_brand_data]
+        store_dfs = list(brand_store_data.values())
         possible_starts = [
             df["order time"].min()
             for df in store_dfs
@@ -1318,15 +1317,12 @@ def run_deals_reports(
         else:
             want_units = any(bool(r.get("include_units", False)) for r in rules)
 
-        mv_summary = build_summary(mv_brand_data, "Mission Valley", include_units=want_units)
-        lm_summary = build_summary(lm_brand_data, "La Mesa", include_units=want_units)
-        sv_summary = build_summary(sv_brand_data, "Sorrento Valley", include_units=want_units)
-        lg_summary = build_summary(lg_brand_data, "Lemon Grove", include_units=want_units)
-        nc_summary = build_summary(nc_brand_data, "National City", include_units=want_units)
-        wp_summary = build_summary(wp_brand_data, "Wildomar Palomar", include_units=want_units)
-
+        summary_frames = [
+            build_summary(frame, store_label_for_code(store_code), include_units=want_units)
+            for store_code, frame in brand_store_data.items()
+        ]
         brand_summary = pd.concat(
-            [mv_summary, lm_summary, sv_summary, lg_summary, nc_summary, wp_summary],
+            [frame for frame in summary_frames if frame is not None and not frame.empty],
             ignore_index=True,
         )
 
@@ -1381,18 +1377,9 @@ def run_deals_reports(
         with pd.ExcelWriter(output_filename) as writer:
             brand_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=1)
 
-            if not mv_brand_data.empty:
-                mv_brand_data.to_excel(writer, sheet_name="MV_Sales", index=False)
-            if not lm_brand_data.empty:
-                lm_brand_data.to_excel(writer, sheet_name="LM_Sales", index=False)
-            if not sv_brand_data.empty:
-                sv_brand_data.to_excel(writer, sheet_name="SV_Sales", index=False)
-            if not lg_brand_data.empty:
-                lg_brand_data.to_excel(writer, sheet_name="LG_Sales", index=False)
-            if not nc_brand_data.empty:
-                nc_brand_data.to_excel(writer, sheet_name="NC_Sales", index=False)
-            if not wp_brand_data.empty:
-                wp_brand_data.to_excel(writer, sheet_name="WP_Sales", index=False)
+            for store_code, frame in brand_store_data.items():
+                if not frame.empty:
+                    frame.to_excel(writer, sheet_name=f"{store_code}_Sales"[:31], index=False)
 
             top_sellers_df.to_excel(writer, sheet_name="Top Sellers", index=False)
             # --- NEW: Rule-level sheets ---
@@ -1458,7 +1445,7 @@ def run_deals_reports(
         wb = load_workbook(output_filename)
         if "Summary" in wb.sheetnames:
             style_summary_sheet(wb["Summary"], brand)
-        for s in ["MV_Sales", "LM_Sales", "SV_Sales", "LG_Sales", "NC_Sales", "WP_Sales"]:
+        for s in [f"{store_code}_Sales"[:31] for store_code in DEFAULT_STORES]:
             if s in wb.sheetnames:
                 style_worksheet(wb[s])
         if "Top Sellers" in wb.sheetnames:

@@ -35,6 +35,7 @@ AUTOJOB_STORES = [
     ("LG", "Buzz Cannabis - Lemon Grove"),
     ("NC", "Buzz Cannabis (National City)"),
     ("WP", "Buzz Cannabis Wildomar Palomar"),
+    ("SE", "Buzz Cannabis - Santee"),
 ]
 DEALS_EXPORT_COLUMNS = [
     "Order ID",

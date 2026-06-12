@@ -431,6 +431,11 @@ class OwnerSnapshotLoyaltyTests(unittest.TestCase):
         self.assertEqual(args.export_source, "api")
         self.assertEqual(args.workers, 6)
 
+    def test_santee_is_in_owner_snapshot_default_store_selection(self):
+        self.assertIn("SE", osnap._selected_store_codes(None))
+        self.assertEqual(osnap._store_name_from_abbr("SE"), "Buzz Cannabis - Santee")
+        self.assertEqual(osnap.store_label(osnap._store_name_from_abbr("SE")), "SANTEE")
+
 
 if __name__ == "__main__":
     unittest.main()

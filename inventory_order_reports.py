@@ -141,6 +141,7 @@ STORE_NAME_TO_ABBR = {
     "Buzz Cannabis - Lemon Grove": "LG",
     "Buzz Cannabis (National City)": "NC",
     "Buzz Cannabis Wildomar Palomar": "WP",
+    "Buzz Cannabis - Santee": "SE",
 }
 STORE_ABBR_TO_NAME = {abbr.upper(): name for name, abbr in STORE_NAME_TO_ABBR.items()}
 

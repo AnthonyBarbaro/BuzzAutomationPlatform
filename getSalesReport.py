@@ -38,7 +38,8 @@ store_abbr_map = {
     "Buzz Cannabis - SORRENTO VALLEY" : "SV",
     "Buzz Cannabis - Lemon Grove" : "LG",
     "Buzz Cannabis (National City)" : "NC",  # ✅ Add this line
-    "Buzz Cannabis Wildomar Palomar" : "WP"
+    "Buzz Cannabis Wildomar Palomar" : "WP",
+    "Buzz Cannabis - Santee": "SE",
 }
 
 start_str = None
@@ -696,42 +697,11 @@ def create_store_checkboxes(frame):
     """
     store_vars = {}
 
-    # Mission Valley
-    varMV = tk.IntVar(value=1)
-    cbMV = tk.Checkbutton(frame, text="Buzz Cannabis - Mission Valley", variable=varMV)
-    cbMV.pack(anchor='w')
-    store_vars["Buzz Cannabis - Mission Valley"] = varMV
-
-    # La Mesa
-    varLM = tk.IntVar(value=1)
-    cbLM = tk.Checkbutton(frame, text="Buzz Cannabis-La Mesa", variable=varLM)
-    cbLM.pack(anchor='w')
-    store_vars["Buzz Cannabis-La Mesa"] = varLM
-
-    # Sorrento Valley
-    varSV = tk.IntVar(value=1)
-    cbSV = tk.Checkbutton(frame, text="Buzz Cannabis - SORRENTO VALLEY", variable=varSV)
-    cbSV.pack(anchor='w')
-    store_vars["Buzz Cannabis - SORRENTO VALLEY"] = varSV
-    
-    # Lemon Grove
-    varLG = tk.IntVar(value=1)
-    cbLG = tk.Checkbutton(frame, text="Buzz Cannabis - Lemon Grove", variable=varLG)
-    cbLG.pack(anchor='w')
-    store_vars["Buzz Cannabis - Lemon Grove"] = varLG
-    
-    # National City
-
-    varNC = tk.IntVar(value=1)
-    cbNC = tk.Checkbutton(frame, text="Buzz Cannabis (National City)", variable=varNC)
-    cbNC.pack(anchor='w')
-    store_vars["Buzz Cannabis (National City)"] = varNC  # ✅ Add this line
-    # Wildomar Palomar
-    varWP = tk.IntVar(value=1)
-    cbWP = tk.Checkbutton(frame,
-            text="Buzz Cannabis Wildomar Palomar", variable=varWP)
-    cbWP.pack(anchor='w')
-    store_vars["Buzz Cannabis Wildomar Palomar"] = varWP
+    for store_name in store_abbr_map:
+        var = tk.IntVar(value=1)
+        cb = tk.Checkbutton(frame, text=store_name, variable=var)
+        cb.pack(anchor='w')
+        store_vars[store_name] = var
     return store_vars
 def open_gui_and_run():
     root = tk.Tk()
@@ -817,14 +787,7 @@ def open_gui_and_run():
 
         # If none selected, default to all
         if not selected_stores:
-            selected_stores = [
-                "Buzz Cannabis - Mission Valley",
-                "Buzz Cannabis-La Mesa",
-                "Buzz Cannabis - SORRENTO VALLEY",
-                "Buzz Cannabis - Lemon Grove",
-                "Buzz Cannabis (National City)",  # ✅ Add this line
-                "Buzz Cannabis Wildomar Palomar"
-            ]
+            selected_stores = list(store_abbr_map.keys())
 
         # Close GUI
         root.destroy()
@@ -859,14 +822,7 @@ def open_gui_and_run():
     root.mainloop()
 def run_sales_report(start_date, end_date):
     """Runs the full sales report process."""
-    store_names = [
-        "Buzz Cannabis - Mission Valley",
-        "Buzz Cannabis-La Mesa",
-        "Buzz Cannabis - SORRENTO VALLEY",
-        "Buzz Cannabis - Lemon Grove",
-        "Buzz Cannabis (National City)",
-        "Buzz Cannabis Wildomar Palomar"
-    ]
+    store_names = list(store_abbr_map.keys())
     global driver
     driver = launchBrowser()
     login(driver)

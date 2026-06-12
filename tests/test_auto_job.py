@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from autoJob import (
+    AUTOJOB_STORES,
     DEALS_EXPORT_COLUMNS,
     _iter_sales_api_chunks,
     _normalize_sales_api_export_rows,
@@ -14,6 +15,9 @@ from autoJob import (
 
 
 class AutoJobApiSalesTests(unittest.TestCase):
+    def test_autojob_includes_santee_store(self):
+        self.assertIn(("SE", "Buzz Cannabis - Santee"), AUTOJOB_STORES)
+
     def test_iter_sales_api_chunks_splits_large_ranges(self):
         chunks = _iter_sales_api_chunks(date(2026, 1, 1), date(2026, 2, 10), max_days=30)
         self.assertEqual(

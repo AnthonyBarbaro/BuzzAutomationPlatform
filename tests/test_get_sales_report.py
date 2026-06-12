@@ -10,6 +10,10 @@ import getSalesReport as gsr
 
 
 class GetSalesReportChunkingTests(unittest.TestCase):
+    def test_santee_store_uses_se_sales_filename(self):
+        self.assertEqual(gsr.store_abbr_map["Buzz Cannabis - Santee"], "SE")
+        self.assertEqual(gsr._expected_store_filename("Buzz Cannabis - Santee"), "salesSE.xlsx")
+
     def test_iter_export_chunks_splits_large_ranges(self):
         chunks = gsr._iter_export_chunks(date(2026, 1, 1), date(2026, 2, 10))
         self.assertEqual(

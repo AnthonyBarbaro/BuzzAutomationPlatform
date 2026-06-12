@@ -263,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stores",
         nargs="*",
-        help="Optional store codes to fetch, for example: MV LG LM WP SV NC",
+        help="Optional store codes to fetch, for example: MV LG LM WP SV NC SE",
     )
     parser.add_argument(
         "--workers",

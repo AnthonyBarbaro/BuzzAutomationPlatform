@@ -92,7 +92,7 @@ WAVE_BANNER_HEIGHT_PX = 26
 # If you want a 2-column grid, set this to 2
 CARDS_PER_ROW = 1
 
-STORE_EMAIL_ORDER = ["MV", "LM", "SV", "LG", "NC", "WP"]
+STORE_EMAIL_ORDER = ["MV", "LM", "SV", "LG", "NC", "WP", "SE"]
 STORE_ORDER_INDEX = {abbr: i for i, abbr in enumerate(STORE_EMAIL_ORDER)}
 
 

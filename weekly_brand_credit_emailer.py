@@ -54,6 +54,7 @@ STORE_LABELS = {
     "WP": "Wildomar Palomar",
     "SV": "Sorrento Valley",
     "NC": "National City",
+    "SE": "Santee",
 }
 HASHISH_SECTION_CATEGORY_ORDER = {
     "Disposables": 80,

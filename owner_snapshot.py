@@ -74,6 +74,7 @@ DEFAULT_STORE_ABBR_MAP = {
     "Buzz Cannabis - Lemon Grove": "LG",
     "Buzz Cannabis (National City)": "NC",
     "Buzz Cannabis Wildomar Palomar": "WP",
+    "Buzz Cannabis - Santee": "SE",
 }
 
 GET_SALES_REPORT_IMPORT_ERROR: Optional[Exception] = None
@@ -705,7 +706,7 @@ def enrich_with_deal_kickbacks_by_brand(df: pd.DataFrame, store_code: str) -> pd
     deal_rule = pd.Series("", index=out.index, dtype="object")
     deal_discount = pd.Series(0.0, index=out.index, dtype="float")
 
-    default_stores = ["MV", "LM", "SV", "LG", "NC", "WP"]
+    default_stores = list(dict.fromkeys(store_abbr_map.values()))
 
     # Apply all rules: keep the highest kickback_pct if overlaps
     for brand_name, criteria in brand_criteria.items():
@@ -2731,10 +2732,11 @@ def _selected_store_codes(values: Optional[List[str]]) -> List[str]:
     return dutchie_parse_store_codes(values)
 
 def _store_name_from_abbr(abbr: str) -> str:
+    code_text = str(abbr or "").upper().strip()
     for store_name, code in store_abbr_map.items():
-        if code == abbr:
+        if str(code or "").upper().strip() == code_text:
             return store_name
-    return DUTCHIE_STORE_CODES.get(abbr, abbr)
+    return DUTCHIE_STORE_CODES.get(code_text, abbr)
 
 def _store_iter(selected_store_codes: Optional[List[str]] = None) -> List[Tuple[str, str]]:
     allowed = set(selected_store_codes or list(dict.fromkeys(store_abbr_map.values())))

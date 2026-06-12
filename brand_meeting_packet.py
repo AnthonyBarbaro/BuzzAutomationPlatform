@@ -101,7 +101,7 @@ OWNER_BRAND_ROLLUP_EMAIL = "anthony@buzzcannabis.com"
 SUPPLY_PRICE_BUCKET = 0.50
 SUPPLY_COST_BUCKET = 0.25
 SUPPLY_BASE_USE_VARIANT = False
-STORE_DISPLAY_ORDER = ["MV", "LM", "SV", "LG", "NC", "WP"]
+STORE_DISPLAY_ORDER = ["MV", "LM", "SV", "LG", "NC", "WP", "SE"]
 STORE_ORDER_RANK = {code: idx for idx, code in enumerate(STORE_DISPLAY_ORDER)}
 
 NOISE_TOKENS = {

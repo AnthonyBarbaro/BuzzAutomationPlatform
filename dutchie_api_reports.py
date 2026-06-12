@@ -541,7 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stores",
         nargs="*",
-        help="Store codes to export, for example: mv lg lm wp sv nc",
+        help="Store codes to export, for example: mv lg lm wp sv nc se",
     )
     parser.add_argument(
         "--reports",

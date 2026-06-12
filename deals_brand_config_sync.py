@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 
-DEFAULT_STORES = ["MV", "LM", "SV", "LG", "NC", "WP"]
+DEFAULT_STORES = ["MV", "LM", "SV", "LG", "NC", "WP", "SE"]
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 CSV_COLUMNS = [
     "brand",

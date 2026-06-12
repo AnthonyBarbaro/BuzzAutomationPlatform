@@ -1,10 +1,19 @@
 import textwrap
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 
+import deals
 from deals import filter_by_rule
-from deals_brand_config_sync import _load_brand_criteria_from_csv_text, flatten_brand_criteria
+from deals_brand_config_sync import (
+    DEFAULT_STORES as CONFIG_DEFAULT_STORES,
+    _load_brand_criteria_from_csv_text,
+    _parse_sheet_stores,
+    flatten_brand_criteria,
+)
 
 
 def _sales_rows():
@@ -22,6 +31,74 @@ def _sales_rows():
 
 
 class DealsDateRulesTest(unittest.TestCase):
+    def test_default_deal_store_config_includes_santee(self):
+        self.assertIn("SE", deals.DEFAULT_STORES)
+        self.assertIn("SE", CONFIG_DEFAULT_STORES)
+        self.assertIn("SE", _parse_sheet_stores("all"))
+        self.assertIn("SE", deals.normalize_rules({"vendors": ["Vendor"], "days": ["Monday"]})[0]["stores"])
+
+    def test_deals_report_iterates_santee_store_without_special_case(self):
+        columns = [
+            "order time",
+            "day of week",
+            "vendor name",
+            "product name",
+            "category",
+            "gross sales",
+            "inventory cost",
+            "total inventory sold",
+        ]
+        santee_frame = pd.DataFrame(
+            [
+                {
+                    "order time": pd.Timestamp("2026-06-01 10:00"),
+                    "day of week": "Monday",
+                    "vendor name": "Vendor S",
+                    "product name": "Test Brand | Flower 3.5g",
+                    "category": "Flower",
+                    "gross sales": 100.0,
+                    "inventory cost": 40.0,
+                    "total inventory sold": 2.0,
+                }
+            ],
+            columns=columns,
+        )
+        empty_frame = pd.DataFrame(columns=columns)
+
+        def fake_process_file(path):
+            return santee_frame.copy() if str(path).endswith("salesSE.xlsx") else empty_frame.copy()
+
+        criteria = {
+            "Test Brand": {
+                "vendors": ["Vendor S"],
+                "brands": ["Test Brand"],
+                "days": ["Monday"],
+                "discount": 0.50,
+                "kickback": 0.20,
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "brand_reports"
+            old_dir = Path(tmpdir) / "old"
+            with mock.patch.object(deals, "refresh_brand_criteria", return_value=criteria):
+                with mock.patch.object(deals, "process_file", side_effect=fake_process_file):
+                    deals.run_deals_reports(
+                        output_dir=output_dir,
+                        old_dir=old_dir,
+                        archive_existing=False,
+                        sync_reference=False,
+                        sync_sheet=False,
+                    )
+
+            report_path = next(output_dir.glob("Test Brand_report_*.xlsx"))
+            with pd.ExcelFile(report_path) as workbook:
+                sheet_names = workbook.sheet_names
+                summary = pd.read_excel(workbook, sheet_name="Summary", header=1)
+
+        self.assertIn("SE_Sales", sheet_names)
+        self.assertIn("Santee", summary["Store"].dropna().astype(str).tolist())
+
     def test_filter_by_rule_honors_inclusive_start_and_end_dates(self):
         rule = {
             "vendors": ["The Clear Group Inc."],

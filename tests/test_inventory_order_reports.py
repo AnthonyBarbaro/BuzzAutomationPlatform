@@ -7,11 +7,16 @@ import pandas as pd
 from inventory_order_reports import (
     build_brand_order_sections,
     build_grouped_order_summary,
+    canonical_store_code,
     order_report_filename,
 )
 
 
 class BuildGroupedOrderSummaryTests(unittest.TestCase):
+    def test_santee_store_name_resolves_to_se(self):
+        self.assertEqual(canonical_store_code("Buzz Cannabis - Santee"), "SE")
+        self.assertEqual(order_report_filename("Buzz Cannabis - Santee", 14, extension=".csv"), "inventory_order_14d_SE.csv")
+
     def make_detail_df(self):
         return pd.DataFrame(
             [
