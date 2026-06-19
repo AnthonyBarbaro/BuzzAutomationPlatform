@@ -122,6 +122,7 @@ def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PA
     config["eligibility"].setdefault("mode", "brand_or_vendor")
     config["eligibility"].setdefault("include_sales_only_rows", True)
     config["eligibility"].setdefault("min_units_sold_30d", 3)
+    config["eligibility"].setdefault("include_all_in_stock", False)
     config.setdefault("exclusions", {})
     config["exclusions"].setdefault("pattern", r"\b(sample|samples|promo|promos|promotional|display|tester)\b")
     config["exclusions"].setdefault("fields", ["product", "category", "tags", "brand", "vendor"])
@@ -140,8 +141,44 @@ def load_ordering_config(config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PA
     config["reorder"].setdefault("par_weight_30d", 0.2)
     config["reorder"].setdefault("par_stale_30d_dampener", 0.6)
     config["reorder"].setdefault("par_stockout_uplift_max", 0.25)
+    config.setdefault("store_overrides", {})
     config.setdefault("review_manual_columns", [])
     return config
+
+
+def resolve_store_config(config: Mapping[str, Any], store_code: str) -> dict[str, Any]:
+    normalized_store = str(store_code or "").strip().upper()
+    merged = _deep_copy_mapping(config)
+    overrides = config.get("store_overrides", {}) if isinstance(config, Mapping) else {}
+    if not isinstance(overrides, Mapping) or not normalized_store:
+        return merged
+
+    store_override = (
+        overrides.get(normalized_store)
+        or overrides.get(normalized_store.lower())
+        or overrides.get(str(store_code or "").strip())
+        or {}
+    )
+    if isinstance(store_override, Mapping):
+        _deep_merge_mapping(merged, store_override)
+    return merged
+
+
+def _deep_copy_mapping(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_copy_mapping(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_deep_copy_mapping(item) for item in value]
+    return value
+
+
+def _deep_merge_mapping(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    for key, value in override.items():
+        if isinstance(value, Mapping) and isinstance(base.get(key), dict):
+            _deep_merge_mapping(base[key], value)
+        else:
+            base[key] = _deep_copy_mapping(value)
+    return base
 
 
 def sheet_output_flags(config: Mapping[str, Any]) -> dict[str, bool]:
@@ -435,6 +472,58 @@ def normalize_products_payload(products_payload: Any, store_code: str) -> pd.Dat
     return bmp.prepare_catalog_for_all_brands(normalized, [store_code])
 
 
+def apply_catalog_cost_overrides(
+    inventory_prepared: pd.DataFrame,
+    catalog_prepared: pd.DataFrame,
+    config: Mapping[str, Any],
+) -> tuple[pd.DataFrame, int]:
+    if inventory_prepared is None or inventory_prepared.empty:
+        return pd.DataFrame(columns=inventory_prepared.columns if inventory_prepared is not None else []), 0
+    if catalog_prepared is None or catalog_prepared.empty:
+        return inventory_prepared.copy(), 0
+    if "SKU" not in inventory_prepared.columns or "SKU" not in catalog_prepared.columns:
+        return inventory_prepared.copy(), 0
+
+    low_cost_threshold = float(config.get("exclusions", {}).get("low_cost_threshold", 1.0))
+    work = inventory_prepared.copy()
+    catalog = catalog_prepared.copy()
+    work["_sku_key"] = work["SKU"].fillna("").astype(str).str.strip()
+    catalog["_sku_key"] = catalog["SKU"].fillna("").astype(str).str.strip()
+
+    catalog_cost = pd.to_numeric(catalog.get("Cost", 0.0), errors="coerce").fillna(0.0).astype(float)
+    catalog = catalog.loc[(catalog["_sku_key"] != "") & (catalog_cost >= low_cost_threshold)].copy()
+    if catalog.empty:
+        return work.drop(columns=["_sku_key"]), 0
+
+    catalog["_catalog_cost"] = pd.to_numeric(catalog.get("Cost", 0.0), errors="coerce").fillna(0.0).astype(float)
+    catalog = catalog.sort_values(["_sku_key", "_catalog_cost"], ascending=[True, False])
+    cost_map = catalog.groupby("_sku_key")["_catalog_cost"].first()
+
+    inventory_cost = pd.to_numeric(work.get("Cost", 0.0), errors="coerce").fillna(0.0).astype(float)
+    replacement_cost = work["_sku_key"].map(cost_map)
+    replace_cost_mask = (work["_sku_key"] != "") & replacement_cost.notna() & (inventory_cost < low_cost_threshold)
+    if not replace_cost_mask.any():
+        return work.drop(columns=["_sku_key"]), 0
+
+    work.loc[replace_cost_mask, "Cost"] = replacement_cost.loc[replace_cost_mask].astype(float)
+    _recompute_inventory_value_columns(work)
+    return work.drop(columns=["_sku_key"]), int(replace_cost_mask.sum())
+
+
+def _recompute_inventory_value_columns(work: pd.DataFrame) -> None:
+    available = pd.to_numeric(work.get("Available", 0.0), errors="coerce").fillna(0.0).astype(float)
+    cost = pd.to_numeric(work.get("Cost", 0.0), errors="coerce").fillna(0.0).astype(float)
+    price_used = pd.to_numeric(work.get("Price_Used", work.get("Price", 0.0)), errors="coerce").fillna(0.0).astype(float)
+    effective_price = price_used * 0.63
+
+    work["Inventory_Value"] = cost * available
+    if "Potential_Profit" in work.columns:
+        work["Potential_Profit"] = (effective_price - cost) * available
+    if "Margin_Current" in work.columns:
+        denom = effective_price.replace({0: np.nan})
+        work["Margin_Current"] = ((effective_price - cost) / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
 def normalize_sales_payload(
     transactions_payload: Any,
     products_payload: Any,
@@ -465,9 +554,15 @@ def build_ordering_bundle(
     snapshot_generated_at: datetime,
     logger: logging.Logger,
 ) -> dict[str, Any]:
+    config = resolve_store_config(config, store_code)
     filtered_transactions, transaction_drop_counts = filter_transaction_payload(payloads.get("transactions") or [], config)
     catalog_prepared = normalize_products_payload(payloads.get("products"), store_code)
     inventory_prepared = normalize_inventory_payload(payloads.get("inventory"), store_code)
+    inventory_prepared, inventory_catalog_cost_overrides = apply_catalog_cost_overrides(
+        inventory_prepared,
+        catalog_prepared,
+        config,
+    )
     sales_prepared = normalize_sales_payload(
         filtered_transactions,
         payloads.get("products"),
@@ -530,6 +625,7 @@ def build_ordering_bundle(
             "eligible_vendor_count": len(eligible_vendor_keys),
             "inventory_rows_in": int(len(inventory_prepared)),
             "inventory_rows_out": int(len(inventory_filtered)),
+            "inventory_catalog_cost_overrides": inventory_catalog_cost_overrides,
             "sales_rows_in": int(len(sales_prepared)),
             "sales_rows_out": int(len(sales_filtered)),
             "metric_filter_counts": dict(metric_filter_counts),
@@ -834,9 +930,11 @@ def apply_eligibility_rules(
         return pd.DataFrame(columns=_merged_columns())
 
     mode = str(config.get("eligibility", {}).get("mode", "brand_or_vendor")).strip().lower()
+    include_all_in_stock = bool(config.get("eligibility", {}).get("include_all_in_stock", False))
     work = merged_df.copy()
     brand_match = work["brand_key"].fillna("").astype(str).isin(eligible_brand_keys)
     vendor_match = work["vendor_key"].fillna("").astype(str).isin(eligible_vendor_keys)
+    in_stock_match = pd.to_numeric(work.get("available", 0.0), errors="coerce").fillna(0.0) > 0
 
     if mode == "brand_only":
         mask = brand_match
@@ -846,6 +944,9 @@ def apply_eligibility_rules(
         mask = brand_match & vendor_match
     else:
         mask = brand_match | vendor_match
+
+    if include_all_in_stock:
+        mask = mask | in_stock_match
 
     filtered = work.loc[mask].copy()
     filtered["eligible_brand_30d"] = brand_match.loc[filtered.index].astype(bool)
@@ -1036,6 +1137,9 @@ def apply_ordering_filters(
     if min_units_sold_30d > 0:
         units_sold_30d = pd.to_numeric(work.get("Units Sold 30d", 0.0), errors="coerce").fillna(0.0)
         low_sales_mask = units_sold_30d < min_units_sold_30d
+        if bool(config.get("eligibility", {}).get("include_all_in_stock", False)):
+            available = pd.to_numeric(work.get("Available", 0.0), errors="coerce").fillna(0.0)
+            low_sales_mask &= available <= 0
         excluded_low_sales = keep_mask & low_sales_mask
         if excluded_low_sales.any():
             counts["min_units_sold_30d"] = int(excluded_low_sales.sum())
@@ -1420,6 +1524,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     proof_rows: list[dict[str, Any]] = []
     failed_stores: list[str] = []
     for store_code in store_codes:
+        store_config = resolve_store_config(config, store_code)
         tab_titles = build_store_tab_titles(store_code, week_of, config)
         try:
             logger.info("[%s] Building weekly ordering bundle for week %s as of %s", store_code, week_of.isoformat(), as_of_day.isoformat())
@@ -1429,7 +1534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 week_of=week_of,
                 as_of_day=as_of_day,
                 payloads=payloads,
-                config=config,
+                config=store_config,
                 snapshot_generated_at=snapshot_generated_at,
                 logger=logger,
             )
@@ -1456,7 +1561,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_result = {"mode": "dry-run"}
             if not args.dry_run:
                 spreadsheet_target = resolve_store_spreadsheet_target(spreadsheet_targets, store_code)
-                write_result = write_store_tabs_to_google_sheet(bundle, spreadsheet_target, config, logger)
+                write_result = write_store_tabs_to_google_sheet(bundle, spreadsheet_target, store_config, logger)
             proof_rows.append(
                 {
                     "store_code": store_code,

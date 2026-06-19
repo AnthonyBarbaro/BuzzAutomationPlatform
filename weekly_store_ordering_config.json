@@ -42,7 +42,8 @@
   "eligibility": {
     "mode": "brand_or_vendor",
     "include_sales_only_rows": true,
-    "min_units_sold_30d": 3
+    "min_units_sold_30d": 3,
+    "include_all_in_stock": false
   },
   "exclusions": {
     "pattern": "\\b(sample|samples|promo|promos|promotional|display|tester)\\b",
@@ -70,6 +71,17 @@
     "par_weight_30d": 0.2,
     "par_stale_30d_dampener": 0.6,
     "par_stockout_uplift_max": 0.25
+  },
+  "store_overrides": {
+    "SE": {
+      "eligibility": {
+        "include_all_in_stock": true,
+        "min_units_sold_30d": 0
+      },
+      "exclusions": {
+        "exclude_low_cost_rows": false
+      }
+    }
   },
   "review_manual_columns": []
 }

@@ -99,6 +99,82 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
         self.assertAlmostEqual(bundle["summary"]["Total Cannabis Inventory Value"], 133.0)
         self.assertAlmostEqual(bundle["summary"]["Total Accessories Inventory Value"], 0.0)
 
+    def test_santee_keeps_in_stock_skus_with_no_sales_and_repairs_sample_cost(self):
+        payloads = {
+            "inventory": [
+                {
+                    "sku": "40918812",
+                    "productName": "Emerald Sky | Gummies 100mg (10pk) | S | California Orange",
+                    "category": "Edibles",
+                    "masterCategory": "Edibles",
+                    "quantityAvailable": 18,
+                    "unitCost": 0.01,
+                    "unitPrice": 10.0,
+                    "brandName": "Emerald Sky",
+                    "vendor": "Vino & Cigarro, LLC",
+                    "tags": [],
+                },
+                {
+                    "sku": "00775052",
+                    "productName": "Emerald Sky | Gummies 100mg (10pk) | S | California Orange (SAMPLE)",
+                    "category": "Edibles",
+                    "masterCategory": "Edibles",
+                    "quantityAvailable": 5,
+                    "unitCost": 0.01,
+                    "unitPrice": 0.01,
+                    "brandName": "Emerald Sky",
+                    "vendor": "Vino & Cigarro, LLC",
+                    "tags": [],
+                },
+            ],
+            "products": [
+                {
+                    "productId": 40918812,
+                    "productName": "Emerald Sky | Gummies 100mg (10pk) | S | California Orange",
+                    "category": "Edibles",
+                    "masterCategory": "Edibles",
+                    "vendorName": "Vino & Cigarro, LLC",
+                    "producerName": "Vino & Cigarro, LLC",
+                    "sku": "40918812",
+                    "unitCost": 4.0,
+                    "price": 10.0,
+                },
+                {
+                    "productId": 775052,
+                    "productName": "Emerald Sky | Gummies 100mg (10pk) | S | California Orange (SAMPLE)",
+                    "category": "Edibles",
+                    "masterCategory": "Edibles",
+                    "vendorName": "Vino & Cigarro, LLC",
+                    "producerName": "Vino & Cigarro, LLC",
+                    "sku": "00775052",
+                    "unitCost": 0.01,
+                    "price": 0.01,
+                },
+            ],
+            "transactions": [],
+        }
+
+        bundle = build_ordering_bundle(
+            store_code="SE",
+            week_of=self.week_of,
+            as_of_day=self.as_of_day,
+            payloads=payloads,
+            config=self.config,
+            snapshot_generated_at=self.snapshot_generated_at,
+            logger=self.logger,
+        )
+
+        metrics = bundle["sku_metrics"].set_index("SKU")
+        self.assertIn("40918812", metrics.index)
+        self.assertNotIn("00775052", metrics.index)
+
+        california_orange = metrics.loc["40918812"]
+        self.assertEqual(int(california_orange["Available"]), 18)
+        self.assertEqual(float(california_orange["Cost"]), 4.0)
+        self.assertEqual(int(california_orange["Units Sold 30d"]), 0)
+        self.assertEqual(bundle["logs"]["inventory_catalog_cost_overrides"], 1)
+        self.assertAlmostEqual(bundle["summary"]["Total Inventory Value"], 72.05)
+
     def test_inventory_value_breakdown_splits_accessories_from_cannabis(self):
         inventory_df = pd.DataFrame(
             [
