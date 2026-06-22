@@ -657,6 +657,12 @@ DEFAULT_BRAND_CRITERIA = {
            'discount': 0.50,
            'kickback': 0.0,
            'brands': ['PBR |', 'NYF |', 'St. Ides |']},
+    'VIOR': {
+        #'vendors': ['Garden Of Weeden Inc.','Garden Of Weeden'],
+           'days': ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'],
+           'discount': 0.50,
+           'kickback': 0.0,
+           'brands': ['Vior |']},
 }
 
 brand_criteria = DEFAULT_BRAND_CRITERIA
