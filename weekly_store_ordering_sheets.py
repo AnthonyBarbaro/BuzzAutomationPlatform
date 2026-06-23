@@ -1,17 +1,38 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import errno
+import hashlib
+import logging
+import socket
+import ssl
+import time
 from datetime import date, datetime
 import math
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
+import httplib2
 import pandas as pd
 import numpy as np
+from googleapiclient.errors import HttpError
 
 from deals_brand_config_sync import _parse_sheet_target, authenticate_sheets
 
 WEEKLY_ORDERING_TRAINING_VIDEO_LABEL = "Training Video"
 WEEKLY_ORDERING_TRAINING_VIDEO_URL = "https://youtu.be/ri9VkqPGAUQ"
+SHEETS_WRITE_CHUNK_ROWS = 500
+SHEETS_WRITE_RETRY_ATTEMPTS = 5
+SHEETS_WRITE_RETRY_BACKOFF_SECONDS = 2.0
+SHEETS_WRITE_RETRY_MAX_BACKOFF_SECONDS = 60.0
+RETRYABLE_GOOGLE_STATUSES = {429, 500, 502, 503, 504}
+RETRYABLE_SOCKET_ERRNOS = {
+    errno.ETIMEDOUT,
+    errno.EPIPE,
+    errno.ECONNABORTED,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+}
+DEFAULT_SHEETS_LOGGER = logging.getLogger("weekly_store_ordering.sheets")
 
 
 def parse_spreadsheet_target(target: str) -> tuple[str, int | None]:
@@ -21,6 +42,66 @@ def parse_spreadsheet_target(target: str) -> tuple[str, int | None]:
     if "/spreadsheets/d/" in text:
         return _parse_sheet_target(text)
     return text, None
+
+
+def _execute_sheet_request(
+    request_factory: Callable[[], Any],
+    *,
+    store_name: str | None = None,
+    tab_name: str | None = None,
+    operation: str = "request",
+    logger: logging.Logger | None = None,
+    attempts: int = SHEETS_WRITE_RETRY_ATTEMPTS,
+) -> Any:
+    log = logger or DEFAULT_SHEETS_LOGGER
+    max_attempts = max(int(attempts or 1), 1)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return request_factory().execute()
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_google_sheet_error(exc):
+                raise
+            wait_seconds = _retry_wait_seconds(attempt)
+            log.warning(
+                "[%s] Google Sheets retry tab=%s operation=%s attempt=%s/%s error=%s: %s; retrying in %.1fs",
+                _log_store_name(store_name),
+                _log_tab_name(tab_name),
+                operation,
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                exc,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+    return None
+
+
+def _is_retryable_google_sheet_error(error: Exception) -> bool:
+    if isinstance(error, HttpError):
+        status = getattr(getattr(error, "resp", None), "status", None)
+        try:
+            return int(status) in RETRYABLE_GOOGLE_STATUSES
+        except Exception:
+            return False
+    if isinstance(error, (TimeoutError, socket.timeout, ConnectionError, ssl.SSLError, httplib2.HttpLib2Error)):
+        return True
+    if isinstance(error, OSError):
+        return getattr(error, "errno", None) in RETRYABLE_SOCKET_ERRNOS
+    return False
+
+
+def _retry_wait_seconds(failed_attempt: int) -> float:
+    wait_seconds = SHEETS_WRITE_RETRY_BACKOFF_SECONDS * (2 ** max(failed_attempt - 1, 0))
+    return min(wait_seconds, SHEETS_WRITE_RETRY_MAX_BACKOFF_SECONDS)
+
+
+def _log_store_name(store_name: str | None) -> str:
+    return str(store_name or "unknown-store").strip() or "unknown-store"
+
+
+def _log_tab_name(tab_name: str | None) -> str:
+    return str(tab_name or "unknown-tab").strip() or "unknown-tab"
 
 
 def build_summary_rows(summary: Mapping[str, Any], max_rows: int = 2) -> list[list[Any]]:
@@ -216,17 +297,96 @@ def merge_preserved_review_columns(
     return source
 
 
-def read_sheet_values(service: Any, spreadsheet_id: str, title: str) -> list[list[Any]]:
+def read_sheet_values(
+    service: Any,
+    spreadsheet_id: str,
+    title: str,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
+) -> list[list[Any]]:
     try:
-        return (
-            service.spreadsheets()
-            .values()
-            .get(spreadsheetId=spreadsheet_id, range=_sheet_range(title))
-            .execute()
-            .get("values", [])
-        )
-    except Exception:
+        return _execute_sheet_request(
+            lambda: service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=_sheet_range(title),
+            ),
+            store_name=store_name,
+            tab_name=title,
+            operation="read values",
+            logger=logger,
+        ).get("values", [])
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if str(status) in {"400", "404"}:
+            return []
+        raise
+    except Exception as exc:
+        if _is_retryable_google_sheet_error(exc):
+            raise
         return []
+
+
+def _write_sheet_values(
+    service: Any,
+    spreadsheet_id: str,
+    title: str,
+    values: Sequence[Sequence[Any]],
+    *,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
+    chunk_rows: int = SHEETS_WRITE_CHUNK_ROWS,
+) -> int:
+    rows = [list(row) for row in values]
+    _execute_sheet_request(
+        lambda: service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=_sheet_range(title),
+            body={},
+        ),
+        store_name=store_name,
+        tab_name=title,
+        operation="clear values",
+        logger=logger,
+    )
+    if not rows:
+        return 0
+
+    batches = list(_value_row_batches(rows, chunk_rows))
+    if len(batches) > 1:
+        (logger or DEFAULT_SHEETS_LOGGER).info(
+            "[%s] Writing tab=%s rows=%s chunks=%s",
+            _log_store_name(store_name),
+            title,
+            len(rows),
+            len(batches),
+        )
+    for start_row, batch_rows in batches:
+        end_row = start_row + len(batch_rows) - 1
+        _execute_sheet_request(
+            lambda start_row=start_row, batch_rows=batch_rows: service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=_sheet_row_start_range(title, start_row),
+                valueInputOption="RAW",
+                body={"values": batch_rows},
+            ),
+            store_name=store_name,
+            tab_name=title,
+            operation=f"write rows {start_row}-{end_row}",
+            logger=logger,
+        )
+    return len(rows)
+
+
+def _value_row_batches(
+    values: Sequence[Sequence[Any]],
+    chunk_rows: int = SHEETS_WRITE_CHUNK_ROWS,
+) -> Iterable[tuple[int, list[list[Any]]]]:
+    max_rows = max(int(chunk_rows or SHEETS_WRITE_CHUNK_ROWS), 1)
+    start_index = 0
+    while start_index < len(values):
+        batch = [list(row) for row in values[start_index : start_index + max_rows]]
+        yield start_index + 1, batch
+        start_index += len(batch)
 
 
 def upsert_readme_tab(
@@ -240,8 +400,17 @@ def upsert_readme_tab(
     manual_columns: Sequence[str] | None = None,
     snapshot_generated_at: str | None = None,
     title: str = "README",
+    logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    sheet_info = ensure_sheet(service, spreadsheet_id, title, "readme")
+    store_context = _store_log_context(store_code, store_name)
+    sheet_info = ensure_sheet(
+        service,
+        spreadsheet_id,
+        title,
+        "readme",
+        store_name=store_context,
+        logger=logger,
+    )
     values = build_readme_rows(
         store_code=store_code,
         store_name=store_name,
@@ -254,19 +423,22 @@ def upsert_readme_tab(
     total_rows = max(len(values), 1)
     total_columns = max(max((len(row) for row in values), default=0), 2)
 
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=_sheet_range(title),
-        body={},
-    ).execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=_sheet_start_range(title),
-        valueInputOption="RAW",
-        body={"values": values},
-    ).execute()
+    _write_sheet_values(
+        service,
+        spreadsheet_id,
+        title,
+        values,
+        store_name=store_context,
+        logger=logger,
+    )
 
-    refreshed_info = get_sheet_info_by_title(service, spreadsheet_id, title)
+    refreshed_info = get_sheet_info_by_title(
+        service,
+        spreadsheet_id,
+        title,
+        store_name=store_context,
+        logger=logger,
+    )
     if not refreshed_info:
         raise RuntimeError(f"Unable to reload sheet metadata for {title}.")
     _format_readme_sheet(
@@ -276,6 +448,8 @@ def upsert_readme_tab(
         values=values,
         total_rows=total_rows,
         total_columns=total_columns,
+        store_name=store_context,
+        logger=logger,
     )
     return {
         "title": title,
@@ -293,27 +467,51 @@ def upsert_ordering_tab(
     sheet_kind: str,
     hidden_headers: Iterable[str] | None = None,
     show_cost_price_separator: bool = True,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    sheet_info = ensure_sheet(service, spreadsheet_id, title, sheet_kind)
+    staging_title = _staging_tab_title(title)
+    sheet_info = ensure_sheet(
+        service,
+        spreadsheet_id,
+        staging_title,
+        sheet_kind,
+        hidden=True,
+        store_name=store_name,
+        logger=logger,
+    )
     values, header_row_number = build_sheet_matrix(summary_rows, df)
     total_rows = max(len(values), 1)
     total_columns = max(len(df.columns), 2)
 
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=_sheet_range(title),
-        body={},
-    ).execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=_sheet_start_range(title),
-        valueInputOption="RAW",
-        body={"values": values},
-    ).execute()
+    ensure_sheet_grid_size(
+        service,
+        spreadsheet_id,
+        sheet_id=int(sheet_info["sheet_id"]),
+        title=staging_title,
+        min_rows=total_rows,
+        min_columns=total_columns,
+        store_name=store_name,
+        logger=logger,
+    )
+    _write_sheet_values(
+        service,
+        spreadsheet_id,
+        staging_title,
+        values,
+        store_name=store_name,
+        logger=logger,
+    )
 
-    refreshed_info = get_sheet_info_by_title(service, spreadsheet_id, title)
+    refreshed_info = get_sheet_info_by_title(
+        service,
+        spreadsheet_id,
+        staging_title,
+        store_name=store_name,
+        logger=logger,
+    )
     if not refreshed_info:
-        raise RuntimeError(f"Unable to reload sheet metadata for {title}.")
+        raise RuntimeError(f"Unable to reload sheet metadata for {staging_title}.")
     _format_ordering_sheet(
         service=service,
         spreadsheet_id=spreadsheet_id,
@@ -329,37 +527,68 @@ def upsert_ordering_tab(
         hidden_headers=set(hidden_headers or []),
         sheet_kind=sheet_kind,
         show_cost_price_separator=show_cost_price_separator,
+        store_name=store_name,
+        logger=logger,
+    )
+    promoted_info = promote_staging_sheet(
+        service,
+        spreadsheet_id,
+        staging_title=staging_title,
+        final_title=title,
+        staging_sheet_id=int(sheet_info["sheet_id"]),
+        sheet_kind=sheet_kind,
+        store_name=store_name,
+        logger=logger,
     )
 
     return {
         "title": title,
-        "sheet_id": sheet_info["sheet_id"],
+        "sheet_id": promoted_info["sheet_id"],
         "header_row_number": header_row_number,
         "rows_written": max(len(df), 0),
     }
 
 
-def move_sheet_to_index(service: Any, spreadsheet_id: str, title: str, index: int) -> None:
-    sheet_info = get_sheet_info_by_title(service, spreadsheet_id, title)
+def move_sheet_to_index(
+    service: Any,
+    spreadsheet_id: str,
+    title: str,
+    index: int,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    sheet_info = get_sheet_info_by_title(
+        service,
+        spreadsheet_id,
+        title,
+        store_name=store_name,
+        logger=logger,
+    )
     if not sheet_info or sheet_info.get("sheet_id") is None:
         return
 
-    service.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={
-            "requests": [
-                {
-                    "updateSheetProperties": {
-                        "properties": {
-                            "sheetId": int(sheet_info["sheet_id"]),
-                            "index": max(int(index), 0),
-                        },
-                        "fields": "index",
+    _execute_sheet_request(
+        lambda: service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": int(sheet_info["sheet_id"]),
+                                "index": max(int(index), 0),
+                            },
+                            "fields": "index",
+                        }
                     }
-                }
-            ]
-        },
-    ).execute()
+                ]
+            },
+        ),
+        store_name=store_name,
+        tab_name=title,
+        operation=f"move to index {index}",
+        logger=logger,
+    )
 
 
 def move_latest_tabs_next_to_readme(
@@ -367,6 +596,8 @@ def move_latest_tabs_next_to_readme(
     spreadsheet_id: str,
     titles: Sequence[str],
     readme_title: str = "README",
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
 ) -> list[str]:
     ordered_titles: list[str] = []
     seen: set[str] = set()
@@ -377,23 +608,75 @@ def move_latest_tabs_next_to_readme(
         ordered_titles.append(title)
         seen.add(title)
 
-    move_sheet_to_index(service, spreadsheet_id, readme_title, 0)
+    if store_name is None and logger is None:
+        move_sheet_to_index(service, spreadsheet_id, readme_title, 0)
+    else:
+        move_sheet_to_index(service, spreadsheet_id, readme_title, 0, store_name=store_name, logger=logger)
     next_index = 1
     for title in ordered_titles:
-        move_sheet_to_index(service, spreadsheet_id, title, next_index)
+        if store_name is None and logger is None:
+            move_sheet_to_index(service, spreadsheet_id, title, next_index)
+        else:
+            move_sheet_to_index(service, spreadsheet_id, title, next_index, store_name=store_name, logger=logger)
         next_index += 1
     return ordered_titles
 
 
-def ensure_sheet(service: Any, spreadsheet_id: str, title: str, sheet_kind: str) -> dict[str, Any]:
-    existing = get_sheet_info_by_title(service, spreadsheet_id, title)
+def ensure_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    title: str,
+    sheet_kind: str,
+    hidden: bool = False,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    existing = get_sheet_info_by_title(
+        service,
+        spreadsheet_id,
+        title,
+        store_name=store_name,
+        logger=logger,
+    )
     if existing:
+        if bool(hidden) and not bool(existing.get("hidden")):
+            _execute_sheet_request(
+                lambda: service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={
+                        "requests": [
+                            {
+                                "updateSheetProperties": {
+                                    "properties": {
+                                        "sheetId": int(existing["sheet_id"]),
+                                        "hidden": True,
+                                    },
+                                    "fields": "hidden",
+                                }
+                            }
+                        ]
+                    },
+                ),
+                store_name=store_name,
+                tab_name=title,
+                operation="hide staging tab",
+                logger=logger,
+            )
+            existing["hidden"] = True
         return existing
 
     color = _tab_color(sheet_kind)
-    response = (
-        service.spreadsheets()
-        .batchUpdate(
+    def add_sheet_request_factory() -> Any:
+        current = get_sheet_info_by_title(
+            service,
+            spreadsheet_id,
+            title,
+            store_name=store_name,
+            logger=logger,
+        )
+        if current:
+            raise _SheetAlreadyExists(current)
+        return service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={
                 "requests": [
@@ -402,26 +685,50 @@ def ensure_sheet(service: Any, spreadsheet_id: str, title: str, sheet_kind: str)
                             "properties": {
                                 "title": title,
                                 "tabColor": color,
+                                "hidden": bool(hidden),
                             }
                         }
                     }
                 ]
             },
         )
-        .execute()
-    )
+
+    try:
+        response = _execute_sheet_request(
+            add_sheet_request_factory,
+            store_name=store_name,
+            tab_name=title,
+            operation="add sheet",
+            logger=logger,
+        )
+    except _SheetAlreadyExists as exists:
+        return exists.sheet_info
     add_reply = (response.get("replies") or [{}])[0].get("addSheet", {})
     props = add_reply.get("properties", {})
     return {
         "title": props.get("title", title),
         "sheet_id": props.get("sheetId"),
+        "index": props.get("index"),
+        "hidden": props.get("hidden", bool(hidden)),
         "banded_ranges": [],
         "conditional_rules": [],
     }
 
 
-def get_sheet_info_by_title(service: Any, spreadsheet_id: str, title: str) -> dict[str, Any] | None:
-    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+def get_sheet_info_by_title(
+    service: Any,
+    spreadsheet_id: str,
+    title: str,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any] | None:
+    metadata = _execute_sheet_request(
+        lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        store_name=store_name,
+        tab_name=title,
+        operation="get spreadsheet metadata",
+        logger=logger,
+    )
     for sheet in metadata.get("sheets", []):
         props = sheet.get("properties", {})
         if props.get("title") != title:
@@ -429,10 +736,144 @@ def get_sheet_info_by_title(service: Any, spreadsheet_id: str, title: str) -> di
         return {
             "title": props.get("title"),
             "sheet_id": props.get("sheetId"),
+            "index": props.get("index"),
+            "hidden": props.get("hidden", False),
+            "row_count": props.get("gridProperties", {}).get("rowCount"),
+            "column_count": props.get("gridProperties", {}).get("columnCount"),
             "banded_ranges": sheet.get("bandedRanges", []),
             "conditional_rules": sheet.get("conditionalFormats", []),
         }
     return None
+
+
+def ensure_sheet_grid_size(
+    service: Any,
+    spreadsheet_id: str,
+    *,
+    sheet_id: int,
+    title: str,
+    min_rows: int,
+    min_columns: int,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    row_count = max(int(min_rows or 1), 1)
+    column_count = max(int(min_columns or 1), 1)
+    _execute_sheet_request(
+        lambda: service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": int(sheet_id),
+                                "gridProperties": {
+                                    "rowCount": row_count,
+                                    "columnCount": column_count,
+                                },
+                            },
+                            "fields": "gridProperties.rowCount,gridProperties.columnCount",
+                        }
+                    }
+                ]
+            },
+        ),
+        store_name=store_name,
+        tab_name=title,
+        operation=f"resize grid to {row_count}x{column_count}",
+        logger=logger,
+    )
+
+
+def promote_staging_sheet(
+    service: Any,
+    spreadsheet_id: str,
+    *,
+    staging_title: str,
+    final_title: str,
+    staging_sheet_id: int,
+    sheet_kind: str,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    def request_factory() -> Any:
+        final_info = get_sheet_info_by_title(
+            service,
+            spreadsheet_id,
+            final_title,
+            store_name=store_name,
+            logger=logger,
+        )
+        staging_info = get_sheet_info_by_title(
+            service,
+            spreadsheet_id,
+            staging_title,
+            store_name=store_name,
+            logger=logger,
+        )
+        if final_info and int(final_info.get("sheet_id")) == int(staging_sheet_id):
+            raise _StagingPromotionComplete(final_info)
+        if not staging_info:
+            raise RuntimeError(f"Staging tab {staging_title!r} is missing before promotion to {final_title!r}.")
+
+        target_index = final_info.get("index") if final_info else staging_info.get("index")
+        requests: list[dict[str, Any]] = []
+        if final_info and int(final_info.get("sheet_id")) != int(staging_sheet_id):
+            requests.append({"deleteSheet": {"sheetId": int(final_info["sheet_id"])}})
+        properties: dict[str, Any] = {
+            "sheetId": int(staging_sheet_id),
+            "title": final_title,
+            "hidden": False,
+            "tabColor": _tab_color(sheet_kind),
+        }
+        fields = "title,hidden,tabColor"
+        if target_index is not None:
+            properties["index"] = max(int(target_index), 0)
+            fields += ",index"
+        requests.append(
+            {
+                "updateSheetProperties": {
+                    "properties": properties,
+                    "fields": fields,
+                }
+            }
+        )
+        return service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests})
+
+    try:
+        _execute_sheet_request(
+            request_factory,
+            store_name=store_name,
+            tab_name=final_title,
+            operation=f"promote staging tab {staging_title}",
+            logger=logger,
+        )
+    except _StagingPromotionComplete as complete:
+        return complete.sheet_info
+
+    promoted_info = get_sheet_info_by_title(
+        service,
+        spreadsheet_id,
+        final_title,
+        store_name=store_name,
+        logger=logger,
+    )
+    if not promoted_info or int(promoted_info.get("sheet_id")) != int(staging_sheet_id):
+        raise RuntimeError(f"Unable to promote staging tab {staging_title!r} to {final_title!r}.")
+    return promoted_info
+
+
+class _StagingPromotionComplete(Exception):
+    def __init__(self, sheet_info: Mapping[str, Any]) -> None:
+        super().__init__("staging tab was already promoted")
+        self.sheet_info = dict(sheet_info)
+
+
+class _SheetAlreadyExists(Exception):
+    def __init__(self, sheet_info: Mapping[str, Any]) -> None:
+        super().__init__("sheet already exists")
+        self.sheet_info = dict(sheet_info)
 
 
 def _format_ordering_sheet(
@@ -450,6 +891,8 @@ def _format_ordering_sheet(
     hidden_headers: set[str],
     sheet_kind: str,
     show_cost_price_separator: bool = True,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
 ) -> None:
     sheet_id = int(sheet_info["sheet_id"])
     header_row_index = header_row_number - 1
@@ -686,10 +1129,16 @@ def _format_ordering_sheet(
     requests.extend(_hidden_column_requests(sheet_id, headers, hidden_headers))
 
     if requests:
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": requests},
-        ).execute()
+        _execute_sheet_request(
+            lambda: service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests},
+            ),
+            store_name=store_name,
+            tab_name=str(sheet_info.get("title") or ""),
+            operation="format ordering tab",
+            logger=logger,
+        )
 
 
 def _format_readme_sheet(
@@ -699,6 +1148,8 @@ def _format_readme_sheet(
     values: Sequence[Sequence[Any]],
     total_rows: int,
     total_columns: int,
+    store_name: str | None = None,
+    logger: logging.Logger | None = None,
 ) -> None:
     sheet_id = int(sheet_info["sheet_id"])
     requests: list[dict[str, Any]] = []
@@ -911,10 +1362,16 @@ def _format_readme_sheet(
         )
 
     if requests:
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": requests},
-        ).execute()
+        _execute_sheet_request(
+            lambda: service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests},
+            ),
+            store_name=store_name,
+            tab_name=str(sheet_info.get("title") or ""),
+            operation="format README tab",
+            logger=logger,
+        )
 
 
 def _number_format_requests(
@@ -1364,9 +1821,32 @@ def _sheet_start_range(title: str) -> str:
     return f"'{escaped}'!A1"
 
 
+def _sheet_row_start_range(title: str, row_number: int) -> str:
+    escaped = str(title).replace("'", "''")
+    return f"'{escaped}'!A{max(int(row_number), 1)}"
+
+
 def _sheet_range(title: str) -> str:
     escaped = str(title).replace("'", "''")
     return f"'{escaped}'"
+
+
+def _store_log_context(store_code: str, store_name: str | None = None) -> str:
+    clean_code = str(store_code or "").strip()
+    clean_name = str(store_name or "").strip()
+    if clean_code and clean_name:
+        return f"{clean_code} - {clean_name}"
+    return clean_code or clean_name or "unknown-store"
+
+
+def _staging_tab_title(title: str) -> str:
+    clean_title = str(title or "").strip() or "untitled"
+    digest = hashlib.sha1(clean_title.encode("utf-8")).hexdigest()[:8]
+    prefix = "__tmp_"
+    suffix = f"_{digest}"
+    max_title_length = 100
+    max_clean_length = max_title_length - len(prefix) - len(suffix)
+    return f"{prefix}{clean_title[:max_clean_length]}{suffix}"
 
 
 def _find_readme_row_number(values: Sequence[Sequence[Any]], label: str) -> int | None:

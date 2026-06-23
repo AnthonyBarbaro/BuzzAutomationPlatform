@@ -1397,6 +1397,9 @@ def write_store_tabs_to_google_sheet(
     output_flags = sheet_output_flags(config)
     spreadsheet_id, _gid = parse_spreadsheet_target(spreadsheet_target)
     service = authenticate_sheets()
+    store_code = str(bundle["store_code"])
+    store_name = bmp._store_name_from_abbr(store_code)
+    store_context = f"{store_code} - {store_name}"
 
     summary_rows = build_summary_rows(bundle["summary"])
     write_result: dict[str, Any] = {
@@ -1414,6 +1417,8 @@ def write_store_tabs_to_google_sheet(
             sheet_kind="auto",
             hidden_headers={"Row Key"},
             show_cost_price_separator=bool(config.get("sheet_formatting", {}).get("show_cost_price_separator_line", True)),
+            store_name=store_context,
+            logger=logger,
         )
         write_result["auto"] = auto_write
         written_titles.append(auto_write["title"])
@@ -1422,7 +1427,13 @@ def write_store_tabs_to_google_sheet(
 
     if output_flags["review"]:
         review_title = str(bundle["tab_titles"]["review"])
-        existing_review_values = read_sheet_values(service, spreadsheet_id, review_title)
+        existing_review_values = read_sheet_values(
+            service,
+            spreadsheet_id,
+            review_title,
+            store_name=store_context,
+            logger=logger,
+        )
         preserved_review_df = merge_preserved_review_columns(
             bundle["review_df"],
             existing_review_values,
@@ -1437,23 +1448,25 @@ def write_store_tabs_to_google_sheet(
             sheet_kind="review",
             hidden_headers={"Row Key"},
             show_cost_price_separator=bool(config.get("sheet_formatting", {}).get("show_cost_price_separator_line", True)),
+            store_name=store_context,
+            logger=logger,
         )
         write_result["review"] = review_write
         written_titles.append(review_write["title"])
     else:
         write_result["review"] = {"enabled": False, "title": str(bundle["tab_titles"]["review"])}
 
-    store_name = bmp._store_name_from_abbr(str(bundle["store_code"]))
     readme_write = upsert_readme_tab(
         service=service,
         spreadsheet_id=spreadsheet_id,
-        store_code=str(bundle["store_code"]),
+        store_code=store_code,
         store_name=store_name,
         output_flags=output_flags,
         week_of=str(bundle["week_of"]),
         tab_titles=bundle["tab_titles"],
         manual_columns=config.get("review_manual_columns", []),
         snapshot_generated_at=str(bundle["snapshot_generated_at"]),
+        logger=logger,
     )
     write_result["readme"] = readme_write
 
@@ -1462,7 +1475,13 @@ def write_store_tabs_to_google_sheet(
         latest_tab_order.append(str(bundle["tab_titles"]["review"]))
     if output_flags["auto"]:
         latest_tab_order.append(str(bundle["tab_titles"]["auto"]))
-    moved_titles = move_latest_tabs_next_to_readme(service, spreadsheet_id, latest_tab_order)
+    moved_titles = move_latest_tabs_next_to_readme(
+        service,
+        spreadsheet_id,
+        latest_tab_order,
+        store_name=store_context,
+        logger=logger,
+    )
     write_result["front_tab_order"] = ["README"] + moved_titles
 
     logger.info("[%s] Wrote tabs: %s", bundle["store_code"], ", ".join(written_titles))
@@ -1522,6 +1541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     snapshot_generated_at = datetime.now(ZoneInfo(tz_name))
     proof_rows: list[dict[str, Any]] = []
+    succeeded_stores: list[str] = []
     failed_stores: list[str] = []
     for store_code in store_codes:
         store_config = resolve_store_config(config, store_code)
@@ -1576,6 +1596,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "write_result": write_result,
                 }
             )
+            succeeded_stores.append(store_code)
         except Exception as exc:
             failed_stores.append(store_code)
             logger.exception("[%s] Failed weekly ordering run: %s", store_code, exc)
@@ -1597,6 +1618,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     proof_path.parent.mkdir(parents=True, exist_ok=True)
     proof_path.write_text(json.dumps(proof_rows, indent=2, default=str), encoding="utf-8")
     logger.info("Run summary saved to %s", proof_path)
+    logger.info(
+        "Weekly ordering summary: succeeded=%s failed=%s",
+        ", ".join(succeeded_stores) if succeeded_stores else "none",
+        ", ".join(failed_stores) if failed_stores else "none",
+    )
     if failed_stores:
         logger.warning("Weekly ordering completed with failures for stores: %s", ", ".join(failed_stores))
         return 1

@@ -8,6 +8,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from googleapiclient.errors import HttpError
 
 import weekly_store_ordering_sheet as weekly_sheet
 import weekly_store_ordering_sheets as weekly_sheet_sheets
@@ -27,6 +28,153 @@ from weekly_store_ordering_sheets import build_readme_rows, build_sheet_matrix, 
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "weekly_store_ordering"
+
+
+class _FakeRequest:
+    def __init__(self, callback):
+        self._callback = callback
+
+    def execute(self):
+        return self._callback()
+
+
+class _FakeResp:
+    def __init__(self, status):
+        self.status = status
+        self.reason = str(status)
+
+
+def _raise(error):
+    raise error
+
+
+class _FakeValuesResource:
+    def __init__(self, service):
+        self.service = service
+        self.calls = []
+
+    def clear(self, **kwargs):
+        self.calls.append(("clear", kwargs))
+        return _FakeRequest(lambda: {})
+
+    def update(self, **kwargs):
+        self.calls.append(("update", kwargs))
+        def execute():
+            title, start_row = _parse_fake_update_range(kwargs.get("range", ""))
+            sheet = self.service.find_sheet(title)
+            if sheet and start_row > int(sheet.get("row_count", 1000)):
+                raise RuntimeError(f"range exceeds fake grid rows: {start_row}")
+            return {}
+
+        return _FakeRequest(execute)
+
+
+class _FakeSheetsResource:
+    def __init__(self, service):
+        self.service = service
+        self.values_resource = _FakeValuesResource(service)
+
+    def values(self):
+        return self.values_resource
+
+    def get(self, **kwargs):
+        return _FakeRequest(lambda: {"sheets": self.service.metadata_sheets()})
+
+    def batchUpdate(self, **kwargs):
+        body = kwargs.get("body", {})
+        self.service.batch_update_bodies.append(body)
+
+        def execute():
+            self.service.apply_batch_update(body)
+            if self.service.fail_next_batch_after_apply:
+                self.service.fail_next_batch_after_apply = False
+                raise TimeoutError("promote timed out after apply")
+            return {"replies": []}
+
+        return _FakeRequest(execute)
+
+
+class _FakeSheetsService:
+    def __init__(self, sheets):
+        self.sheets = [dict(sheet) for sheet in sheets]
+        self.batch_update_bodies = []
+        self.fail_next_batch_after_apply = False
+        self._spreadsheets = _FakeSheetsResource(self)
+
+    def spreadsheets(self):
+        return self._spreadsheets
+
+    def metadata_sheets(self):
+        return [
+            {
+                "properties": {
+                    "sheetId": sheet["sheet_id"],
+                    "title": sheet["title"],
+                    "index": sheet.get("index", index),
+                    "hidden": sheet.get("hidden", False),
+                    "gridProperties": {
+                        "rowCount": sheet.get("row_count", 1000),
+                        "columnCount": sheet.get("column_count", 26),
+                    },
+                },
+                "bandedRanges": sheet.get("banded_ranges", []),
+                "conditionalFormats": sheet.get("conditional_rules", []),
+            }
+            for index, sheet in enumerate(self.sheets)
+        ]
+
+    def apply_batch_update(self, body):
+        for request in body.get("requests", []):
+            if "deleteSheet" in request:
+                sheet_id = request["deleteSheet"]["sheetId"]
+                self.sheets = [sheet for sheet in self.sheets if sheet["sheet_id"] != sheet_id]
+                continue
+            add_sheet = request.get("addSheet")
+            if add_sheet:
+                properties = add_sheet.get("properties", {})
+                next_id = max([sheet["sheet_id"] for sheet in self.sheets], default=0) + 1
+                self.sheets.append(
+                    {
+                        "sheet_id": properties.get("sheetId", next_id),
+                        "title": properties.get("title", f"Sheet{next_id}"),
+                        "index": properties.get("index", len(self.sheets)),
+                        "hidden": properties.get("hidden", False),
+                        "row_count": properties.get("gridProperties", {}).get("rowCount", 1000),
+                        "column_count": properties.get("gridProperties", {}).get("columnCount", 26),
+                    }
+                )
+                continue
+            update = request.get("updateSheetProperties")
+            if update:
+                properties = update.get("properties", {})
+                sheet_id = properties.get("sheetId")
+                for sheet in self.sheets:
+                    if sheet["sheet_id"] != sheet_id:
+                        continue
+                    if "title" in properties:
+                        sheet["title"] = properties["title"]
+                    if "hidden" in properties:
+                        sheet["hidden"] = properties["hidden"]
+                    if "index" in properties:
+                        sheet["index"] = properties["index"]
+                    grid_properties = properties.get("gridProperties", {})
+                    if "rowCount" in grid_properties:
+                        sheet["row_count"] = grid_properties["rowCount"]
+                    if "columnCount" in grid_properties:
+                        sheet["column_count"] = grid_properties["columnCount"]
+
+    def find_sheet(self, title):
+        for sheet in self.sheets:
+            if sheet["title"] == title:
+                return sheet
+        return None
+
+
+def _parse_fake_update_range(range_name):
+    title_part, _, cell = str(range_name).partition("!")
+    title = title_part.strip("'").replace("''", "'")
+    row_digits = "".join(ch for ch in cell if ch.isdigit())
+    return title, int(row_digits or 1)
 
 
 class WeeklyStoreOrderingTests(unittest.TestCase):
@@ -290,6 +438,153 @@ class WeeklyStoreOrderingTests(unittest.TestCase):
                 mock.call(service, "spreadsheet-123", "NC 2026-04-13 Auto", 2),
             ],
         )
+
+    def test_sheet_execute_retries_timeout_and_logs_context(self):
+        outcomes = [TimeoutError("write operation timed out"), {"ok": True}]
+
+        def request_factory():
+            return _FakeRequest(lambda: outcomes.pop(0) if not isinstance(outcomes[0], Exception) else (_raise(outcomes.pop(0))))
+
+        with mock.patch("weekly_store_ordering_sheets.time.sleep") as mock_sleep:
+            with self.assertLogs("weekly_store_ordering.sheets", level="WARNING") as logs:
+                result = weekly_sheet_sheets._execute_sheet_request(
+                    request_factory,
+                    store_name="MV - Buzz Cannabis - Mission Valley",
+                    tab_name="MV 2026-06-22 Review",
+                    operation="write rows 1-500",
+                )
+
+        self.assertEqual(result, {"ok": True})
+        mock_sleep.assert_called_once_with(2.0)
+        self.assertIn("MV - Buzz Cannabis - Mission Valley", logs.output[0])
+        self.assertIn("MV 2026-06-22 Review", logs.output[0])
+        self.assertIn("attempt=1/5", logs.output[0])
+
+    def test_sheet_execute_retries_transient_google_status(self):
+        outcomes = [HttpError(_FakeResp(503), b"backend error"), {"ok": True}]
+
+        def request_factory():
+            return _FakeRequest(lambda: outcomes.pop(0) if not isinstance(outcomes[0], Exception) else (_raise(outcomes.pop(0))))
+
+        with mock.patch("weekly_store_ordering_sheets.time.sleep"):
+            result = weekly_sheet_sheets._execute_sheet_request(
+                request_factory,
+                store_name="MV",
+                tab_name="MV 2026-06-22 Review",
+                operation="format ordering tab",
+            )
+
+        self.assertEqual(result, {"ok": True})
+
+    def test_write_sheet_values_chunks_large_payloads(self):
+        service = _FakeSheetsService([])
+        values = [[row] for row in range(1201)]
+
+        written = weekly_sheet_sheets._write_sheet_values(
+            service,
+            "spreadsheet-123",
+            "MV 2026-06-22 Review",
+            values,
+            store_name="MV",
+            chunk_rows=500,
+        )
+
+        self.assertEqual(written, 1201)
+        value_calls = service.spreadsheets().values_resource.calls
+        self.assertEqual(value_calls[0][0], "clear")
+        update_calls = [call for call in value_calls if call[0] == "update"]
+        self.assertEqual([call[1]["range"] for call in update_calls], [
+            "'MV 2026-06-22 Review'!A1",
+            "'MV 2026-06-22 Review'!A501",
+            "'MV 2026-06-22 Review'!A1001",
+        ])
+        self.assertEqual([len(call[1]["body"]["values"]) for call in update_calls], [500, 500, 201])
+
+    def test_upsert_ordering_tab_resizes_staging_grid_before_chunk_writes(self):
+        title = "MV 2026-06-22 Review"
+        staging_title = weekly_sheet_sheets._staging_tab_title(title)
+        service = _FakeSheetsService(
+            [
+                {
+                    "sheet_id": 20,
+                    "title": staging_title,
+                    "index": 1,
+                    "hidden": True,
+                    "row_count": 1000,
+                    "column_count": 26,
+                },
+            ]
+        )
+        df = pd.DataFrame({"Row Key": [f"row-{index}" for index in range(1200)], "Product": ["Item"] * 1200})
+
+        result = weekly_sheet_sheets.upsert_ordering_tab(
+            service=service,
+            spreadsheet_id="spreadsheet-123",
+            title=title,
+            summary_rows=[],
+            df=df,
+            sheet_kind="review",
+            hidden_headers={"Row Key"},
+            show_cost_price_separator=False,
+            store_name="MV",
+        )
+
+        self.assertEqual(result["rows_written"], 1200)
+        final_sheet = service.find_sheet(title)
+        self.assertIsNotNone(final_sheet)
+        self.assertEqual(final_sheet["row_count"], 1201)
+        self.assertEqual(final_sheet["column_count"], 2)
+        update_ranges = [
+            call[1]["range"]
+            for call in service.spreadsheets().values_resource.calls
+            if call[0] == "update"
+        ]
+        self.assertIn(f"'{staging_title}'!A1001", update_ranges)
+
+    def test_promote_staging_sheet_recovers_when_timeout_happened_after_swap(self):
+        staging_title = weekly_sheet_sheets._staging_tab_title("MV 2026-06-22 Review")
+        service = _FakeSheetsService(
+            [
+                {"sheet_id": 10, "title": "MV 2026-06-22 Review", "index": 2, "hidden": False},
+                {"sheet_id": 20, "title": staging_title, "index": 7, "hidden": True},
+            ]
+        )
+        service.fail_next_batch_after_apply = True
+
+        with mock.patch("weekly_store_ordering_sheets.time.sleep"):
+            promoted = weekly_sheet_sheets.promote_staging_sheet(
+                service,
+                "spreadsheet-123",
+                staging_title=staging_title,
+                final_title="MV 2026-06-22 Review",
+                staging_sheet_id=20,
+                sheet_kind="review",
+                store_name="MV",
+            )
+
+        self.assertEqual(promoted["sheet_id"], 20)
+        final_sheets = [sheet for sheet in service.sheets if sheet["title"] == "MV 2026-06-22 Review"]
+        self.assertEqual(len(final_sheets), 1)
+        self.assertFalse(final_sheets[0]["hidden"])
+        self.assertNotIn(10, [sheet["sheet_id"] for sheet in service.sheets])
+
+    def test_ensure_sheet_recovers_when_timeout_happened_after_add(self):
+        service = _FakeSheetsService([])
+        service.fail_next_batch_after_apply = True
+
+        with mock.patch("weekly_store_ordering_sheets.time.sleep"):
+            info = weekly_sheet_sheets.ensure_sheet(
+                service,
+                "spreadsheet-123",
+                "MV 2026-06-22 Review",
+                "review",
+                hidden=True,
+                store_name="MV",
+            )
+
+        self.assertEqual(info["title"], "MV 2026-06-22 Review")
+        self.assertTrue(info["hidden"])
+        self.assertEqual(len(service.sheets), 1)
 
     def test_cost_price_separator_positions_mark_breaks_when_price_or_category_changes(self):
         df = pd.DataFrame(

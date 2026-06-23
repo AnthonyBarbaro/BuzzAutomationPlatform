@@ -446,11 +446,13 @@ def _sheet_full_range(sheet_title):
     return f"'{escaped}'"
 
 
-def authenticate_sheets():
+def authenticate_sheets(timeout: int = 180):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
+    from google_auth_httplib2 import AuthorizedHttp
     from googleapiclient.discovery import build
+    import httplib2
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -469,7 +471,8 @@ def authenticate_sheets():
             creds = flow.run_local_server(port=0)
         TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
 
-    return build("sheets", "v4", credentials=creds)
+    http = AuthorizedHttp(creds, http=httplib2.Http(timeout=int(timeout or 180)))
+    return build("sheets", "v4", http=http)
 
 
 def _find_sheet_info(service, spreadsheet_id, gid):
