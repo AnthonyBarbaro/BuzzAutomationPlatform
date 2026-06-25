@@ -12,7 +12,7 @@ from typing import Iterable
 import locale
 import shutil
 import warnings
-from deals_brand_config_sync import sync_brand_config_artifacts
+from deals_brand_config_sync import load_brand_criteria, sync_brand_config_artifacts
 # Global dictionary to map real names -> pseudonyms
 NAME_MAP = {}
 GLOBAL_COUNTER = 1
@@ -672,10 +672,11 @@ brand_config_source = "built-in deals.py"
 def refresh_brand_criteria(sync_reference=False, sync_sheet=False, log_source=True, log_errors=True):
     global brand_criteria, brand_config_source
 
-    brand_criteria = DEFAULT_BRAND_CRITERIA
-    brand_config_source = "built-in deals.py"
-    if log_source:
-        print("[INFO] Using built-in deals brand config from DEFAULT_BRAND_CRITERIA in deals.py.")
+    brand_criteria, brand_config_source = load_brand_criteria(
+        DEFAULT_BRAND_CRITERIA,
+        log_source=log_source,
+        log_errors=log_errors,
+    )
 
     if sync_reference:
         try:
