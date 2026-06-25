@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import html
+import json
 import math
 import mimetypes
 import os
@@ -10,7 +12,7 @@ import subprocess
 import sys
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from functools import lru_cache
@@ -92,15 +94,28 @@ ALL_STORE_SLOW_MOVER_REPORT_NAME = "_all_store_slow_movers"
 OWNER_BRAND_ROLLUP_REPORT_NAME = "owner_rollups"
 THIS_DIR = Path(__file__).resolve().parent
 FILES_DIR = THIS_DIR / "files"
+DEFAULT_INVENTORY_LINKS_MANIFEST = THIS_DIR / "inventory_links" / "latest.json"
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 GMAIL_TOKEN = THIS_DIR / "token_gmail.json"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+DRIVE_TOKEN = THIS_DIR / "token_drive.json"
 DEFAULT_REPORT_EMAIL = "anthony@buzzcannabis.com"
-OWNER_BRAND_ROLLUP_EMAIL = "anthony@buzzcannabis.com"
+OWNER_BRAND_ROLLUP_EMAILS = [
+    "anthony@buzzcannabis.com",
+]
+OWNER_BRAND_ROLLUP_EMAIL = ", ".join(OWNER_BRAND_ROLLUP_EMAILS)
+DEFAULT_INVENTORY_OTHER_DRIVE_FOLDER_ID = os.environ.get(
+    "OWNER_ROLLUP_INVENTORY_OTHER_FOLDER_ID",
+    "1aFdvqp5CCOLnhy45Q9decW_gSWbhjxfk",
+)
 
 SUPPLY_PRICE_BUCKET = 0.50
 SUPPLY_COST_BUCKET = 0.25
 SUPPLY_BASE_USE_VARIANT = False
+PDF_CHART_DPI = int(os.environ.get("BRAND_PACKET_CHART_DPI", "320") or "320")
+PDF_CHART_FORMAT = str(os.environ.get("BRAND_PACKET_CHART_FORMAT", "png") or "png").strip().lower()
+PDF_CHART_JPEG_QUALITY = int(os.environ.get("BRAND_PACKET_CHART_JPEG_QUALITY", "96") or "96")
 STORE_DISPLAY_ORDER = ["MV", "LM", "SV", "LG", "NC", "WP", "SE"]
 STORE_ORDER_RANK = {code: idx for idx, code in enumerate(STORE_DISPLAY_ORDER)}
 
@@ -125,6 +140,8 @@ VARIANT_KEYWORDS = [
 ]
 
 DEAL_TARGET_MARGIN = 0.35
+OWNER_HIGH_DISCOUNT_REFERENCE = 0.50
+OWNER_HIGH_DISCOUNT_ASSUMED_KICKBACK = 0.30
 DEAL_SCENARIOS = [
     {"label": "Current (No Deal, 30% Off)", "discount_pct": 0.30, "kickback_pct": 0.00},
     {"label": "40% Off + 20% Kickback", "discount_pct": 0.40, "kickback_pct": 0.20},
@@ -208,6 +225,7 @@ class OwnerBrandRollupArtifacts:
     brand_count: int
     missing_sales_stores: List[str]
     missing_catalog_stores: List[str]
+    store_pdf_paths: List[Path] = field(default_factory=list)
 
 
 @dataclass
@@ -408,6 +426,33 @@ def parse_store_codes_arg(stores_arg: Optional[str]) -> List[str]:
     return order_store_codes(valid) or all_codes
 
 
+def parse_email_recipients(value: Any) -> List[str]:
+    raw_values: List[Any]
+    if value is None:
+        raw_values = []
+    elif isinstance(value, str):
+        raw_values = [value]
+    else:
+        try:
+            raw_values = list(value)
+        except TypeError:
+            raw_values = [value]
+
+    recipients: List[str] = []
+    seen: set = set()
+    for raw in raw_values:
+        for part in re.split(r"[,;\s]+", str(raw or "")):
+            email = part.strip()
+            if not email:
+                continue
+            key = email.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            recipients.append(email)
+    return recipients
+
+
 def window_days(start_day: date, end_day: date) -> int:
     return (end_day - start_day).days + 1
 
@@ -531,6 +576,16 @@ def _owner_margin_gap_label(value: Any) -> str:
     return osnap.pp1(v) if hasattr(osnap, "pp1") else f"{v * 100.0:+.1f}pp"
 
 
+def _owner_assumed_kickback_rate(discount_rate: Any) -> float:
+    try:
+        discount = float(discount_rate)
+    except Exception:
+        return 0.0
+    if not np.isfinite(discount):
+        return 0.0
+    return OWNER_HIGH_DISCOUNT_ASSUMED_KICKBACK if discount > OWNER_HIGH_DISCOUNT_REFERENCE else 0.0
+
+
 def owner_brand_status_action(row: Dict[str, Any], targets: Dict[str, float]) -> Tuple[str, str]:
     net = float(row.get("net_revenue", 0.0) or 0.0)
     sales_share = float(row.get("sales_share_pct", 0.0) or 0.0)
@@ -545,6 +600,10 @@ def owner_brand_status_action(row: Dict[str, Any], targets: Dict[str, float]) ->
     min_sell = float(targets.get("min_sell_through", 0.25) or 0.25)
     credit_gap = float(row.get("credit_gap", 0.0) or 0.0)
     credit_gap_pct = float(row.get("credit_gap_pct_sales", 0.0) or 0.0)
+    deal_expected = float(row.get("deal_expected_credit_amount", 0.0) or 0.0)
+    expected_support = float(row.get("expected_credit_amount", 0.0) or 0.0)
+    assumed_kickback_rate = float(row.get("assumed_kickback_rate", 0.0) or 0.0)
+    projected_margin = float(row.get("margin_with_assumed_kickback", margin) or margin)
     sales_delta = row.get("sales_vs_prior_pct")
     sales_declining = isinstance(sales_delta, (int, float)) and np.isfinite(float(sales_delta)) and float(sales_delta) < -0.10
     sales_growing = isinstance(sales_delta, (int, float)) and np.isfinite(float(sales_delta)) and float(sales_delta) > 0.10
@@ -553,7 +612,19 @@ def owner_brand_status_action(row: Dict[str, Any], targets: Dict[str, float]) ->
     if sales_share < 0.01 and margin_gap < -0.05 and high_days:
         return "Exit / Reduce", "Exit or buyback"
     if credit_gap >= max(1000.0, net * 0.05) or credit_gap_pct >= 0.08:
+        if deal_expected > 0:
+            return "Fix", "Collect deal support"
         return "Fix", "Collect support"
+    if expected_support > 0 and margin_gap < -0.05 and projected_margin >= target_margin:
+        if credit_gap > 0:
+            return "Watch", "Confirm deal support" if deal_expected > 0 else "Confirm support"
+        return "Good", "Maintain"
+    if deal_expected > 0 and margin_gap < -0.05:
+        return "Fix", "Collect deal support"
+    if assumed_kickback_rate > 0 and margin_gap < -0.05 and projected_margin >= target_margin:
+        return "Watch", "Confirm 30% kickback"
+    if assumed_kickback_rate > 0 and margin_gap < -0.05:
+        return "Fix", "Collect 30% kickback"
     if margin_gap < -0.05:
         return "Fix", "Fix margin"
     if discount > max_discount and margin < target_margin:
@@ -2680,6 +2751,406 @@ def summarize_weekly(df: pd.DataFrame) -> pd.DataFrame:
         g["discount"] / approx_g,
     )
     return g.fillna(0.0).sort_values("week_start")
+
+
+BRAND_PRODUCT_INVENTORY_COLUMNS = [
+    "snapshot_product_key", "product_group_display", "category", "price_token", "cost_token",
+    "net_revenue", "gross_sales", "units", "profit_real", "margin_real", "discount", "discount_rate",
+    "tickets", "store_count", "units_sold_7d", "units_sold_14d", "units_sold_30d",
+    "units_on_hand", "inventory_value", "days_supply_30d", "merged_count", "product_list",
+]
+
+BRAND_CATEGORY_INVENTORY_COLUMNS = [
+    "category", "net_revenue", "units", "profit_real", "margin_real", "discount_rate",
+    "units_sold_7d", "units_sold_14d", "units_sold_30d", "units_on_hand", "inventory_value",
+    "days_supply_30d", "product_groups",
+]
+
+BRAND_TREND_COLUMNS = [
+    "period", "period_start", "net_revenue", "prior_net_revenue", "sales_vs_prior_pct",
+    "units", "tickets", "profit_real", "margin_real", "discount", "discount_rate",
+]
+
+
+def _snapshot_token_series(df: pd.DataFrame, token_col: str, fallback_values: pd.Series, bucket: float) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+    if token_col in df.columns:
+        tokens = df[token_col].fillna("").astype(str).str.strip().str.upper()
+        bad = tokens.isin({"", "NA", "N/A", "NAN", "NONE", "NULL", "0", "0.0", "0.00"})
+    else:
+        tokens = pd.Series("", index=df.index, dtype=str)
+        bad = pd.Series(True, index=df.index, dtype=bool)
+    fallback = pd.to_numeric(fallback_values, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    fallback_tokens = fallback.map(lambda v: _bucket_token(v, bucket))
+    tokens = tokens.mask(bad, fallback_tokens)
+    return tokens.fillna("NA").astype(str)
+
+
+def _snapshot_category_series(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=str)
+    if "category_normalized" in df.columns:
+        raw = df["category_normalized"]
+    elif "Category" in df.columns:
+        raw = df["Category"]
+    elif "Product Category" in df.columns:
+        raw = df["Product Category"]
+    else:
+        raw = pd.Series("UNKNOWN", index=df.index)
+    return raw.fillna("UNKNOWN").astype(str).map(normalize_category_value).replace({"": "UNKNOWN"})
+
+
+def _prepare_product_snapshot_sales(
+    sales_df: pd.DataFrame,
+    start_day: date,
+    end_day: date,
+    selected_store_codes: Sequence[str] = (),
+) -> pd.DataFrame:
+    if sales_df is None or sales_df.empty or "_date" not in sales_df.columns:
+        return pd.DataFrame(columns=sales_df.columns if sales_df is not None else [])
+
+    tmp = _date_filter(sales_df, start_day, end_day)
+    tmp = _filter_product_group_rows(tmp)
+    if tmp.empty:
+        return tmp
+    if selected_store_codes and "_store_abbr" in tmp.columns:
+        selected = {str(s).upper().strip() for s in selected_store_codes if str(s).strip()}
+        tmp["_store_abbr"] = tmp["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+        tmp = tmp[tmp["_store_abbr"].isin(selected)].copy()
+    if tmp.empty:
+        return tmp
+
+    for col in ["_net", "_gross", "_qty", "_cogs_real", "_profit_real", "_disc_total"]:
+        if col not in tmp.columns:
+            tmp[col] = 0.0
+        tmp[col] = pd.to_numeric(tmp[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    if "_tx_key" not in tmp.columns:
+        tmp["_tx_key"] = "__row_" + tmp.index.astype(str)
+    if "_store_abbr" not in tmp.columns:
+        tmp["_store_abbr"] = ""
+    if "_product_raw" not in tmp.columns:
+        tmp["_product_raw"] = tmp.get("product_group_display", pd.Series("Unknown", index=tmp.index))
+
+    qty_abs = tmp["_qty"].abs().replace({0: np.nan})
+    fallback_price = (tmp["_net"].abs() / qty_abs).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    fallback_cost = (tmp["_cogs_real"].abs() / qty_abs).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    tmp["snapshot_category"] = _snapshot_category_series(tmp)
+    tmp["snapshot_price_token"] = _snapshot_token_series(tmp, "merge_price_basis", fallback_price, SUPPLY_PRICE_BUCKET)
+    tmp["snapshot_cost_token"] = _snapshot_token_series(tmp, "merge_cost_basis", fallback_cost, SUPPLY_COST_BUCKET)
+    tmp["snapshot_product_key"] = (
+        tmp["snapshot_category"].astype(str) + "|P" + tmp["snapshot_price_token"].astype(str) + "|C" + tmp["snapshot_cost_token"].astype(str)
+    )
+    return tmp[tmp["snapshot_product_key"].str.strip() != ""].copy()
+
+
+def _prepare_product_snapshot_inventory(
+    catalog_df: pd.DataFrame,
+    selected_store_codes: Sequence[str] = (),
+) -> pd.DataFrame:
+    inv = _inventory_reporting_rows(catalog_df)
+    inv = _filter_product_group_rows(inv)
+    if inv is None or inv.empty:
+        return pd.DataFrame(columns=catalog_df.columns if catalog_df is not None else [])
+    if selected_store_codes and "_store_abbr" in inv.columns:
+        selected = {str(s).upper().strip() for s in selected_store_codes if str(s).strip()}
+        inv["_store_abbr"] = inv["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+        inv = inv[(inv["_store_abbr"] == "") | (inv["_store_abbr"].isin(selected))].copy()
+    if inv.empty:
+        return inv
+
+    for col in ["Available", "Inventory_Value"]:
+        if col not in inv.columns:
+            inv[col] = 0.0
+        inv[col] = pd.to_numeric(inv[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    if "Price_Used" in inv.columns:
+        price_values = pd.to_numeric(inv["Price_Used"], errors="coerce")
+    elif "shelf_price" in inv.columns:
+        price_values = pd.to_numeric(inv["shelf_price"], errors="coerce")
+    else:
+        price_values = pd.to_numeric(inv.get("Potential_Revenue", 0.0), errors="coerce") / inv["Available"].replace({0: np.nan})
+    if "Cost" in inv.columns:
+        cost_values = pd.to_numeric(inv["Cost"], errors="coerce")
+    elif "cost" in inv.columns:
+        cost_values = pd.to_numeric(inv["cost"], errors="coerce")
+    else:
+        cost_values = inv["Inventory_Value"] / inv["Available"].replace({0: np.nan})
+    if "_product_raw" not in inv.columns:
+        inv["_product_raw"] = inv.get("Product", inv.get("Product Name", inv.get("display_product", pd.Series("Unknown", index=inv.index))))
+
+    inv["snapshot_category"] = _snapshot_category_series(inv)
+    inv["snapshot_price_token"] = _snapshot_token_series(inv, "merge_price_basis", price_values, SUPPLY_PRICE_BUCKET)
+    inv["snapshot_cost_token"] = _snapshot_token_series(inv, "merge_cost_basis", cost_values, SUPPLY_COST_BUCKET)
+    inv["snapshot_product_key"] = (
+        inv["snapshot_category"].astype(str) + "|P" + inv["snapshot_price_token"].astype(str) + "|C" + inv["snapshot_cost_token"].astype(str)
+    )
+    return inv[inv["snapshot_product_key"].str.strip() != ""].copy()
+
+
+def _product_snapshot_name_maps(sales_tmp: pd.DataFrame, inv_tmp: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, int]]:
+    parts: List[pd.DataFrame] = []
+    if sales_tmp is not None and not sales_tmp.empty:
+        s = sales_tmp[["snapshot_product_key", "_product_raw", "_net"]].copy()
+        s = s.rename(columns={"_net": "__weight"})
+        parts.append(s)
+    if inv_tmp is not None and not inv_tmp.empty:
+        i = inv_tmp[["snapshot_product_key", "_product_raw", "Inventory_Value"]].copy()
+        i = i.rename(columns={"Inventory_Value": "__weight"})
+        parts.append(i)
+    if not parts:
+        return {}, {}, {}
+
+    tmp = pd.concat(parts, ignore_index=True)
+    tmp["_product_raw"] = tmp["_product_raw"].fillna("").astype(str).str.strip()
+    tmp = tmp[tmp["_product_raw"] != ""].copy()
+    if tmp.empty:
+        return {}, {}, {}
+    tmp["__weight"] = pd.to_numeric(tmp["__weight"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).abs()
+    grouped = tmp.groupby(["snapshot_product_key", "_product_raw"], as_index=False).agg(weight=("__weight", "sum"))
+    grouped = grouped.sort_values(["snapshot_product_key", "weight", "_product_raw"], ascending=[True, False, True])
+
+    display_map: Dict[str, str] = {}
+    list_map: Dict[str, str] = {}
+    count_map: Dict[str, int] = {}
+    for key, part in grouped.groupby("snapshot_product_key", sort=False):
+        names = [str(x).strip() for x in part["_product_raw"].tolist() if str(x).strip()]
+        if not names:
+            continue
+        top = _ordering_display_product_without_brand(names[0])
+        count_map[str(key)] = len(names)
+        display_map[str(key)] = f"{top} (+{len(names) - 1} variants)" if len(names) > 1 else top
+        list_map[str(key)] = "; ".join([_ordering_display_product_without_brand(n) for n in names])
+    return display_map, list_map, count_map
+
+
+def _snapshot_window_units(
+    sales_df: pd.DataFrame,
+    end_day: date,
+    days: int,
+    selected_store_codes: Sequence[str] = (),
+) -> pd.DataFrame:
+    if sales_df is None or sales_df.empty or "_date" not in sales_df.columns:
+        return pd.DataFrame(columns=["snapshot_product_key", f"units_sold_{days}d"])
+    start_day = end_day - timedelta(days=max(int(days), 1) - 1)
+    tmp = _prepare_product_snapshot_sales(sales_df, start_day, end_day, selected_store_codes)
+    if tmp.empty:
+        return pd.DataFrame(columns=["snapshot_product_key", f"units_sold_{days}d"])
+    if "_is_return" in tmp.columns:
+        tmp = tmp[~tmp["_is_return"].fillna(False).astype(bool)].copy()
+    tmp = tmp[pd.to_numeric(tmp["_qty"], errors="coerce").fillna(0.0) > 0].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["snapshot_product_key", f"units_sold_{days}d"])
+    out = tmp.groupby("snapshot_product_key", as_index=False).agg(**{f"units_sold_{days}d": ("_qty", "sum")})
+    return out
+
+
+def build_brand_product_inventory_snapshot(
+    sales_df: pd.DataFrame,
+    catalog_df: pd.DataFrame,
+    start_day: date,
+    end_day: date,
+    selected_store_codes: Sequence[str] = (),
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    sales_tmp = _prepare_product_snapshot_sales(sales_df, start_day, end_day, selected_store_codes)
+    inv_tmp = _prepare_product_snapshot_inventory(catalog_df, selected_store_codes)
+    display_map, product_list_map, count_map = _product_snapshot_name_maps(sales_tmp, inv_tmp)
+
+    sales_group = pd.DataFrame(columns=[
+        "snapshot_product_key", "category", "price_token", "cost_token", "net_revenue", "gross_sales",
+        "units", "profit_real", "discount", "tickets", "store_count",
+    ])
+    if sales_tmp is not None and not sales_tmp.empty:
+        sales_group = sales_tmp.groupby("snapshot_product_key", as_index=False).agg(
+            category=("snapshot_category", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+            price_token=("snapshot_price_token", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+            cost_token=("snapshot_cost_token", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+            net_revenue=("_net", "sum"),
+            gross_sales=("_gross", "sum"),
+            units=("_qty", "sum"),
+            profit_real=("_profit_real", "sum"),
+            discount=("_disc_total", "sum"),
+            tickets=("_tx_key", "nunique"),
+            store_count=("_store_abbr", "nunique"),
+        )
+
+    inv_group = pd.DataFrame(columns=["snapshot_product_key", "category", "price_token", "cost_token", "units_on_hand", "inventory_value"])
+    if inv_tmp is not None and not inv_tmp.empty:
+        inv_group = inv_tmp.groupby("snapshot_product_key", as_index=False).agg(
+            category=("snapshot_category", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+            price_token=("snapshot_price_token", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+            cost_token=("snapshot_cost_token", lambda s: s.mode().iloc[0] if not s.mode().empty else str(s.iloc[0])),
+            units_on_hand=("Available", "sum"),
+            inventory_value=("Inventory_Value", "sum"),
+        )
+
+    out = sales_group.merge(inv_group, on="snapshot_product_key", how="outer", suffixes=("_sales", "_inv"))
+    if out.empty:
+        return (
+            pd.DataFrame(columns=BRAND_PRODUCT_INVENTORY_COLUMNS),
+            pd.DataFrame(columns=BRAND_CATEGORY_INVENTORY_COLUMNS),
+        )
+    for base_col in ["category", "price_token", "cost_token"]:
+        sales_col = f"{base_col}_sales"
+        inv_col = f"{base_col}_inv"
+        if sales_col in out.columns or inv_col in out.columns:
+            out[base_col] = out.get(sales_col, pd.Series("", index=out.index)).replace("", np.nan).fillna(
+                out.get(inv_col, pd.Series("", index=out.index))
+            )
+    for col in [
+        "net_revenue", "gross_sales", "units", "profit_real", "discount", "tickets", "store_count",
+        "units_on_hand", "inventory_value",
+    ]:
+        out[col] = pd.to_numeric(out.get(col, 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    out["margin_real"] = out["profit_real"] / out["net_revenue"].replace({0: np.nan})
+    approx_gross = (out["net_revenue"] + out["discount"]).replace({0: np.nan})
+    out["discount_rate"] = np.where(
+        out["gross_sales"] > 0,
+        out["discount"] / out["gross_sales"].replace({0: np.nan}),
+        out["discount"] / approx_gross,
+    )
+
+    for days in [7, 14, 30]:
+        units_df = _snapshot_window_units(sales_df, end_day, days, selected_store_codes)
+        out = out.merge(units_df, on="snapshot_product_key", how="left")
+        out[f"units_sold_{days}d"] = pd.to_numeric(out.get(f"units_sold_{days}d", 0.0), errors="coerce").fillna(0.0).astype(float)
+    out["days_supply_30d"] = out.apply(
+        lambda r: _safe_dos(float(r.get("units_on_hand", 0.0)), safe_div(float(r.get("units_sold_30d", 0.0)), 30.0, 0.0)),
+        axis=1,
+    )
+    out["product_group_display"] = out["snapshot_product_key"].astype(str).map(display_map).fillna("")
+    fallback_display = out["category"].fillna("UNKNOWN").astype(str).str.title()
+    fallback_display = fallback_display + " $" + out["price_token"].fillna("NA").astype(str) + " / C$" + out["cost_token"].fillna("NA").astype(str)
+    out["product_group_display"] = out["product_group_display"].replace("", np.nan).fillna(fallback_display)
+    out["product_list"] = out["snapshot_product_key"].astype(str).map(product_list_map).fillna("")
+    out["merged_count"] = out["snapshot_product_key"].astype(str).map(count_map).fillna(1).astype(int)
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for c in ["margin_real", "discount_rate", "days_supply_30d"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    for c in BRAND_PRODUCT_INVENTORY_COLUMNS:
+        if c not in out.columns:
+            out[c] = 0.0 if c not in {"snapshot_product_key", "product_group_display", "category", "price_token", "cost_token", "product_list"} else ""
+    product_out = out[BRAND_PRODUCT_INVENTORY_COLUMNS].sort_values(
+        ["net_revenue", "units", "inventory_value"], ascending=[False, False, False]
+    ).reset_index(drop=True)
+
+    cat = product_out.groupby("category", as_index=False).agg(
+        net_revenue=("net_revenue", "sum"),
+        units=("units", "sum"),
+        profit_real=("profit_real", "sum"),
+        discount=("discount", "sum"),
+        gross_sales=("gross_sales", "sum"),
+        units_sold_7d=("units_sold_7d", "sum"),
+        units_sold_14d=("units_sold_14d", "sum"),
+        units_sold_30d=("units_sold_30d", "sum"),
+        units_on_hand=("units_on_hand", "sum"),
+        inventory_value=("inventory_value", "sum"),
+        product_groups=("snapshot_product_key", "nunique"),
+    )
+    cat["margin_real"] = cat["profit_real"] / cat["net_revenue"].replace({0: np.nan})
+    approx_cat_gross = (cat["net_revenue"] + cat["discount"]).replace({0: np.nan})
+    cat["discount_rate"] = np.where(
+        cat["gross_sales"] > 0,
+        cat["discount"] / cat["gross_sales"].replace({0: np.nan}),
+        cat["discount"] / approx_cat_gross,
+    )
+    cat["days_supply_30d"] = cat.apply(
+        lambda r: _safe_dos(float(r.get("units_on_hand", 0.0)), safe_div(float(r.get("units_sold_30d", 0.0)), 30.0, 0.0)),
+        axis=1,
+    )
+    for c in BRAND_CATEGORY_INVENTORY_COLUMNS:
+        if c not in cat.columns:
+            cat[c] = 0.0 if c != "category" else ""
+    category_out = cat[BRAND_CATEGORY_INVENTORY_COLUMNS].replace([np.inf, -np.inf], np.nan).sort_values(
+        ["net_revenue", "inventory_value"], ascending=[False, False]
+    ).reset_index(drop=True)
+    return product_out, category_out
+
+
+def _brand_period_summary(tmp: pd.DataFrame, period_col: str, period_label_col: str) -> pd.DataFrame:
+    if tmp is None or tmp.empty or period_col not in tmp.columns:
+        return pd.DataFrame(columns=BRAND_TREND_COLUMNS)
+    for col in ["_net", "_gross", "_qty", "_profit_real", "_disc_total"]:
+        if col not in tmp.columns:
+            tmp[col] = 0.0
+        tmp[col] = pd.to_numeric(tmp[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    if "_tx_key" not in tmp.columns:
+        tmp["_tx_key"] = "__row_" + tmp.index.astype(str)
+    g = tmp.groupby(period_col, as_index=False).agg(
+        net_revenue=("_net", "sum"),
+        gross_sales=("_gross", "sum"),
+        units=("_qty", "sum"),
+        tickets=("_tx_key", "nunique"),
+        profit_real=("_profit_real", "sum"),
+        discount=("_disc_total", "sum"),
+    )
+    g["period_start"] = pd.to_datetime(g[period_col], errors="coerce")
+    g = g.sort_values("period_start").reset_index(drop=True)
+    g["period"] = g["period_start"].dt.strftime(period_label_col)
+    g["prior_net_revenue"] = g["net_revenue"].shift(1)
+    g["sales_vs_prior_pct"] = [
+        pct_change(cur, prior) if pd.notna(prior) else np.nan
+        for cur, prior in zip(g["net_revenue"], g["prior_net_revenue"])
+    ]
+    g["margin_real"] = g["profit_real"] / g["net_revenue"].replace({0: np.nan})
+    approx_gross = (g["net_revenue"] + g["discount"]).replace({0: np.nan})
+    g["discount_rate"] = np.where(
+        g["gross_sales"] > 0,
+        g["discount"] / g["gross_sales"].replace({0: np.nan}),
+        g["discount"] / approx_gross,
+    )
+    for c in BRAND_TREND_COLUMNS:
+        if c not in g.columns:
+            g[c] = np.nan if c in {"prior_net_revenue", "sales_vs_prior_pct", "margin_real", "discount_rate"} else 0.0
+    return g[BRAND_TREND_COLUMNS].replace([np.inf, -np.inf], np.nan)
+
+
+def build_brand_sales_trend_snapshots(
+    sales_df: pd.DataFrame,
+    start_day: date,
+    end_day: date,
+    selected_store_codes: Sequence[str] = (),
+) -> Dict[str, pd.DataFrame]:
+    cols = BRAND_TREND_COLUMNS
+    if sales_df is None or sales_df.empty or "_date" not in sales_df.columns:
+        empty = pd.DataFrame(columns=cols)
+        return {"daily": empty.copy(), "weekly": empty.copy(), "monthly": empty.copy()}
+
+    tmp = _date_filter(sales_df, start_day, end_day)
+    if selected_store_codes and "_store_abbr" in tmp.columns:
+        selected = {str(s).upper().strip() for s in selected_store_codes if str(s).strip()}
+        tmp["_store_abbr"] = tmp["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+        tmp = tmp[tmp["_store_abbr"].isin(selected)].copy()
+    if tmp.empty:
+        empty = pd.DataFrame(columns=cols)
+        return {"daily": empty.copy(), "weekly": empty.copy(), "monthly": empty.copy()}
+
+    tmp = tmp.copy()
+    tmp["day_start"] = pd.to_datetime(tmp["_date"], errors="coerce").dt.date
+    tmp["week_start"] = tmp["day_start"].apply(lambda d: d - timedelta(days=d.weekday()) if pd.notna(d) else pd.NaT)
+    tmp["month_start"] = pd.to_datetime(tmp["day_start"], errors="coerce").dt.to_period("M").dt.to_timestamp().dt.date
+
+    daily = _brand_period_summary(tmp, "day_start", "%b %d")
+    if not daily.empty:
+        all_days = pd.DataFrame({"period_start": pd.date_range(start=start_day, end=end_day, freq="D")})
+        daily["period_start"] = pd.to_datetime(daily["period_start"], errors="coerce")
+        daily = all_days.merge(daily.drop(columns=["period"], errors="ignore"), on="period_start", how="left")
+        daily["period"] = daily["period_start"].dt.strftime("%b %d")
+        for col in ["net_revenue", "units", "tickets", "profit_real", "discount"]:
+            daily[col] = pd.to_numeric(daily.get(col, 0.0), errors="coerce").fillna(0.0)
+        daily["prior_net_revenue"] = daily["net_revenue"].shift(1)
+        daily["sales_vs_prior_pct"] = [
+            pct_change(cur, prior) if pd.notna(prior) else np.nan
+            for cur, prior in zip(daily["net_revenue"], daily["prior_net_revenue"])
+        ]
+        daily["margin_real"] = daily["profit_real"] / daily["net_revenue"].replace({0: np.nan})
+        daily["discount_rate"] = daily["discount"] / (daily["net_revenue"] + daily["discount"]).replace({0: np.nan})
+        daily = daily[cols].replace([np.inf, -np.inf], np.nan)
+
+    return {
+        "daily": daily,
+        "weekly": _brand_period_summary(tmp, "week_start", "%b %d"),
+        "monthly": _brand_period_summary(tmp, "month_start", "%b %Y"),
+    }
 
 
 def summarize_product_groups(df: pd.DataFrame) -> pd.DataFrame:
@@ -5126,6 +5597,252 @@ def _owner_inventory_by_brand(catalog_all_df: pd.DataFrame) -> pd.DataFrame:
     return grouped[[c for c in cols if c in grouped.columns]].copy()
 
 
+def _owner_load_deals_brand_config() -> Tuple[Dict[str, Any], str]:
+    try:
+        import deals  # type: ignore
+    except Exception as exc:
+        return {}, f"unavailable: {exc}"
+
+    try:
+        if hasattr(deals, "refresh_brand_criteria"):
+            criteria = deals.refresh_brand_criteria(
+                sync_reference=False,
+                sync_sheet=False,
+                log_source=False,
+                log_errors=True,
+            )
+        else:
+            criteria = getattr(deals, "brand_criteria", None) or getattr(deals, "DEFAULT_BRAND_CRITERIA", {})
+        source = str(getattr(deals, "brand_config_source", "") or "deals.py")
+        return dict(criteria or {}), source
+    except Exception as exc:
+        fallback = getattr(deals, "DEFAULT_BRAND_CRITERIA", {})
+        return dict(fallback or {}), f"built-in deals.py fallback after error: {exc}"
+
+
+def _owner_deals_brand_criteria() -> Dict[str, Any]:
+    criteria, _source = _owner_load_deals_brand_config()
+    return criteria
+
+
+def _owner_deal_normalize_rules(criteria: Any, config_name: str) -> List[Dict[str, Any]]:
+    if isinstance(criteria, list):
+        base: Dict[str, Any] = {}
+        rules = criteria
+    else:
+        base = dict(criteria or {})
+        rules = base.pop("rules", None) or [{}]
+
+    out: List[Dict[str, Any]] = []
+    for idx, rule in enumerate(rules, start=1):
+        effective = dict(base)
+        effective.update(rule or {})
+        effective.setdefault("rule_name", f"{config_name} Rule {idx}")
+        effective.setdefault("stores", base.get("stores", STORE_DISPLAY_ORDER))
+        effective.setdefault("vendors", base.get("vendors", []))
+        effective.setdefault("days", base.get("days", []))
+        out.append(effective)
+    return out
+
+
+def _owner_deal_text_match(value: Any, patterns: Sequence[Any]) -> bool:
+    text = str(value or "").lower()
+    text_canon = canon(text)
+    for pattern in patterns or []:
+        pat = str(pattern or "").strip().lower()
+        if not pat:
+            continue
+        pat_clean = pat.strip(" |-/")
+        if pat in text or (pat_clean and pat_clean in text):
+            return True
+        pat_canon = canon(pat)
+        if pat_canon and pat_canon in text_canon:
+            return True
+    return False
+
+
+def _owner_deal_vendor_col(df: pd.DataFrame) -> str:
+    for col in [
+        "vendor name", "Vendor Name", "vendor", "Vendor", "producer", "Producer",
+        "vendor_name", "VendorName",
+    ]:
+        if col in df.columns:
+            return col
+    return ""
+
+
+def _owner_deal_date_bound(value: Any) -> Optional[pd.Timestamp]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return pd.Timestamp(parsed).normalize()
+
+
+def _owner_deal_candidate_configs(
+    brand_name: str,
+    brand_sales_df: pd.DataFrame,
+    criteria_by_brand: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, Any]]:
+    criteria = criteria_by_brand if criteria_by_brand is not None else _owner_deals_brand_criteria()
+    if not criteria:
+        return []
+
+    brand_text = str(brand_name or "")
+    brand_canon = canon(brand_text)
+    product_series = (
+        brand_sales_df.get("_product_raw", pd.Series(dtype=str)).fillna("").astype(str)
+        if brand_sales_df is not None and not brand_sales_df.empty
+        else pd.Series(dtype=str)
+    )
+
+    direct_matches: List[Tuple[str, Any]] = []
+    product_matches: List[Tuple[str, Any]] = []
+    for config_name, config in criteria.items():
+        aliases: List[Any] = [config_name]
+        if isinstance(config, list):
+            for rule in config:
+                if isinstance(rule, dict):
+                    aliases.extend(rule.get("brands") or [])
+        elif isinstance(config, dict):
+            aliases.extend(config.get("brands") or [])
+            for rule in config.get("rules") or []:
+                if isinstance(rule, dict):
+                    aliases.extend(rule.get("brands") or [])
+        else:
+            continue
+
+        direct_name_match = any(
+            canon(alias) and (canon(alias) == brand_canon or canon(alias) in brand_canon or brand_canon in canon(alias))
+            for alias in aliases
+        )
+        product_match = False
+        if not product_series.empty:
+            product_match = bool(product_series.map(lambda txt: _owner_deal_text_match(txt, aliases)).any())
+        if direct_name_match:
+            direct_matches.append((str(config_name), config))
+        elif product_match:
+            product_matches.append((str(config_name), config))
+    return direct_matches if direct_matches else product_matches
+
+
+def _owner_deal_rule_mask(df: pd.DataFrame, rule: Dict[str, Any]) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    mask = pd.Series(True, index=df.index, dtype=bool)
+
+    stores = [str(s).upper().strip() for s in (rule.get("stores") or []) if str(s).strip()]
+    if stores and "_store_abbr" in df.columns:
+        store_series = df["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+        mask &= store_series.isin(stores)
+
+    days = [str(d).strip() for d in (rule.get("days") or []) if str(d).strip()]
+    if days and "_date" in df.columns:
+        day_series = pd.to_datetime(df["_date"], errors="coerce").dt.day_name()
+        mask &= day_series.isin(days)
+
+    start_bound = _owner_deal_date_bound(rule.get("start_date"))
+    end_bound = _owner_deal_date_bound(rule.get("end_date"))
+    if (start_bound is not None or end_bound is not None) and "_date" in df.columns:
+        date_series = pd.to_datetime(df["_date"], errors="coerce").dt.normalize()
+        date_mask = date_series.notna()
+        if start_bound is not None:
+            date_mask &= date_series >= start_bound
+        if end_bound is not None:
+            date_mask &= date_series <= end_bound
+        mask &= date_mask
+
+    categories = [normalize_category_value(c) for c in (rule.get("categories") or []) if str(c).strip()]
+    if categories and "category_normalized" in df.columns:
+        category_series = df["category_normalized"].fillna("").astype(str).map(normalize_category_value)
+        mask &= category_series.isin(categories)
+
+    vendors = [str(v).strip() for v in (rule.get("vendors") or []) if str(v).strip()]
+    vendor_col = _owner_deal_vendor_col(df)
+    if vendors and vendor_col:
+        mask &= df[vendor_col].fillna("").astype(str).isin(vendors)
+
+    product_series = df.get("_product_raw", pd.Series("", index=df.index)).fillna("").astype(str)
+    brands = [str(v).strip() for v in (rule.get("brands") or []) if str(v).strip()]
+    if brands:
+        mask &= product_series.map(lambda txt: _owner_deal_text_match(txt, brands))
+
+    include_phrases = [str(v).strip() for v in (rule.get("include_phrases") or []) if str(v).strip()]
+    if include_phrases:
+        mask &= product_series.map(lambda txt: _owner_deal_text_match(txt, include_phrases))
+
+    excluded_phrases = [str(v).strip() for v in (rule.get("excluded_phrases") or []) if str(v).strip()]
+    if excluded_phrases:
+        mask &= ~product_series.map(lambda txt: _owner_deal_text_match(txt, excluded_phrases))
+
+    return mask.fillna(False).astype(bool)
+
+
+def summarize_owner_deal_config_support(
+    brand_sales_df: pd.DataFrame,
+    brand_name: str,
+    criteria_by_brand: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = {
+        "deal_expected_credit_amount": 0.0,
+        "deal_rows": 0,
+        "deal_config_names": "",
+        "deal_rule_names": "",
+        "deal_avg_kickback_rate": 0.0,
+    }
+    if brand_sales_df is None or brand_sales_df.empty:
+        return out
+
+    candidates = _owner_deal_candidate_configs(brand_name, brand_sales_df, criteria_by_brand=criteria_by_brand)
+    if not candidates:
+        return out
+
+    remaining = brand_sales_df.copy()
+    if "_cogs_real" not in remaining.columns:
+        remaining["_cogs_real"] = 0.0
+    remaining["_cogs_real"] = pd.to_numeric(remaining["_cogs_real"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+
+    total_support = 0.0
+    total_cost = 0.0
+    total_rows = 0
+    config_names: List[str] = []
+    rule_names: List[str] = []
+    for config_name, criteria in candidates:
+        if remaining.empty:
+            break
+        matched_config = False
+        for rule in _owner_deal_normalize_rules(criteria, config_name):
+            if remaining.empty:
+                break
+            mask = _owner_deal_rule_mask(remaining, rule)
+            matched = remaining[mask].copy()
+            if matched.empty:
+                continue
+            try:
+                kickback_rate = float(rule.get("kickback", 0.0) or 0.0)
+            except Exception:
+                kickback_rate = 0.0
+            support = float((matched["_cogs_real"] * kickback_rate).sum())
+            cost = float(matched["_cogs_real"].sum())
+            total_support += support
+            total_cost += cost
+            total_rows += int(len(matched))
+            matched_config = True
+            rule_names.append(str(rule.get("rule_name") or config_name))
+            remaining = remaining.drop(index=matched.index, errors="ignore")
+        if matched_config:
+            config_names.append(config_name)
+
+    out["deal_expected_credit_amount"] = max(total_support, 0.0)
+    out["deal_rows"] = total_rows
+    out["deal_config_names"] = ", ".join(dict.fromkeys(config_names))
+    out["deal_rule_names"] = "; ".join(dict.fromkeys(rule_names))
+    out["deal_avg_kickback_rate"] = safe_div(total_support, total_cost, 0.0)
+    return out
+
+
 def build_owner_brand_rollup_scorecard(
     sales_all_df: pd.DataFrame,
     catalog_all_df: pd.DataFrame,
@@ -5140,9 +5857,14 @@ def build_owner_brand_rollup_scorecard(
     cols = [
         "rank", "brand_key", "brand_name", "net_revenue", "sales_share_pct", "sales_vs_prior_pct",
         "prior_net_revenue", "units", "units_vs_prior_pct", "prior_units", "margin_real",
-        "target_margin", "margin_gap_pp", "discount_rate", "inventory_value", "units_available",
-        "days_supply", "sell_through_pct", "credit_gap", "credit_gap_pct_sales", "status",
-        "recommended_action", "top_store", "top_category", "top_product", "credit_rows",
+        "target_margin", "margin_gap_pp", "discount_rate", "assumed_kickback_rate",
+        "assumed_kickback_amount", "margin_with_assumed_kickback", "margin_gap_after_assumed_kickback_pp",
+        "projected_support_amount", "support_source", "deal_expected_credit_amount", "deal_rows",
+        "deal_config_names", "deal_rule_names", "deal_avg_kickback_rate", "deal_config_source",
+        "support_needed_after_assumed_kickback", "inventory_value", "units_available", "days_supply",
+        "sell_through_pct", "expected_credit_amount", "received_credit_amount", "expected_credit_margin",
+        "received_credit_margin", "credit_gap", "credit_gap_pct_sales", "status", "recommended_action",
+        "top_store", "top_category", "top_product", "credit_rows", "creditflow_rows",
     ]
     if sales_all_df is None or sales_all_df.empty or "brand_key" not in sales_all_df.columns:
         return pd.DataFrame(columns=cols)
@@ -5157,6 +5879,7 @@ def build_owner_brand_rollup_scorecard(
         prior_df = pd.DataFrame(columns=sales_all_df.columns)
     if report_df.empty:
         return pd.DataFrame(columns=cols)
+    deal_criteria, deal_config_source = _owner_load_deals_brand_config()
 
     current = summarize_group(report_df, "brand_key")
     if current.empty:
@@ -5218,8 +5941,16 @@ def build_owner_brand_rollup_scorecard(
         brand_targets = get_brand_targets(targets_payload, brand_name)
         effective_target = float(target_margin if target_margin is not None else brand_targets.get("target_margin", DEAL_TARGET_MARGIN))
         brand_targets["target_margin"] = effective_target
+        assumed_kickback_rate = _owner_assumed_kickback_rate(discount_rate)
+        assumed_kickback_amount = net * assumed_kickback_rate
+        real_profit = net * margin_real
 
         brand_sales_df = report_df[report_df["brand_key"].fillna("").astype(str) == brand_key].copy()
+        deal_support = summarize_owner_deal_config_support(
+            brand_sales_df,
+            brand_name,
+            criteria_by_brand=deal_criteria,
+        )
         credit_summary, _credit_reconciliation = summarize_credit_reconciliation(
             all_credit_rows,
             brand_sales_df,
@@ -5229,7 +5960,22 @@ def build_owner_brand_rollup_scorecard(
             target_margin=effective_target,
             system_expected_credit=0.0,
         )
-        credit_gap = float(credit_summary.get("credit_gap", 0.0) or 0.0)
+        deal_expected = float(deal_support.get("deal_expected_credit_amount", 0.0) or 0.0)
+        ledger_expected = float(credit_summary.get("expected_credit_amount", 0.0) or 0.0)
+        received_credit = float(credit_summary.get("received_credit_amount", 0.0) or 0.0)
+        expected_credit = max(deal_expected, ledger_expected)
+        projected_support_amount = expected_credit if expected_credit > 0 else assumed_kickback_amount
+        if deal_expected > 0:
+            support_source = str(deal_support.get("deal_config_names") or "deals.py")
+        elif ledger_expected > 0:
+            support_source = "ledger/CreditFlow"
+        elif assumed_kickback_amount > 0:
+            support_source = "discount assumption"
+        else:
+            support_source = "none"
+        margin_with_assumed_kickback = safe_div(real_profit + projected_support_amount, net, margin_real)
+        support_needed_after_assumed = max(effective_target * net - (real_profit + projected_support_amount), 0.0)
+        credit_gap = max(expected_credit - received_credit, float(credit_summary.get("credit_gap", 0.0) or 0.0), 0.0)
 
         units_per_day = safe_div(units, report_days, 0.0)
         out = {
@@ -5247,16 +5993,34 @@ def build_owner_brand_rollup_scorecard(
             "target_margin": effective_target,
             "margin_gap_pp": pp_change(margin_real, effective_target),
             "discount_rate": discount_rate,
+            "assumed_kickback_rate": assumed_kickback_rate,
+            "assumed_kickback_amount": assumed_kickback_amount,
+            "margin_with_assumed_kickback": margin_with_assumed_kickback,
+            "margin_gap_after_assumed_kickback_pp": pp_change(margin_with_assumed_kickback, effective_target),
+            "projected_support_amount": projected_support_amount,
+            "support_source": support_source,
+            "deal_expected_credit_amount": deal_expected,
+            "deal_rows": int(deal_support.get("deal_rows", 0) or 0),
+            "deal_config_names": str(deal_support.get("deal_config_names", "") or ""),
+            "deal_rule_names": str(deal_support.get("deal_rule_names", "") or ""),
+            "deal_avg_kickback_rate": float(deal_support.get("deal_avg_kickback_rate", 0.0) or 0.0),
+            "deal_config_source": deal_config_source,
+            "support_needed_after_assumed_kickback": support_needed_after_assumed,
             "inventory_value": float(row.get("inventory_value", 0.0) or 0.0),
             "units_available": units_available,
             "days_supply": safe_div(units_available, units_per_day, float("nan")),
             "sell_through_pct": safe_div(units, units + units_available, 0.0),
+            "expected_credit_amount": expected_credit,
+            "received_credit_amount": received_credit,
+            "expected_credit_margin": safe_div(real_profit + expected_credit, net, margin_real),
+            "received_credit_margin": safe_div(real_profit + received_credit, net, margin_real),
             "credit_gap": credit_gap,
             "credit_gap_pct_sales": safe_div(credit_gap, net, 0.0),
             "top_store": top_store_map.get(brand_key, "n/a"),
             "top_category": top_category_map.get(brand_key, "n/a"),
             "top_product": top_product_map.get(brand_key, "n/a"),
-            "credit_rows": int(credit_summary.get("credit_rows", 0) or 0),
+            "credit_rows": int(credit_summary.get("credit_rows", 0) or 0) + int(deal_support.get("deal_rows", 0) or 0),
+            "creditflow_rows": int(credit_summary.get("creditflow_rows", 0) or 0),
         }
         status, action = owner_brand_status_action(out, brand_targets)
         out["status"] = status
@@ -5286,15 +6050,45 @@ def _owner_summary_from_scorecard(
 
     reviewed = scorecard.copy() if scorecard is not None else pd.DataFrame()
     credit_gap = float(pd.to_numeric(reviewed.get("credit_gap", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not reviewed.empty else 0.0
+    reviewed_net = float(pd.to_numeric(reviewed.get("net_revenue", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not reviewed.empty else 0.0
+    reviewed_profit = 0.0
+    if not reviewed.empty:
+        reviewed_profit = float((
+            pd.to_numeric(reviewed.get("net_revenue", 0.0), errors="coerce").fillna(0.0)
+            * pd.to_numeric(reviewed.get("margin_real", 0.0), errors="coerce").fillna(0.0)
+        ).sum())
+    projected_support = float(pd.to_numeric(reviewed.get("projected_support_amount", reviewed.get("assumed_kickback_amount", pd.Series(dtype=float))), errors="coerce").fillna(0.0).sum()) if not reviewed.empty else 0.0
+    expected_support = float(pd.to_numeric(reviewed.get("expected_credit_amount", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not reviewed.empty else 0.0
+    deal_support = float(pd.to_numeric(reviewed.get("deal_expected_credit_amount", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not reviewed.empty else 0.0
+    deal_sources: List[str] = []
+    if not reviewed.empty and "deal_config_source" in reviewed.columns:
+        deal_sources = [
+            str(value).strip()
+            for value in reviewed["deal_config_source"].dropna().astype(str).unique().tolist()
+            if str(value).strip()
+        ]
+    brands_with_assumed_kickback = int((
+        pd.to_numeric(reviewed.get("assumed_kickback_rate", pd.Series(dtype=float)), errors="coerce").fillna(0.0) > 0
+    ).sum()) if not reviewed.empty else 0
     return {
         "generated_at": datetime.now(ZoneInfo(REPORT_TZ)).isoformat(timespec="seconds"),
         "start_date": start_day.isoformat(),
         "end_date": end_day.isoformat(),
         "stores": ", ".join(selected_store_codes),
         "total_net_sales": float(report_metrics.get("net_revenue", 0.0) or 0.0),
+        "top_brands_net_sales": reviewed_net,
+        "top_brands_sales_share": safe_div(reviewed_net, float(report_metrics.get("net_revenue", 0.0) or 0.0), 0.0),
         "total_units_sold": total_units,
+        "total_real_profit": float(report_metrics.get("profit_real", 0.0) or 0.0),
         "average_real_margin": float(report_metrics.get("margin_real", 0.0) or 0.0),
+        "average_margin_with_assumed_kickback": safe_div(reviewed_profit + projected_support, reviewed_net, float(report_metrics.get("margin_real", 0.0) or 0.0)),
         "average_discount_rate": float(report_metrics.get("discount_rate", 0.0) or 0.0),
+        "assumed_kickback_amount": projected_support,
+        "projected_support_amount": projected_support,
+        "expected_support_amount": expected_support,
+        "deal_support_amount": deal_support,
+        "deal_config_source": "; ".join(deal_sources) if deal_sources else "deals.py",
+        "brands_with_assumed_kickback": brands_with_assumed_kickback,
         "inventory_value": inventory_value,
         "days_supply": days_supply,
         "total_credit_gap": credit_gap,
@@ -5310,6 +6104,226 @@ def _owner_short_text(value: Any, max_chars: int = 32) -> str:
         return text
     cut = text[: max_chars - 3].rsplit(" ", 1)[0].strip()
     return (cut or text[: max_chars - 3]).rstrip(" |-/") + "..."
+
+
+def _owner_inventory_link_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _owner_drive_folder_link(folder_id: str) -> str:
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def _owner_escape_drive_query_value(value: Any) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _owner_build_drive_service(logger: Optional[Callable[[str], None]] = None):
+    if not DRIVE_TOKEN.exists():
+        if logger:
+            logger(f"[WARN] Drive token not found: {DRIVE_TOKEN}")
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(str(DRIVE_TOKEN), DRIVE_SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            DRIVE_TOKEN.write_text(creds.to_json(), encoding="utf-8")
+        if not creds or not creds.valid:
+            if logger:
+                logger("[WARN] Drive token is not valid; skipping live inventory folder lookup.")
+            return None
+        return build("drive", "v3", credentials=creds)
+    except Exception as exc:
+        if logger:
+            logger(f"[WARN] Could not initialize Drive service for inventory links: {exc}")
+        return None
+
+
+def _owner_drive_child_folders(service, parent_id: str) -> List[Dict[str, str]]:
+    parent_escaped = _owner_escape_drive_query_value(parent_id)
+    query = (
+        "mimeType='application/vnd.google-apps.folder' "
+        "and trashed=false "
+        f"and '{parent_escaped}' in parents"
+    )
+    folders: List[Dict[str, str]] = []
+    page_token = None
+    while True:
+        request = service.files().list(
+            q=query,
+            spaces="drive",
+            fields="nextPageToken, files(id,name,modifiedTime,webViewLink)",
+            pageSize=1000,
+            pageToken=page_token,
+        )
+        response = request.execute()
+        folders.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return folders
+
+
+def _owner_latest_date_folder(folders: Sequence[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    candidates: List[Tuple[date, Dict[str, str]]] = []
+    for folder in folders or []:
+        name = str(folder.get("name") or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", name):
+            continue
+        try:
+            candidates.append((date.fromisoformat(name), folder))
+        except ValueError:
+            continue
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def load_owner_inventory_other_drive_links(
+    parent_folder_id: str = DEFAULT_INVENTORY_OTHER_DRIVE_FOLDER_ID,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Dict[str, str]]:
+    parent_id = str(parent_folder_id or "").strip()
+    if not parent_id:
+        return {}
+    service = _owner_build_drive_service(logger=logger)
+    if service is None:
+        return {}
+    try:
+        date_folder = _owner_latest_date_folder(_owner_drive_child_folders(service, parent_id))
+        if not date_folder:
+            if logger:
+                logger("[WARN] No dated folders found under INVENTORY_OTHER.")
+            return {}
+        date_folder_name = str(date_folder.get("name") or "").strip()
+        date_folder_id = str(date_folder.get("id") or "").strip()
+        child_folders = _owner_drive_child_folders(service, date_folder_id)
+        other_folder = next(
+            (
+                folder for folder in child_folders
+                if _owner_inventory_link_key(folder.get("name")) == "other"
+            ),
+            None,
+        )
+        brand_parent = other_folder or date_folder
+        brand_parent_id = str(brand_parent.get("id") or "").strip()
+        brand_parent_name = str(brand_parent.get("name") or "").strip()
+        brand_folders = _owner_drive_child_folders(service, brand_parent_id)
+    except Exception as exc:
+        if logger:
+            logger(f"[WARN] Could not read live INVENTORY_OTHER Drive folders: {exc}")
+        return {}
+
+    try:
+        manifest_day = date.fromisoformat(date_folder_name).strftime("%A")
+    except ValueError:
+        manifest_day = ""
+    if _owner_inventory_link_key(brand_parent_name) == "other":
+        source = f"INVENTORY_OTHER / {date_folder_name} / {brand_parent_name}"
+    else:
+        source = f"INVENTORY_OTHER / {date_folder_name}"
+    lookup: Dict[str, Dict[str, str]] = {}
+    for folder in brand_folders:
+        folder_name = str(folder.get("name") or "").strip()
+        folder_id = str(folder.get("id") or "").strip()
+        key = _owner_inventory_link_key(folder_name)
+        if not key or not folder_id:
+            continue
+        lookup[key] = {
+            "folder_name": folder_name,
+            "link": str(folder.get("webViewLink") or _owner_drive_folder_link(folder_id)),
+            "source": source,
+            "manifest_date": date_folder_name,
+            "manifest_day": manifest_day,
+            "generated_at": "",
+        }
+    if logger:
+        logger(f"[INFO] Loaded {len(lookup)} live inventory brand folder link(s) from {source}.")
+    return lookup
+
+
+def load_owner_inventory_link_lookup(
+    manifest_path: Optional[Path] = None,
+    logger: Optional[Callable[[str], None]] = None,
+    include_drive_lookup: bool = False,
+    drive_parent_folder_id: str = DEFAULT_INVENTORY_OTHER_DRIVE_FOLDER_ID,
+) -> Dict[str, Dict[str, str]]:
+    path = Path(manifest_path or DEFAULT_INVENTORY_LINKS_MANIFEST)
+    lookup: Dict[str, Dict[str, str]] = {}
+    if not path.exists():
+        if logger:
+            logger(f"[WARN] Inventory link manifest not found: {path}")
+    else:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            if logger:
+                logger(f"[WARN] Could not read inventory link manifest {path}: {exc}")
+            payload = {}
+        manifest_date = str(payload.get("date") or "")
+        manifest_day = str(payload.get("day") or "")
+        generated_at = str(payload.get("generated_at") or "")
+
+        def add_folder(folder_name: Any, info: Any, source_label: str) -> None:
+            name = str(folder_name or "").strip()
+            if isinstance(info, str):
+                link = info.strip()
+            elif isinstance(info, dict):
+                link = str(info.get("link") or "").strip()
+            else:
+                link = ""
+            key = _owner_inventory_link_key(name)
+            if not key or not link:
+                return
+            lookup.setdefault(key, {
+                "folder_name": name,
+                "link": link,
+                "source": source_label,
+                "manifest_date": manifest_date,
+                "manifest_day": manifest_day,
+                "generated_at": generated_at,
+            })
+
+        other_folder = payload.get("other_folder") or {}
+        if isinstance(other_folder, dict):
+            other_source = " / ".join(
+                str(part).strip()
+                for part in [
+                    other_folder.get("parent_folder_name") or "INVENTORY_OTHER",
+                    other_folder.get("folder_name") or "OTHER",
+                ]
+                if str(part or "").strip()
+            )
+            brand_folders = other_folder.get("brand_folders") or {}
+            if isinstance(brand_folders, dict):
+                for folder_name, info in brand_folders.items():
+                    add_folder(folder_name, info, other_source)
+
+        folders = payload.get("folders") or {}
+        if isinstance(folders, dict):
+            for folder_name, info in folders.items():
+                add_folder(folder_name, info, "Brand inventory folder")
+
+    if include_drive_lookup:
+        live_lookup = load_owner_inventory_other_drive_links(
+            parent_folder_id=drive_parent_folder_id,
+            logger=logger,
+        )
+        lookup.update(live_lookup)
+    return lookup
+
+
+def _owner_inventory_link_for_brand(
+    brand_name: Any,
+    brand_key: Any = "",
+    inventory_links: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Optional[Dict[str, str]]:
+    links = inventory_links or {}
+    for candidate in [brand_name, brand_key]:
+        key = _owner_inventory_link_key(candidate)
+        if key and key in links:
+            return links[key]
+    return None
 
 
 def _owner_pdf_styles() -> Dict[str, ParagraphStyle]:
@@ -5331,11 +6345,15 @@ def _owner_p(text: Any, style: ParagraphStyle) -> Paragraph:
     return Paragraph(xml_escape(str(text or "")), style)
 
 
+def _owner_markup_p(markup: Any, style: ParagraphStyle) -> Paragraph:
+    return Paragraph(str(markup or ""), style)
+
+
 def _owner_scorecard_table(scorecard: pd.DataFrame) -> Table:
     styles = _owner_pdf_styles()
     headers = [
-        "#", "Brand", "Sales", "Share", "Sales +/-", "Units", "Unit +/-", "Margin", "Target",
-        "Gap", "Disc", "Inv $", "DOS", "Sell", "Credit", "Cred %", "Status", "Action",
+        "#", "Brand", "Sales", "Share", "vs Prior", "Units", "Margin", "W/Support",
+        "Disc", "Deal Due", "Inventory Cost", "DOS", "Open Due", "Status", "Action",
     ]
     rows: List[List[Any]] = [headers]
     if scorecard is not None and not scorecard.empty:
@@ -5347,22 +6365,19 @@ def _owner_scorecard_table(scorecard: pd.DataFrame) -> Table:
                 pct1(r.get("sales_share_pct", 0.0)),
                 _owner_pct_change_label(r.get("sales_vs_prior_pct"), r.get("net_revenue", 0.0), r.get("prior_net_revenue", 0.0)),
                 int0(r.get("units", 0.0)),
-                _owner_pct_change_label(r.get("units_vs_prior_pct"), r.get("units", 0.0), r.get("prior_units", 0.0)),
                 pct1(r.get("margin_real", 0.0)),
-                pct1(r.get("target_margin", 0.0)),
-                _owner_margin_gap_label(r.get("margin_gap_pp", 0.0)),
+                pct1(r.get("margin_with_assumed_kickback", r.get("margin_real", 0.0))),
                 pct1(r.get("discount_rate", 0.0)),
+                money0(r.get("expected_credit_amount", r.get("projected_support_amount", 0.0))),
                 money0(r.get("inventory_value", 0.0)),
                 days1(r.get("days_supply", np.nan)),
-                pct1(r.get("sell_through_pct", 0.0)),
                 money0(r.get("credit_gap", 0.0)),
-                pct1(r.get("credit_gap_pct_sales", 0.0)),
                 str(r.get("status", "")),
                 str(r.get("recommended_action", "")),
             ])
 
-    right_cols = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-    center_cols = {0, 16}
+    right_cols = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+    center_cols = {0, 13}
     wrapped: List[List[Any]] = []
     for ridx, row in enumerate(rows):
         out_row: List[Any] = []
@@ -5378,9 +6393,9 @@ def _owner_scorecard_table(scorecard: pd.DataFrame) -> Table:
         wrapped.append(out_row)
 
     col_widths = [
-        0.26 * inch, 1.00 * inch, 0.58 * inch, 0.42 * inch, 0.52 * inch, 0.42 * inch,
-        0.52 * inch, 0.43 * inch, 0.43 * inch, 0.43 * inch, 0.42 * inch, 0.56 * inch,
-        0.42 * inch, 0.42 * inch, 0.55 * inch, 0.44 * inch, 0.58 * inch, 0.83 * inch,
+        0.28 * inch, 1.38 * inch, 0.68 * inch, 0.45 * inch, 0.58 * inch, 0.44 * inch,
+        0.50 * inch, 0.64 * inch, 0.44 * inch, 0.66 * inch, 0.58 * inch, 0.44 * inch,
+        0.64 * inch, 0.62 * inch, 1.22 * inch,
     ]
     table = Table(wrapped, colWidths=col_widths, repeatRows=1, hAlign="LEFT", splitByRow=1)
     style_cmds: List[Tuple[Any, ...]] = [
@@ -5402,9 +6417,9 @@ def _owner_scorecard_table(scorecard: pd.DataFrame) -> Table:
         "Exit / Reduce": "#F6D5D1",
     }
     for ridx, row in enumerate(rows[1:], start=1):
-        color = status_color.get(str(row[16]), "")
+        color = status_color.get(str(row[13]), "")
         if color:
-            style_cmds.append(("BACKGROUND", (16, ridx), (17, ridx), colors.HexColor(color)))
+            style_cmds.append(("BACKGROUND", (13, ridx), (14, ridx), colors.HexColor(color)))
     table.setStyle(TableStyle(style_cmds))
     return table
 
@@ -5421,6 +6436,60 @@ def _owner_panel_table(title: str, rows: Sequence[str], width: float = 3.15 * in
         ("RIGHTPADDING", (0, 0), (-1, -1), 5),
         ("TOPPADDING", (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return table
+
+
+def _owner_inventory_link_panel(
+    brand_name: str,
+    link_info: Dict[str, str],
+    width: float = 10.05 * inch,
+) -> Table:
+    styles = _owner_pdf_styles()
+    bold = getattr(osnap, "BOLD_FONT", "Helvetica-Bold")
+    link_style = ParagraphStyle(
+        "OwnerInventoryLink",
+        fontName=bold,
+        fontSize=8.5,
+        leading=10.3,
+        textColor=colors.HexColor("#1D4ED8"),
+        splitLongWords=1,
+    )
+    folder_name = str(link_info.get("folder_name") or brand_name or "").strip()
+    source = str(link_info.get("source") or "INVENTORY_OTHER").strip()
+    manifest_date = str(link_info.get("manifest_date") or "").strip()
+    manifest_day = str(link_info.get("manifest_day") or "").strip()
+    generated_at = str(link_info.get("generated_at") or "").strip()
+    link = str(link_info.get("link") or "").strip()
+    date_label = manifest_date
+    if manifest_day and manifest_date:
+        date_label = f"{manifest_date} ({manifest_day})"
+    elif manifest_day:
+        date_label = manifest_day
+    if not date_label and generated_at:
+        date_label = generated_at
+    source_line = f"Matched folder: {source} / {folder_name}."
+    if date_label:
+        source_line += f" Link manifest date: {date_label}."
+    safe_href = xml_escape(link, {'"': "&quot;"})
+    safe_label = xml_escape(f"Open {folder_name} inventory folder")
+    data = [
+        [_owner_p("Current Inventory Report", styles["head"])],
+        [_owner_p(source_line, styles["small"])],
+        [_owner_markup_p(f'<a href="{safe_href}">{safe_label}</a>', link_style)],
+        [_owner_p(link, styles["small"])],
+        [_owner_p("Source refresh: BrandINVEmailer weekday 6 AM inventory job.", styles["small"])],
+    ]
+    table = Table(data, colWidths=[width], hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F6B5D")),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F6F8F7")),
+        ("BOX", (0, 0), (-1, -1), 0.45, colors.HexColor("#D7DEE0")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     return table
@@ -5444,6 +6513,92 @@ def _owner_panel_grid(panels: Sequence[Table], cols: int = 3) -> Table:
     return table
 
 
+def _owner_detail_metric_card(
+    label: str,
+    value: Any,
+    note: str = "",
+    accent: str = "#2F6B5D",
+    width: float = 2.48 * inch,
+) -> Table:
+    base = getattr(osnap, "BASE_FONT", "Helvetica")
+    bold = getattr(osnap, "BOLD_FONT", "Helvetica-Bold")
+    label_style = ParagraphStyle(
+        "OwnerDetailMetricLabel",
+        fontName=bold,
+        fontSize=6.4,
+        leading=7.4,
+        textColor=colors.HexColor("#52615D"),
+        splitLongWords=0,
+    )
+    value_style = ParagraphStyle(
+        "OwnerDetailMetricValue",
+        fontName=bold,
+        fontSize=15.0,
+        leading=16.8,
+        textColor=colors.HexColor("#111827"),
+        splitLongWords=0,
+    )
+    note_style = ParagraphStyle(
+        "OwnerDetailMetricNote",
+        fontName=base,
+        fontSize=7.0,
+        leading=8.2,
+        textColor=colors.HexColor("#4B5563"),
+        splitLongWords=0,
+    )
+    table = Table(
+        [[_owner_p(str(label).upper(), label_style)], [_owner_p(value, value_style)], [_owner_p(note, note_style)]],
+        colWidths=[width],
+        rowHeights=[0.17 * inch, 0.30 * inch, 0.28 * inch],
+        hAlign="LEFT",
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F4F7F5")),
+        ("BOX", (0, 0), (-1, -1), 0.55, colors.HexColor("#CBD5D1")),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.6, colors.HexColor(accent)),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return table
+
+
+def _owner_detail_metric_grid(cards: Sequence[Table], cols: int = 4) -> Table:
+    rows: List[List[Any]] = []
+    for idx in range(0, len(cards), cols):
+        row = list(cards[idx:idx + cols])
+        while len(row) < cols:
+            row.append("")
+        rows.append(row)
+    table = Table(rows, colWidths=[2.56 * inch] * cols, hAlign="LEFT")
+    table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return table
+
+
+def _owner_flex_col_widths(
+    min_widths: Sequence[float],
+    total_width: float = 10.15 * inch,
+    flex_cols: Optional[Sequence[int]] = None,
+) -> List[float]:
+    widths = [float(w) for w in min_widths]
+    extra = max(float(total_width) - sum(widths), 0.0)
+    targets = list(flex_cols or range(len(widths)))
+    targets = [idx for idx in targets if 0 <= idx < len(widths)]
+    if extra and targets:
+        add = extra / len(targets)
+        for idx in targets:
+            widths[idx] += add
+    return widths
+
+
 def _owner_rank_lines(df: pd.DataFrame, value_col: str, formatter, top_n: int = 5, ascending: bool = False) -> List[str]:
     if df is None or df.empty or value_col not in df.columns:
         return ["No data"]
@@ -5459,16 +6614,630 @@ def _owner_rank_lines(df: pd.DataFrame, value_col: str, formatter, top_n: int = 
 
 
 def _owner_brand_card(row: pd.Series, width: float = 4.95 * inch) -> Table:
+    projected_support = float(row.get("projected_support_amount", row.get("assumed_kickback_amount", 0.0)) or 0.0)
+    expected_due = float(row.get("expected_credit_amount", 0.0) or 0.0)
+    support_source = _owner_short_text(row.get("support_source", "none"), 26)
     lines = [
         f"Sales {money0(row.get('net_revenue', 0.0))} | Share {pct1(row.get('sales_share_pct', 0.0))}",
         f"Sales vs prior {_owner_pct_change_label(row.get('sales_vs_prior_pct'), row.get('net_revenue', 0.0), row.get('prior_net_revenue', 0.0))} | Units vs prior {_owner_pct_change_label(row.get('units_vs_prior_pct'), row.get('units', 0.0), row.get('prior_units', 0.0))}",
         f"Margin {pct1(row.get('margin_real', 0.0))} | Discount {pct1(row.get('discount_rate', 0.0))}",
-        f"DOS {days1(row.get('days_supply', np.nan))} | Credit gap {money0(row.get('credit_gap', 0.0))}",
+        f"Margin w/support {pct1(row.get('margin_with_assumed_kickback', row.get('margin_real', 0.0)))} | Support {money0(expected_due if expected_due > 0 else projected_support)}",
+        f"Source {support_source} | Open support {money0(row.get('credit_gap', 0.0))}",
+        f"DOS {days1(row.get('days_supply', np.nan))} | Inventory {money0(row.get('inventory_value', 0.0))}",
         f"Top store {row.get('top_store', 'n/a')} | Category {_owner_short_text(row.get('top_category', 'n/a'), 20)}",
         f"Top item {_owner_short_text(row.get('top_product', 'n/a'), 38)}",
         f"Main issue {row.get('status', '')}: {row.get('recommended_action', '')}",
     ]
     return _owner_panel_table(f"{int(row.get('rank', 0) or 0)}. {_owner_short_text(row.get('brand_name', ''), 32)}", lines, width=width)
+
+
+def _owner_brand_sales_df(report_df: Optional[pd.DataFrame], brand_key: str) -> pd.DataFrame:
+    if report_df is None or report_df.empty or "brand_key" not in report_df.columns:
+        return pd.DataFrame()
+    key = str(brand_key or "").strip()
+    tmp = report_df.copy()
+    tmp["brand_key"] = tmp["brand_key"].fillna("").astype(str)
+    return tmp[tmp["brand_key"] == key].copy()
+
+
+def _owner_brand_catalog_df(
+    catalog_all_df: Optional[pd.DataFrame],
+    brand_key: str,
+    selected_store_codes: Sequence[str],
+) -> pd.DataFrame:
+    if catalog_all_df is None or catalog_all_df.empty or "brand_key" not in catalog_all_df.columns:
+        return pd.DataFrame()
+    key = str(brand_key or "").strip()
+    tmp = catalog_all_df.copy()
+    tmp["brand_key"] = tmp["brand_key"].fillna("").astype(str)
+    tmp = tmp[tmp["brand_key"] == key].copy()
+    if tmp.empty:
+        return tmp
+    if selected_store_codes and "_store_abbr" in tmp.columns:
+        selected = {str(s).upper().strip() for s in selected_store_codes if str(s).strip()}
+        tmp["_store_abbr"] = tmp["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+        tmp = tmp[(tmp["_store_abbr"] == "") | (tmp["_store_abbr"].isin(selected))].copy()
+    return tmp
+
+
+def _owner_brand_store_summary_rows(
+    brand_sales_df: pd.DataFrame,
+    selected_store_codes: Sequence[str],
+) -> List[List[Any]]:
+    rows: List[List[Any]] = [["Store", "Sales", "Share", "Units", "Tickets", "Margin", "Discount", "Top Product"]]
+    selected = order_store_codes([str(s).upper().strip() for s in selected_store_codes if str(s).strip()])
+    if brand_sales_df is None or brand_sales_df.empty or "_store_abbr" not in brand_sales_df.columns:
+        rows.append(["No store sales rows", "", "", "", "", "", "", ""])
+        return rows
+
+    tmp = brand_sales_df.copy()
+    tmp["_store_abbr"] = tmp["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+    tmp = tmp[tmp["_store_abbr"] != ""].copy()
+    if selected:
+        tmp = tmp[tmp["_store_abbr"].isin(selected)].copy()
+    if tmp.empty:
+        rows.append(["No store sales rows", "", "", "", "", "", "", ""])
+        return rows
+
+    for col in ["_net", "_gross", "_qty", "_disc_total", "_profit_real"]:
+        if col not in tmp.columns:
+            tmp[col] = 0.0
+        tmp[col] = pd.to_numeric(tmp[col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if "_tx_key" not in tmp.columns:
+        tmp["_tx_key"] = ""
+
+    grouped = tmp.groupby("_store_abbr", as_index=False).agg(
+        net_revenue=("_net", "sum"),
+        gross_sales=("_gross", "sum"),
+        units=("_qty", "sum"),
+        tickets=("_tx_key", "nunique"),
+        discount=("_disc_total", "sum"),
+        profit_real=("_profit_real", "sum"),
+    )
+    grouped["margin_real"] = grouped["profit_real"] / grouped["net_revenue"].replace({0: np.nan})
+    approx_gross = (grouped["net_revenue"] + grouped["discount"]).replace({0: np.nan})
+    grouped["discount_rate"] = np.where(
+        grouped["gross_sales"] > 0,
+        grouped["discount"] / grouped["gross_sales"].replace({0: np.nan}),
+        grouped["discount"] / approx_gross,
+    )
+    grouped = grouped.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    total_net = float(grouped["net_revenue"].sum())
+
+    product_col = "product_group_display" if "product_group_display" in tmp.columns else "_product_raw"
+    top_product_map: Dict[str, str] = {}
+    if product_col in tmp.columns:
+        product_sales = tmp.groupby(["_store_abbr", product_col], as_index=False).agg(net_revenue=("_net", "sum"))
+        product_sales[product_col] = product_sales[product_col].fillna("").astype(str)
+        product_sales = product_sales.sort_values(["_store_abbr", "net_revenue"], ascending=[True, False])
+        for store, part in product_sales.groupby("_store_abbr"):
+            top_product_map[str(store)] = str(part.iloc[0][product_col] or "")
+
+    rank_map = {code: idx for idx, code in enumerate(selected or order_store_codes(grouped["_store_abbr"].tolist()))}
+    grouped["_rank"] = grouped["_store_abbr"].map(lambda s: rank_map.get(str(s).upper(), 999))
+    grouped = grouped.sort_values(["_rank", "net_revenue"], ascending=[True, False])
+    for _, r in grouped.iterrows():
+        store = str(r.get("_store_abbr") or "")
+        rows.append([
+            store,
+            money0(r.get("net_revenue", 0.0)),
+            pct1(safe_div(float(r.get("net_revenue", 0.0) or 0.0), total_net, 0.0)),
+            int0(r.get("units", 0.0)),
+            int0(r.get("tickets", 0.0)),
+            pct1(r.get("margin_real", 0.0)),
+            pct1(r.get("discount_rate", 0.0)),
+            _owner_short_text(top_product_map.get(store, "n/a"), 34),
+        ])
+    return rows
+
+
+def _owner_brand_weekly_store_rows(
+    brand_sales_df: pd.DataFrame,
+    selected_store_codes: Sequence[str],
+    max_weeks: int = 6,
+) -> Tuple[List[List[Any]], List[float]]:
+    weekly = build_dashboard_store_weekly_metrics(brand_sales_df, selected_store_codes)
+    empty_widths = _owner_flex_col_widths(
+        [0.66 * inch, 0.90 * inch, 5.25 * inch, 0.92 * inch, 0.70 * inch, 0.70 * inch],
+        flex_cols=[2],
+    )
+    if weekly is None or weekly.empty:
+        return [["Store", "Total", "No weekly data", "Latest +/-", "Margin", "Disc"]], empty_widths
+
+    work = weekly.copy()
+    work["store"] = work["store"].fillna("").astype(str).str.upper().str.strip()
+    work = work[work["store"] != ""].copy()
+    work["week_sort"] = pd.to_datetime(work["week_start"], errors="coerce")
+    work = work.dropna(subset=["week_sort"]).copy()
+    if work.empty:
+        return [["Store", "Total", "No weekly data", "Latest +/-", "Margin", "Disc"]], empty_widths
+
+    week_values = sorted(work["week_sort"].dropna().unique().tolist())[-max(1, int(max_weeks)):]
+    week_labels: List[str] = []
+    for week_value in week_values:
+        week_dt = pd.Timestamp(week_value).date()
+        week_labels.append(f"{week_dt:%b} {week_dt.day}")
+    rows: List[List[Any]] = [["Store", "Total"] + week_labels + ["Latest +/-", "Margin", "Disc"]]
+
+    selected = order_store_codes([str(s).upper().strip() for s in selected_store_codes if str(s).strip()])
+    stores = selected or order_store_codes(work["store"].dropna().astype(str).unique().tolist())
+    for store in stores:
+        part = work[work["store"] == store].copy().sort_values("week_sort")
+        if part.empty:
+            rows.append([store, "$0"] + ["$0"] * len(week_labels) + ["n/a", "0.0%", "0.0%"])
+            continue
+        total = float(pd.to_numeric(part["net_sales"], errors="coerce").fillna(0.0).sum())
+        week_map = {
+            pd.Timestamp(r["week_sort"]).date(): float(r.get("net_sales", 0.0) or 0.0)
+            for _, r in part.iterrows()
+        }
+        latest = part.iloc[-1]
+        rows.append([
+            store,
+            money0(total),
+            *[money0(week_map.get(pd.Timestamp(w).date(), 0.0)) for w in week_values],
+            _format_delta(latest.get("sales_vs_prior_week_pct"), latest.get("net_sales", 0.0), latest.get("prior_week_net_sales", 0.0)),
+            pct1(latest.get("real_margin_pct", 0.0)),
+            pct1(latest.get("discount_pct", 0.0)),
+        ])
+    col_widths = _owner_flex_col_widths(
+        [0.66 * inch, 0.90 * inch] + ([0.78 * inch] * len(week_labels)) + [0.78 * inch, 0.62 * inch, 0.62 * inch],
+        flex_cols=list(range(2, 2 + len(week_labels))),
+    )
+    return rows, col_widths
+
+
+def _owner_should_show_store_comparison(selected_store_codes: Sequence[str]) -> bool:
+    """Store comparison tables are only useful when multiple stores are in scope."""
+    return len(order_store_codes([str(s).upper().strip() for s in selected_store_codes if str(s).strip()])) > 1
+
+
+def _owner_chart_image(buf: BytesIO, width: float, height: float) -> Any:
+    if buf is None or not hasattr(buf, "getbuffer") or buf.getbuffer().nbytes <= 0:
+        return Spacer(1, 0.01 * inch)
+    return Image(buf, width=width, height=height)
+
+
+def _owner_as_date(value: Any) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.date()
+
+
+def _owner_week_range_label(
+    period_start: Any,
+    report_start: Any,
+    report_end: Any,
+    multiline: bool = False,
+) -> str:
+    week_start = _owner_as_date(period_start)
+    if week_start is None:
+        return ""
+    week_end = week_start + timedelta(days=6)
+    start_limit = _owner_as_date(report_start)
+    end_limit = _owner_as_date(report_end)
+    if start_limit is not None and week_start < start_limit:
+        week_start = start_limit
+    if end_limit is not None and week_end > end_limit:
+        week_end = end_limit
+    if week_end < week_start:
+        week_end = week_start
+    start_label = week_start.strftime("%b %d")
+    end_label = week_end.strftime("%b %d")
+    if start_label == end_label:
+        return start_label
+    separator = "-\n" if multiline else "-"
+    return f"{start_label}{separator}{end_label}"
+
+
+def _owner_brand_weekly_sales_chart(
+    brand_sales_df: pd.DataFrame,
+    brand_name: str,
+    start_day: date,
+    end_day: date,
+    selected_store_codes: Sequence[str],
+) -> BytesIO:
+    if brand_sales_df is None or brand_sales_df.empty:
+        return BytesIO()
+    trend = build_brand_sales_trend_snapshots(
+        brand_sales_df,
+        start_day,
+        end_day,
+        selected_store_codes=selected_store_codes,
+    ).get("weekly", pd.DataFrame())
+    if trend is None or trend.empty:
+        return BytesIO()
+    tmp = trend.copy()
+    tmp["net_revenue"] = pd.to_numeric(tmp.get("net_revenue", 0.0), errors="coerce").fillna(0.0)
+    tmp["sales_vs_prior_pct"] = pd.to_numeric(tmp.get("sales_vs_prior_pct", np.nan), errors="coerce")
+    tmp["period_start"] = pd.to_datetime(tmp.get("period_start"), errors="coerce")
+    tmp = tmp[tmp["net_revenue"] > 0].sort_values("period_start").tail(9)
+    if tmp.empty:
+        return BytesIO()
+
+    _mpl_setup()
+    fig, ax = plt.subplots(figsize=(9.7, 2.38))
+    x = np.arange(len(tmp))
+    deltas = tmp["sales_vs_prior_pct"].replace([np.inf, -np.inf], np.nan)
+    bar_colors = [
+        "#2F6B5D" if pd.isna(delta) or float(delta) >= 0 else "#B54034"
+        for delta in deltas
+    ]
+    bars = ax.bar(x, tmp["net_revenue"].to_numpy(dtype=float), color=bar_colors, edgecolor="#1F2937", linewidth=0.35)
+    ax.set_title(f"{_owner_short_text(brand_name, 42)} Weekly Net Sales", loc="left", pad=8)
+    ax.set_xticks(x)
+    week_labels = [
+        _owner_week_range_label(period_start, start_day, end_day, multiline=True)
+        for period_start in tmp["period_start"].tolist()
+    ]
+    ax.set_xticklabels(week_labels, rotation=0, fontsize=7.0, linespacing=0.95)
+    ax.tick_params(axis="x", pad=2)
+    ax.set_ylabel("Sales")
+    ax.yaxis.set_major_formatter(lambda value, _pos: money0(value))
+    ax.grid(axis="y", color="#E5E7EB", linewidth=0.6)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    ymax = max(float(tmp["net_revenue"].max()) * 1.16, 1.0)
+    ax.set_ylim(0, ymax)
+    for bar, value, delta in zip(bars, tmp["net_revenue"], deltas):
+        delta_label = _format_delta(delta, value, np.nan)
+        label = f"{money0(value)}"
+        if delta_label not in {"n/a", "New"}:
+            label += f" ({delta_label})"
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            float(value) + ymax * 0.025,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=7.0,
+            color="#111827",
+        )
+    fig.subplots_adjust(bottom=0.20)
+    buf = BytesIO()
+    _save_chart_image(buf, dpi=220, quality=92)
+    plt.close(fig)
+    return buf
+
+
+def _owner_product_group_sales_chart(product_snapshot: pd.DataFrame, brand_name: str, max_rows: int = 8) -> BytesIO:
+    if product_snapshot is None or product_snapshot.empty:
+        return BytesIO()
+    tmp = product_snapshot.copy()
+    tmp["net_revenue"] = pd.to_numeric(tmp.get("net_revenue", 0.0), errors="coerce").fillna(0.0)
+    tmp = tmp[tmp["net_revenue"] > 0].sort_values("net_revenue", ascending=False).head(max_rows)
+    if tmp.empty:
+        return BytesIO()
+    tmp["chart_label"] = tmp.get("product_group_display", pd.Series("", index=tmp.index)).fillna("").astype(str).map(lambda v: _owner_short_text(v, 38))
+
+    _mpl_setup()
+    fig_height = max(2.1, min(3.2, 0.33 * len(tmp) + 0.85))
+    fig, ax = plt.subplots(figsize=(9.7, fig_height))
+    plot_df = tmp.iloc[::-1].copy()
+    y = np.arange(len(plot_df))
+    bars = ax.barh(y, plot_df["net_revenue"].to_numpy(dtype=float), color="#2F6B5D", edgecolor="#047857", linewidth=0.35)
+    ax.set_title(f"{_owner_short_text(brand_name, 42)} Top Product Group Sales", loc="left", pad=8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(plot_df["chart_label"].tolist())
+    ax.xaxis.set_major_formatter(lambda value, _pos: money0(value))
+    ax.grid(axis="x", color="#E5E7EB", linewidth=0.6)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right", "left"]:
+        ax.spines[spine].set_visible(False)
+    max_val = max(float(plot_df["net_revenue"].max()) * 1.18, 1.0)
+    ax.set_xlim(0, max_val)
+    for bar, value in zip(bars, plot_df["net_revenue"]):
+        ax.text(float(value) + max_val * 0.018, bar.get_y() + bar.get_height() / 2, money0(value), va="center", fontsize=7.2, color="#111827")
+    buf = BytesIO()
+    _save_chart_image(buf, dpi=220, quality=92)
+    plt.close(fig)
+    return buf
+
+
+def _owner_store_sales_chart(
+    brand_sales_df: pd.DataFrame,
+    brand_name: str,
+    selected_store_codes: Sequence[str],
+) -> BytesIO:
+    if brand_sales_df is None or brand_sales_df.empty or "_store_abbr" not in brand_sales_df.columns:
+        return BytesIO()
+    tmp = brand_sales_df.copy()
+    tmp["_store_abbr"] = tmp["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+    tmp["_net"] = pd.to_numeric(tmp.get("_net", 0.0), errors="coerce").fillna(0.0)
+    tmp = tmp[(tmp["_store_abbr"] != "") & (tmp["_net"] > 0)].copy()
+    if selected_store_codes:
+        selected = {str(s).upper().strip() for s in selected_store_codes if str(s).strip()}
+        tmp = tmp[tmp["_store_abbr"].isin(selected)].copy()
+    if tmp.empty:
+        return BytesIO()
+    grouped = tmp.groupby("_store_abbr", as_index=False).agg(net_revenue=("_net", "sum"))
+    grouped = grouped[grouped["net_revenue"] > 0].copy()
+    if len(grouped) < 2:
+        return BytesIO()
+    rank_map = {code: idx for idx, code in enumerate(order_store_codes(grouped["_store_abbr"].tolist()))}
+    grouped["_rank"] = grouped["_store_abbr"].map(lambda s: rank_map.get(str(s).upper(), 999))
+    grouped = grouped.sort_values(["_rank", "net_revenue"], ascending=[True, False])
+
+    _mpl_setup()
+    fig_height = max(1.75, min(2.55, 0.32 * len(grouped) + 0.85))
+    fig, ax = plt.subplots(figsize=(9.7, fig_height))
+    y = np.arange(len(grouped))
+    bars = ax.barh(y, grouped["net_revenue"].to_numpy(dtype=float), color="#D6B800", edgecolor="#8A6F00", linewidth=0.35)
+    ax.set_title(f"{_owner_short_text(brand_name, 42)} Sales by Store", loc="left", pad=8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(grouped["_store_abbr"].tolist())
+    ax.invert_yaxis()
+    ax.xaxis.set_major_formatter(lambda value, _pos: money0(value))
+    ax.grid(axis="x", color="#E5E7EB", linewidth=0.6)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right", "left"]:
+        ax.spines[spine].set_visible(False)
+    max_val = max(float(grouped["net_revenue"].max()) * 1.18, 1.0)
+    ax.set_xlim(0, max_val)
+    total = float(grouped["net_revenue"].sum())
+    for bar, value in zip(bars, grouped["net_revenue"]):
+        share = safe_div(float(value), total, 0.0)
+        ax.text(float(value) + max_val * 0.018, bar.get_y() + bar.get_height() / 2, f"{money0(value)} ({pct1(share)})", va="center", fontsize=7.2, color="#111827")
+    buf = BytesIO()
+    _save_chart_image(buf, dpi=220, quality=92)
+    plt.close(fig)
+    return buf
+
+
+def _owner_brand_detail_page(
+    story: List[Any],
+    row: pd.Series,
+    report_df: Optional[pd.DataFrame],
+    selected_store_codes: Sequence[str],
+    start_day: date,
+    end_day: date,
+    catalog_all_df: Optional[pd.DataFrame] = None,
+    compact: bool = True,
+    inventory_links: Optional[Dict[str, Dict[str, str]]] = None,
+) -> None:
+    styles = _owner_pdf_styles()
+    brand_key = str(row.get("brand_key") or "")
+    brand_name = str(row.get("brand_name") or "Unknown")
+    brand_sales = _owner_brand_sales_df(report_df, brand_key)
+    brand_catalog = _owner_brand_catalog_df(catalog_all_df, brand_key, selected_store_codes)
+    inventory_link_info = _owner_inventory_link_for_brand(brand_name, brand_key, inventory_links)
+
+    story.append(PageBreak())
+    story.append(_owner_p(f"{int(row.get('rank', 0) or 0)}. {brand_name}", styles["title"]))
+    story.append(_owner_p(
+        f"Brand drilldown | Window: {start_day.isoformat()} to {end_day.isoformat()} | Stores: {', '.join(selected_store_codes)} | Sales, margin, discount, and week-by-week store comparison.",
+        styles["subtitle"],
+    ))
+    story.append(Spacer(1, 0.07 * inch))
+    status = str(row.get("status", "") or "")
+    status_accent = {
+        "Grow": "#2F6B5D",
+        "Good": "#2F6B5D",
+        "Watch": "#D6B800",
+        "Fix": "#B54034",
+        "Exit / Reduce": "#8B2F28",
+    }.get(status, "#2F6B5D")
+    projected_support = float(row.get("projected_support_amount", row.get("assumed_kickback_amount", 0.0)) or 0.0)
+    expected_due = float(row.get("expected_credit_amount", 0.0) or 0.0)
+    support_for_window = expected_due if expected_due > 0 else projected_support
+    support_source = _owner_short_text(row.get("support_source", "none"), 42)
+    deal_rows = int(float(row.get("deal_rows", 0.0) or 0.0))
+    creditflow_rows = int(float(row.get("creditflow_rows", 0.0) or 0.0))
+    received_support = float(row.get("received_credit_amount", 0.0) or 0.0)
+    cards = [
+        _owner_detail_metric_card("Net Sales", money0(row.get("net_revenue", 0.0)), f"share {pct1(row.get('sales_share_pct', 0.0))}"),
+        _owner_detail_metric_card("Sales +/-", _owner_pct_change_label(row.get("sales_vs_prior_pct"), row.get("net_revenue", 0.0), row.get("prior_net_revenue", 0.0)), f"prior {money0(row.get('prior_net_revenue', 0.0))}"),
+        _owner_detail_metric_card("Units Sold", int0(row.get("units", 0.0)), f"prior {int0(row.get('prior_units', 0.0))}"),
+        _owner_detail_metric_card("Status", status or "Review", str(row.get("recommended_action", "")), status_accent),
+        _owner_detail_metric_card("Real Margin", pct1(row.get("margin_real", 0.0)), "before support"),
+        _owner_detail_metric_card("Margin w/Support", pct1(row.get("margin_with_assumed_kickback", row.get("margin_real", 0.0))), f"support {money0(support_for_window)}", "#D6B800"),
+        _owner_detail_metric_card("Deal Due", money0(expected_due), support_source, "#D6B800"),
+        _owner_detail_metric_card("Discount", pct1(row.get("discount_rate", 0.0)), "30% fallback only over 50%", "#B54034" if float(row.get("assumed_kickback_rate", 0.0) or 0.0) > 0 else "#2F6B5D"),
+        _owner_detail_metric_card("Inventory", money0(row.get("inventory_value", 0.0)), f"DOS {days1(row.get('days_supply', np.nan))}"),
+        _owner_detail_metric_card("Open Support", money0(row.get("credit_gap", 0.0)), f"deals {deal_rows} | CF {creditflow_rows}", "#B54034" if float(row.get("credit_gap", 0.0) or 0.0) > 0 else "#2F6B5D"),
+        _owner_detail_metric_card("Top Store", row.get("top_store", "n/a"), _owner_short_text(row.get("top_category", "n/a"), 36)),
+    ]
+    if received_support > 0:
+        cards.insert(
+            7,
+            _owner_detail_metric_card(
+                "Received Support",
+                money0(received_support),
+                f"margin {pct1(row.get('received_credit_margin', row.get('margin_real', 0.0)))}",
+            ),
+        )
+    story.append(_owner_detail_metric_grid(cards, cols=4))
+    story.append(Spacer(1, 0.10 * inch))
+
+    support_line = f"Support source: {support_source}; due {money0(expected_due)}."
+    if received_support > 0:
+        support_line = f"Support source: {support_source}; due {money0(expected_due)}; received {money0(received_support)}."
+    owner_read = _owner_panel_table(
+        "Owner Read",
+        [
+            f"Status: {status or 'Review'} - {row.get('recommended_action', '')}.",
+            f"Top category: {_owner_short_text(row.get('top_category', 'n/a'), 46)}.",
+            f"Top product: {_owner_short_text(row.get('top_product', 'n/a'), 62)}.",
+            support_line,
+            f"Top store: {row.get('top_store', 'n/a')} with {money0(row.get('net_revenue', 0.0))} total selected-store sales.",
+        ],
+        width=4.95 * inch,
+    )
+    next_steps = [
+        f"Confirm {money0(support_for_window)} support for this window ({support_source}).",
+        f"Margin goal is {pct1(row.get('target_margin', 0.0))}; margin w/support is {pct1(row.get('margin_with_assumed_kickback', row.get('margin_real', 0.0)))}.",
+    ]
+    support_needed = float(row.get("support_needed_after_assumed_kickback", 0.0) or 0.0)
+    if support_needed > 0:
+        next_steps.append(f"Additional support still needed after expected support: {money0(support_needed)}.")
+    else:
+        next_steps.append("Expected support covers the margin gap for this brand.")
+    next_steps.append(f"Review inventory depth: {money0(row.get('inventory_value', 0.0))} on hand, {days1(row.get('days_supply', np.nan))} days supply.")
+    action_panel = _owner_panel_table("Next Conversation", next_steps, width=4.95 * inch)
+    action_grid = Table([[owner_read, action_panel]], colWidths=[5.08 * inch, 5.08 * inch], hAlign="LEFT")
+    action_grid.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    story.append(KeepTogether([action_grid, Spacer(1, 0.08 * inch)]))
+
+    sales_chart = _owner_brand_weekly_sales_chart(
+        brand_sales,
+        brand_name,
+        start_day,
+        end_day,
+        selected_store_codes,
+    )
+    if sales_chart.getbuffer().nbytes > 0:
+        story.append(_owner_p("Weekly Sales Bar Chart", styles["section"]))
+        story.append(_owner_chart_image(sales_chart, width=10.05 * inch, height=2.28 * inch))
+        story.append(Spacer(1, 0.08 * inch))
+    store_sales_chart = _owner_store_sales_chart(brand_sales, brand_name, selected_store_codes)
+    if store_sales_chart.getbuffer().nbytes > 0:
+        story.append(_owner_p("Store Sales Bar Chart", styles["section"]))
+        story.append(_owner_chart_image(store_sales_chart, width=10.05 * inch, height=1.95 * inch))
+        story.append(Spacer(1, 0.08 * inch))
+
+    if _owner_should_show_store_comparison(selected_store_codes):
+        store_rows = _owner_brand_store_summary_rows(brand_sales, selected_store_codes)
+        store_table = build_premium_table(
+            store_rows,
+            _owner_flex_col_widths(
+                [0.68 * inch, 0.90 * inch, 0.62 * inch, 0.62 * inch, 0.72 * inch, 0.72 * inch, 0.72 * inch, 3.55 * inch],
+                flex_cols=[7],
+            ),
+            money_cols=[1],
+            pct_cols=[2, 5, 6],
+            compact=compact,
+        )
+        weekly_rows, weekly_widths = _owner_brand_weekly_store_rows(brand_sales, selected_store_codes)
+        weekly_table = build_premium_table(
+            weekly_rows,
+            weekly_widths,
+            money_cols=list(range(1, max(2, len(weekly_rows[0]) - 3))),
+            pct_cols=[len(weekly_rows[0]) - 2, len(weekly_rows[0]) - 1],
+            compact=compact,
+        )
+        story.append(KeepTogether([
+            _owner_p("Store Breakdown", styles["section"]),
+            store_table,
+            Spacer(1, 0.08 * inch),
+            _owner_p("Week-by-Week Sales by Store", styles["section"]),
+            weekly_table,
+            Spacer(1, 0.08 * inch),
+        ]))
+
+    product_snapshot, category_snapshot = build_brand_product_inventory_snapshot(
+        brand_sales,
+        brand_catalog,
+        start_day,
+        end_day,
+        selected_store_codes=selected_store_codes,
+    )
+    trend_snapshots = build_brand_sales_trend_snapshots(
+        brand_sales,
+        start_day,
+        end_day,
+        selected_store_codes=selected_store_codes,
+    )
+    snapshot_metrics = _brand_snapshot_metric_values(product_snapshot, category_snapshot)
+    units_per_day_30 = safe_div(snapshot_metrics.get("units_sold_30d", 0.0), 30.0, 0.0)
+    days_supply_30 = _safe_dos(snapshot_metrics.get("units_on_hand", 0.0), units_per_day_30)
+
+    story.append(PageBreak())
+    inventory_title_suffix = "Inventory Link" if inventory_link_info else "Product Inventory"
+    story.append(_owner_p(f"{brand_name} - Sales Timing + {inventory_title_suffix}", styles["title"]))
+    story.append(_owner_p(
+        "Day, week, and month sales trends. Current inventory uses the BrandINVEmailer Drive folder when a brand match is available.",
+        styles["subtitle"],
+    ))
+    story.append(Spacer(1, 0.06 * inch))
+    snapshot_cards = [
+        _owner_detail_metric_card("Top Product", money0(snapshot_metrics.get("top_product_sales", 0.0)), _owner_short_text(snapshot_metrics.get("top_product", "n/a"), 46)),
+        _owner_detail_metric_card("Top Category", money0(snapshot_metrics.get("top_category_sales", 0.0)), str(snapshot_metrics.get("top_category", "n/a"))),
+        _owner_detail_metric_card("Units On Hand", int0(snapshot_metrics.get("units_on_hand", 0.0)), "current inventory"),
+        _owner_detail_metric_card("Inventory Value", money0(snapshot_metrics.get("inventory_value", 0.0)), "cost on hand"),
+        _owner_detail_metric_card("7/14/30 Sold", f"{int0(snapshot_metrics.get('units_sold_7d', 0.0))}/{int0(snapshot_metrics.get('units_sold_14d', 0.0))}/{int0(snapshot_metrics.get('units_sold_30d', 0.0))}", "unit movement"),
+        _owner_detail_metric_card("Days Supply", _format_days_supply_v2(days_supply_30, units_per_day_30, snapshot_metrics.get("units_on_hand", 0.0)), "30d pace"),
+        _owner_detail_metric_card("Product Groups", int0(len(product_snapshot) if product_snapshot is not None else 0), "same category + price + cost"),
+        _owner_detail_metric_card("Categories", int0(len(category_snapshot) if category_snapshot is not None else 0), "category rollup"),
+    ]
+    story.append(_owner_detail_metric_grid(snapshot_cards, cols=4))
+    story.append(Spacer(1, 0.08 * inch))
+
+    if inventory_link_info:
+        story.append(_owner_inventory_link_panel(brand_name, inventory_link_info))
+        story.append(Spacer(1, 0.08 * inch))
+    else:
+        product_sales_chart = _owner_product_group_sales_chart(product_snapshot, brand_name)
+        if product_sales_chart.getbuffer().nbytes > 0:
+            story.append(_owner_p("Top Product Group Sales", styles["section"]))
+            story.append(_owner_chart_image(product_sales_chart, width=10.05 * inch, height=2.45 * inch))
+            story.append(Spacer(1, 0.08 * inch))
+
+    daily_table = build_premium_table(
+        _brand_trend_rows((trend_snapshots or {}).get("daily", pd.DataFrame()), max_rows=14, include_tickets=False),
+        [0.58 * inch, 0.68 * inch, 0.50 * inch, 0.44 * inch, 0.48 * inch, 0.44 * inch],
+        money_cols=[1],
+        pct_cols=[2, 4, 5],
+        compact=compact,
+    )
+    weekly_table = build_premium_table(
+        _brand_trend_rows((trend_snapshots or {}).get("weekly", pd.DataFrame()), max_rows=8, include_tickets=False),
+        [0.62 * inch, 0.72 * inch, 0.52 * inch, 0.46 * inch, 0.48 * inch, 0.44 * inch],
+        money_cols=[1],
+        pct_cols=[2, 4, 5],
+        compact=compact,
+    )
+    monthly_table = build_premium_table(
+        _brand_trend_rows((trend_snapshots or {}).get("monthly", pd.DataFrame()), max_rows=6, include_tickets=False),
+        [0.68 * inch, 0.72 * inch, 0.55 * inch, 0.42 * inch, 0.44 * inch, 0.40 * inch],
+        money_cols=[1],
+        pct_cols=[2, 4, 5],
+        compact=compact,
+    )
+    trend_grid = Table([
+        [_owner_p("Day by Day", styles["small"]), _owner_p("Week by Week", styles["small"]), _owner_p("Month by Month", styles["small"])],
+        [daily_table, weekly_table, monthly_table],
+    ], colWidths=[3.34 * inch, 3.34 * inch, 3.34 * inch], hAlign="LEFT")
+    trend_grid.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(trend_grid)
+    story.append(Spacer(1, 0.08 * inch))
+    if not inventory_link_info:
+        story.append(_owner_p("Product Sales and Current Inventory On Hand", styles["section"]))
+        story.append(build_premium_table(
+            _brand_product_inventory_rows(product_snapshot),
+            [1.72 * inch, 0.52 * inch, 0.66 * inch, 0.44 * inch, 0.48 * inch, 0.48 * inch, 0.76 * inch, 0.44 * inch, 4.05 * inch],
+            money_cols=[2],
+            pct_cols=[4],
+            compact=compact,
+        ))
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(_owner_p("Category Rollup", styles["section"]))
+        story.append(build_premium_table(
+            _brand_category_inventory_rows(category_snapshot),
+            [1.35 * inch, 0.78 * inch, 0.50 * inch, 0.52 * inch, 0.48 * inch, 0.54 * inch, 0.74 * inch, 0.78 * inch, 0.52 * inch],
+            money_cols=[1, 6],
+            pct_cols=[3, 4],
+            compact=compact,
+        ))
 
 
 def build_owner_brand_rollup_pdf(
@@ -5480,6 +7249,9 @@ def build_owner_brand_rollup_pdf(
     summary: Dict[str, Any],
     include_brand_cards: bool = True,
     compact: bool = True,
+    report_df: Optional[pd.DataFrame] = None,
+    catalog_all_df: Optional[pd.DataFrame] = None,
+    report_title: str = "Owner Top Brands Review",
 ) -> None:
     osnap.setup_fonts()
     styles = _owner_pdf_styles()
@@ -5493,29 +7265,45 @@ def build_owner_brand_rollup_pdf(
         topMargin=0.30 * inch,
         bottomMargin=0.30 * inch,
         pageCompression=1,
-        title=f"Owner Top Brands Review - {start_day.isoformat()} to {end_day.isoformat()}",
+        title=f"{report_title} - {start_day.isoformat()} to {end_day.isoformat()}",
         author="Buzz Automation",
     )
 
     story: List[Any] = []
-    story.append(_owner_p("Owner Top Brands Review", styles["title"]))
+    prior_start, prior_end = compute_prior_report_window(start_day, end_day)
+    prior_loaded = True
+    if scorecard is not None and not scorecard.empty and "prior_net_revenue" in scorecard.columns:
+        prior_loaded = not pd.to_numeric(scorecard["prior_net_revenue"], errors="coerce").isna().all()
+    comparison_text = (
+        f"Current period: {start_day.isoformat()} to {end_day.isoformat()} | "
+        f"Compared to prior period: {prior_start.isoformat()} to {prior_end.isoformat()}"
+        if prior_loaded
+        else f"Current period: {start_day.isoformat()} to {end_day.isoformat()} | No prior comparison loaded"
+    )
+    story.append(_owner_p(report_title, styles["title"]))
     story.append(_owner_p(
         f"{start_day.isoformat()} to {end_day.isoformat()} | Stores: {', '.join(selected_store_codes)} | Generated: {generated_at}",
         styles["subtitle"],
     ))
+    story.append(_owner_p(comparison_text, styles["subtitle"]))
     story.append(Spacer(1, 0.08 * inch))
 
     kpi_cards = [
         _metric_card("Total Net Sales", money0(summary.get("total_net_sales", 0.0)), "all brands"),
+        _metric_card("Top Brand Sales", money0(summary.get("top_brands_net_sales", 0.0)), "reviewed brands"),
+        _metric_card("Top Brand Share", pct1(summary.get("top_brands_sales_share", 0.0)), "of total sales"),
         _metric_card("Units Sold", int0(summary.get("total_units_sold", 0.0)), "all brands"),
+        _metric_card("Real Profit", money0(summary.get("total_real_profit", 0.0)), "before credits"),
         _metric_card("Avg Real Margin", pct1(summary.get("average_real_margin", 0.0)), "sales margin"),
+        _metric_card("Margin w/Support", pct1(summary.get("average_margin_with_assumed_kickback", 0.0)), "top brands after expected support", "#D6B800"),
         _metric_card("Avg Discount", pct1(summary.get("average_discount_rate", 0.0)), "sales discount"),
+        _metric_card("Deal Support Due", money0(summary.get("expected_support_amount", summary.get("assumed_kickback_amount", 0.0))), f"{money0(summary.get('deal_support_amount', 0.0))} from deals.py"),
         _metric_card("Inventory Value", money0(summary.get("inventory_value", 0.0)), "current on hand"),
         _metric_card("Days Supply", days1(summary.get("days_supply", np.nan)), "all inventory"),
-        _metric_card("Credit Gap", money0(summary.get("total_credit_gap", 0.0)), "reviewed brands"),
+        _metric_card("Open Support", money0(summary.get("total_credit_gap", 0.0)), "expected minus received"),
         _metric_card("Brands Reviewed", int0(summary.get("brands_reviewed", 0)), "top brands"),
     ]
-    story.append(_metric_grid(kpi_cards, cols=4))
+    story.append(_metric_grid(kpi_cards, cols=6))
     story.append(Spacer(1, 0.08 * inch))
 
     panels = [
@@ -5524,9 +7312,19 @@ def build_owner_brand_rollup_pdf(
         _owner_panel_table("Sales Decliners", _owner_rank_lines(scorecard, "sales_vs_prior_pct", pct1, ascending=True)),
         _owner_panel_table("Biggest Margin Risks", _owner_rank_lines(scorecard, "margin_gap_pp", _owner_margin_gap_label, ascending=True)),
         _owner_panel_table("Biggest Inventory Risks", _owner_rank_lines(scorecard, "days_supply", days1)),
-        _owner_panel_table("Biggest Credit Gaps", _owner_rank_lines(scorecard, "credit_gap", money0)),
+        _owner_panel_table("Biggest Open Support", _owner_rank_lines(scorecard, "credit_gap", money0)),
     ]
     story.append(_owner_panel_grid(panels, cols=3))
+    story.append(Spacer(1, 0.06 * inch))
+    story.append(_owner_panel_table(
+        "Deal Support Source",
+        [
+            f"Deal Due uses the current deals brand config: {summary.get('deal_config_source', 'deals.py')}.",
+            "Rows match when brand, day, store, category, and product filters line up with the current deal rules.",
+            "If no deal rule matches, the older high-discount 30% support assumption is only used as a fallback.",
+        ],
+        width=9.85 * inch,
+    ))
     if summary.get("missing_sales_stores") != "None" or summary.get("missing_catalog_stores") != "None":
         story.append(Spacer(1, 0.05 * inch))
         story.append(_owner_p(
@@ -5534,13 +7332,31 @@ def build_owner_brand_rollup_pdf(
             styles["small"],
         ))
 
+    owner_inventory_links = load_owner_inventory_link_lookup(include_drive_lookup=True, logger=print)
+
     story.append(PageBreak())
     story.append(_owner_p("Top Brand Scorecard", styles["title"]))
-    story.append(_owner_p("Ranked by net sales. Share is calculated against total brand sales in the selected stores/window.", styles["subtitle"]))
+    story.append(_owner_p(
+        f"Ranked by net sales. {comparison_text}. Share is calculated against total brand sales in the selected stores/window.",
+        styles["subtitle"],
+    ))
     story.append(Spacer(1, 0.06 * inch))
     story.append(_owner_scorecard_table(scorecard))
 
-    if include_brand_cards and scorecard is not None and not scorecard.empty:
+    if include_brand_cards and scorecard is not None and not scorecard.empty and report_df is not None and not report_df.empty:
+        for _, row in scorecard.iterrows():
+            _owner_brand_detail_page(
+                story,
+                row,
+                report_df,
+                selected_store_codes,
+                start_day,
+                end_day,
+                catalog_all_df=catalog_all_df,
+                compact=compact,
+                inventory_links=owner_inventory_links,
+            )
+    elif include_brand_cards and scorecard is not None and not scorecard.empty:
         cards_per_page = 4 if compact else 2
         card_cols = 2 if compact else 1
         card_width = 4.95 * inch if compact else 10.10 * inch
@@ -5571,33 +7387,322 @@ def build_owner_brand_rollup_pdf(
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
 
 
+def _email_html(value: Any) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _email_file_size(path: Path) -> str:
+    try:
+        size = Path(path).stat().st_size
+    except Exception:
+        return "n/a"
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.0f} KB"
+    return f"{size} B"
+
+
+def _owner_email_metric_cell(label: str, value: Any, note: str = "", accent: str = "#2F6B5D") -> str:
+    return (
+        f'<td style="width:25%;padding:8px;">'
+        f'<div style="border:1px solid #D7DEE0;border-top:4px solid {accent};background:#F7FAF9;padding:10px 12px;">'
+        f'<div style="font-size:10px;font-weight:700;color:#52615D;text-transform:uppercase;letter-spacing:.4px;">{_email_html(label)}</div>'
+        f'<div style="font-size:22px;line-height:26px;font-weight:800;color:#111827;margin-top:4px;">{_email_html(value)}</div>'
+        f'<div style="font-size:11px;line-height:15px;color:#4B5563;margin-top:4px;">{_email_html(note)}</div>'
+        f'</div>'
+        f'</td>'
+    )
+
+
+def _owner_email_status_style(status: Any) -> Tuple[str, str]:
+    text = str(status or "Review")
+    styles = {
+        "Grow": ("#DFF3E8", "#14532D"),
+        "Good": ("#EEF7EC", "#166534"),
+        "Watch": ("#FFF4D6", "#854D0E"),
+        "Fix": ("#FCE4E1", "#991B1B"),
+        "Exit / Reduce": ("#F6D5D1", "#7F1D1D"),
+    }
+    return styles.get(text, ("#E5E7EB", "#374151"))
+
+
+def _owner_rollup_email_plain_text(
+    start_day: date,
+    end_day: date,
+    summary: Dict[str, Any],
+    scorecard: Optional[pd.DataFrame] = None,
+    store_summaries: Optional[Sequence[Dict[str, Any]]] = None,
+) -> str:
+    lines = [
+        "Owner Top Brands Review is attached.",
+        "",
+        f"Window: {start_day.isoformat()} to {end_day.isoformat()}",
+        f"Total net sales: {money0(summary.get('total_net_sales', 0.0))}",
+        f"Brands reviewed: {int0(summary.get('brands_reviewed', 0))}",
+        f"Average margin: {pct1(summary.get('average_real_margin', 0.0))}",
+        f"Margin w/support: {pct1(summary.get('average_margin_with_assumed_kickback', 0.0))}",
+        f"Deal config source: {summary.get('deal_config_source', 'deals.py')}",
+        f"Deal support due: {money0(summary.get('expected_support_amount', 0.0))}",
+        f"Open support: {money0(summary.get('total_credit_gap', 0.0))}",
+        f"Projected support: {money0(summary.get('projected_support_amount', summary.get('assumed_kickback_amount', 0.0)))}",
+    ]
+    if store_summaries:
+        lines.extend(["", "Store snapshot:"])
+        for row in store_summaries:
+            lines.append(
+                f"{row.get('store', '')}: "
+                f"{money0(row.get('total_net_sales', 0.0))}, "
+                f"margin {pct1(row.get('average_real_margin', 0.0))}, "
+                f"open support {money0(row.get('total_credit_gap', 0.0))}, "
+                f"top brand {row.get('top_brand', 'n/a')} ({money0(row.get('top_brand_sales', 0.0))})"
+            )
+    if scorecard is not None and not scorecard.empty:
+        lines.extend(["", "Top brand preview:"])
+        for _, row in scorecard.head(10).iterrows():
+            lines.append(
+                f"{int(row.get('rank', 0) or 0)}. {row.get('brand_name', '')}: "
+                f"{money0(row.get('net_revenue', 0.0))}, "
+                f"margin {pct1(row.get('margin_real', 0.0))}, "
+                f"open support {money0(row.get('credit_gap', 0.0))}, "
+                f"{row.get('status', '')} / {row.get('recommended_action', '')}"
+            )
+    return "\n".join(lines)
+
+
+def _owner_rollup_email_html(
+    start_day: date,
+    end_day: date,
+    summary: Dict[str, Any],
+    scorecard: Optional[pd.DataFrame] = None,
+    store_summaries: Optional[Sequence[Dict[str, Any]]] = None,
+    attachments: Optional[Sequence[Path]] = None,
+) -> str:
+    total_sales = money0(summary.get("total_net_sales", 0.0))
+    stores_label = str(summary.get("stores") or "selected stores")
+    reviewed_sales = money0(summary.get("top_brands_net_sales", 0.0))
+    reviewed_share = pct1(summary.get("top_brands_sales_share", 0.0))
+    avg_margin = pct1(summary.get("average_real_margin", 0.0))
+    support_margin = pct1(summary.get("average_margin_with_assumed_kickback", 0.0))
+    deal_due = money0(summary.get("expected_support_amount", 0.0))
+    open_support = money0(summary.get("total_credit_gap", 0.0))
+    projected_support = money0(summary.get("projected_support_amount", summary.get("assumed_kickback_amount", 0.0)))
+    inventory = money0(summary.get("inventory_value", 0.0))
+    days_supply = days1(summary.get("days_supply", np.nan))
+    brands_reviewed = int0(summary.get("brands_reviewed", 0))
+    attachment_paths = [Path(p) for p in attachments or []]
+    attachment_total = sum(Path(p).stat().st_size for p in attachment_paths if Path(p).exists())
+    attachment_size = f"{attachment_total / (1024 * 1024):.1f} MB" if attachment_total else "n/a"
+
+    metric_rows = [
+        [
+            _owner_email_metric_cell("Total Net Sales", total_sales, f"{brands_reviewed} brands reviewed"),
+            _owner_email_metric_cell("Reviewed Sales", reviewed_sales, f"{reviewed_share} of selected-store sales"),
+            _owner_email_metric_cell("Real Margin", avg_margin, "before vendor support"),
+            _owner_email_metric_cell("Margin w/Support", support_margin, f"projected {projected_support}", "#D6B800"),
+        ],
+        [
+            _owner_email_metric_cell("Deal Support Due", deal_due, _owner_short_text(summary.get("deal_config_source", "deals.py"), 54), "#D6B800"),
+            _owner_email_metric_cell("Open Support", open_support, "expected minus received", "#B54034" if float(summary.get("total_credit_gap", 0.0) or 0.0) > 0 else "#2F6B5D"),
+            _owner_email_metric_cell("Inventory On Hand", inventory, f"{days_supply} days supply"),
+            _owner_email_metric_cell("PDF Package", f"{len(attachment_paths)} files", attachment_size),
+        ],
+    ]
+    metric_html = "".join(f'<tr>{"".join(row)}</tr>' for row in metric_rows)
+
+    store_rows: List[str] = []
+    for row in store_summaries or []:
+        top_brand = str(row.get("top_brand") or "n/a")
+        top_brand_sales = float(row.get("top_brand_sales", 0.0) or 0.0)
+        top_action = _owner_short_text(row.get("top_action", ""), 36)
+        open_amount = float(row.get("total_credit_gap", 0.0) or 0.0)
+        open_color = "#991B1B" if open_amount > 0 else "#166534"
+        store_rows.append(
+            "<tr>"
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;font-weight:800;color:#111827;">{_email_html(row.get("store", ""))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{money0(row.get("total_net_sales", 0.0))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{int0(row.get("brands_reviewed", 0.0))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;font-weight:700;">{_email_html(_owner_short_text(top_brand, 24))}<br><span style="font-weight:400;color:#6B7280;">{money0(top_brand_sales)}</span></td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{pct1(row.get("average_real_margin", 0.0))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{pct1(row.get("average_margin_with_assumed_kickback", 0.0))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{money0(row.get("expected_support_amount", 0.0))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;color:{open_color};font-weight:700;">{money0(open_amount)}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{money0(row.get("inventory_value", 0.0))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{days1(row.get("days_supply", np.nan))}</td>'
+            f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;color:#374151;">{_email_html(top_action)}</td>'
+            "</tr>"
+        )
+    store_snapshot_html = ""
+    if store_rows:
+        store_snapshot_html = f"""
+        <tr>
+          <td style="padding:0 18px 16px 18px;">
+            <div style="font-size:15px;font-weight:800;color:#111827;margin:4px 0 8px 0;">Store Snapshot</div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #D7DEE0;font-size:12px;">
+              <tr style="background:#0F3D35;color:#FFFFFF;">
+                <th style="padding:7px;text-align:left;">Store</th>
+                <th style="padding:7px;text-align:right;">Sales</th>
+                <th style="padding:7px;text-align:right;">Brands</th>
+                <th style="padding:7px;text-align:left;">Top Brand</th>
+                <th style="padding:7px;text-align:right;">Margin</th>
+                <th style="padding:7px;text-align:right;">W/Support</th>
+                <th style="padding:7px;text-align:right;">Deal Due</th>
+                <th style="padding:7px;text-align:right;">Open</th>
+                <th style="padding:7px;text-align:right;">Inventory Cost</th>
+                <th style="padding:7px;text-align:right;">DOS</th>
+                <th style="padding:7px;text-align:left;">Top Action</th>
+              </tr>
+              {''.join(store_rows)}
+            </table>
+          </td>
+        </tr>
+"""
+
+    table_rows: List[str] = []
+    if scorecard is not None and not scorecard.empty:
+        for _, row in scorecard.head(30).iterrows():
+            status = str(row.get("status", "Review") or "Review")
+            status_bg, status_fg = _owner_email_status_style(status)
+            action = _owner_short_text(row.get("recommended_action", ""), 34)
+            brand = _owner_short_text(row.get("brand_name", ""), 30)
+            support = row.get("expected_credit_amount", row.get("projected_support_amount", 0.0))
+            table_rows.append(
+                "<tr>"
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:center;color:#374151;">{int(row.get("rank", 0) or 0)}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;font-weight:700;color:#111827;">{_email_html(brand)}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{money0(row.get("net_revenue", 0.0))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{_email_html(_owner_pct_change_label(row.get("sales_vs_prior_pct"), row.get("net_revenue", 0.0), row.get("prior_net_revenue", 0.0)))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{int0(row.get("units", 0.0))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{pct1(row.get("margin_real", 0.0))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{pct1(row.get("margin_with_assumed_kickback", row.get("margin_real", 0.0)))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{pct1(row.get("discount_rate", 0.0))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{money0(support)}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{money0(row.get("credit_gap", 0.0))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:right;">{days1(row.get("days_supply", np.nan))}</td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;text-align:center;"><span style="display:inline-block;background:{status_bg};color:{status_fg};padding:3px 8px;border-radius:10px;font-weight:700;">{_email_html(status)}</span></td>'
+                f'<td style="padding:7px;border-bottom:1px solid #E5E7EB;color:#374151;">{_email_html(action)}</td>'
+                "</tr>"
+            )
+    if not table_rows:
+        table_rows.append('<tr><td colspan="13" style="padding:12px;color:#4B5563;">No scorecard rows available.</td></tr>')
+
+    attachment_rows: List[str] = []
+    for idx, path in enumerate(attachment_paths, start=1):
+        attachment_rows.append(
+            "<tr>"
+            f'<td style="padding:6px 8px;border-bottom:1px solid #E5E7EB;color:#52615D;">{idx}</td>'
+            f'<td style="padding:6px 8px;border-bottom:1px solid #E5E7EB;font-weight:700;color:#111827;">{_email_html(path.name)}</td>'
+            f'<td style="padding:6px 8px;border-bottom:1px solid #E5E7EB;text-align:right;color:#374151;">{_email_html(_email_file_size(path))}</td>'
+            "</tr>"
+        )
+    attachment_html = "".join(attachment_rows) or '<tr><td colspan="3" style="padding:10px;color:#4B5563;">No attachments listed.</td></tr>'
+
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#F3F6F5;font-family:Arial,Helvetica,sans-serif;color:#111827;">
+    <div style="max-width:1120px;margin:0 auto;padding:18px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#FFFFFF;border:1px solid #D7DEE0;">
+        <tr>
+          <td style="background:#0F3D35;color:#FFFFFF;padding:18px 20px;">
+            <div style="font-size:22px;line-height:28px;font-weight:800;">Owner Top Brands Review</div>
+            <div style="font-size:13px;line-height:18px;color:#DDEBE7;margin-top:4px;">{_email_html(start_day.isoformat())} to {_email_html(end_day.isoformat())} | Stores: {_email_html(stores_label)}</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:12px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">{metric_html}</table>
+          </td>
+        </tr>
+        {store_snapshot_html}
+        <tr>
+          <td style="padding:0 18px 16px 18px;">
+            <div style="font-size:15px;font-weight:800;color:#111827;margin:4px 0 8px 0;">Top Brand Read</div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #D7DEE0;font-size:12px;">
+              <tr style="background:#111827;color:#FFFFFF;">
+                <th style="padding:7px;text-align:center;">#</th>
+                <th style="padding:7px;text-align:left;">Brand</th>
+                <th style="padding:7px;text-align:right;">Sales</th>
+                <th style="padding:7px;text-align:right;">+/-</th>
+                <th style="padding:7px;text-align:right;">Units</th>
+                <th style="padding:7px;text-align:right;">Margin</th>
+                <th style="padding:7px;text-align:right;">W/Support</th>
+                <th style="padding:7px;text-align:right;">Disc</th>
+                <th style="padding:7px;text-align:right;">Deal Due</th>
+                <th style="padding:7px;text-align:right;">Open</th>
+                <th style="padding:7px;text-align:right;">DOS</th>
+                <th style="padding:7px;text-align:center;">Status</th>
+                <th style="padding:7px;text-align:left;">Action</th>
+              </tr>
+              {''.join(table_rows)}
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:0 18px 18px 18px;">
+            <div style="font-size:15px;font-weight:800;color:#111827;margin:4px 0 8px 0;">Attached PDFs</div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #D7DEE0;font-size:12px;">
+              <tr style="background:#F6F8F7;color:#52615D;">
+                <th style="padding:6px 8px;text-align:left;width:40px;">#</th>
+                <th style="padding:6px 8px;text-align:left;">File</th>
+                <th style="padding:6px 8px;text-align:right;width:90px;">Size</th>
+              </tr>
+              {attachment_html}
+            </table>
+            <div style="font-size:11px;color:#6B7280;line-height:16px;margin-top:10px;">PDFs include the all-store owner review plus one packet for each store. Inventory links inside the PDFs use the latest INVENTORY_OTHER Drive folder when available.</div>
+          </td>
+        </tr>
+      </table>
+    </div>
+  </body>
+</html>
+"""
+
+
 def send_owner_brand_rollup_email(
     pdf_path: Path,
     start_day: date,
     end_day: date,
     summary: Dict[str, Any],
-    to_email: str = DEFAULT_REPORT_EMAIL,
+    to_email: Any = DEFAULT_REPORT_EMAIL,
+    extra_attachments: Optional[Sequence[Path]] = None,
+    scorecard: Optional[pd.DataFrame] = None,
+    store_summaries: Optional[Sequence[Dict[str, Any]]] = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> None:
     service = _build_gmail_service()
+    recipients = parse_email_recipients(to_email) or [DEFAULT_REPORT_EMAIL]
     subject = f"Owner Top Brands Review - {start_day.isoformat()} to {end_day.isoformat()}"
     msg = EmailMessage()
-    msg["To"] = to_email
+    msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
+    attachments = [Path(pdf_path)] + [Path(attachment) for attachment in (extra_attachments or [])]
     msg.set_content(
-        "\n".join([
-            "Owner Top Brands Review is attached.",
-            "",
-            f"Window: {start_day.isoformat()} to {end_day.isoformat()}",
-            f"Total net sales: {money0(summary.get('total_net_sales', 0.0))}",
-            f"Brands reviewed: {int0(summary.get('brands_reviewed', 0))}",
-            f"Credit gap: {money0(summary.get('total_credit_gap', 0.0))}",
-        ])
+        _owner_rollup_email_plain_text(
+            start_day,
+            end_day,
+            summary,
+            scorecard=scorecard,
+            store_summaries=store_summaries,
+        )
+    )
+    msg.add_alternative(
+        _owner_rollup_email_html(
+            start_day,
+            end_day,
+            summary,
+            scorecard=scorecard,
+            store_summaries=store_summaries,
+            attachments=attachments,
+        ),
+        subtype="html",
     )
     _attach_file_to_email(msg, pdf_path)
+    for attachment in extra_attachments or []:
+        _attach_file_to_email(msg, Path(attachment))
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
-    _log(f"[EMAIL] Sent owner top brands review to {to_email}", logger)
+    _log(f"[EMAIL] Sent owner top brands review to {', '.join(recipients)}", logger)
 
 
 def generate_owner_brand_rollup_packet(
@@ -5622,6 +7727,7 @@ def generate_owner_brand_rollup_packet(
     api_workers: int = DEFAULT_PACKET_API_WORKERS,
     credit_ledger_path: str = "brand_credit_ledger.json",
     creditflow_base_url: str = "https://creditflow.replit.app/api/v1",
+    owner_email_to: Any = None,
     logger: Optional[Callable[[str], None]] = None,
 ) -> OwnerBrandRollupArtifacts:
     selected = order_store_codes(stores or list(store_abbr_map.values()))
@@ -5788,11 +7894,105 @@ def generate_owner_brand_rollup_packet(
         summary=summary,
         include_brand_cards=include_brand_cards,
         compact=compact,
+        report_df=report_df,
+        catalog_all_df=catalog_all,
     )
     _log(f"[PDF] Created (Owner Top Brands Review): {out_pdf}", logger)
 
+    store_pdf_paths: List[Path] = []
+    store_email_summaries: List[Dict[str, Any]] = []
+    if "_store_abbr" in sales_all.columns:
+        sales_all_store_codes = sales_all["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+    else:
+        sales_all_store_codes = pd.Series("", index=sales_all.index)
+
+    for abbr in selected:
+        store_sales_all = sales_all[sales_all_store_codes == str(abbr).upper()].copy()
+        if store_sales_all.empty:
+            continue
+
+        store_catalog_all = catalog_all.copy()
+        if "_store_abbr" in store_catalog_all.columns:
+            store_catalog_all["_store_abbr"] = store_catalog_all["_store_abbr"].fillna("").astype(str).str.upper().str.strip()
+            scoped_catalog = store_catalog_all[
+                (store_catalog_all["_store_abbr"] == str(abbr).upper()) | (store_catalog_all["_store_abbr"] == "")
+            ].copy()
+            if not scoped_catalog.empty:
+                store_catalog_all = scoped_catalog
+
+        store_scorecard = build_owner_brand_rollup_scorecard(
+            store_sales_all,
+            store_catalog_all,
+            start_date,
+            end_date,
+            top_n=top_n,
+            target_margin=target_margin,
+            targets_payload=targets_payload,
+            credit_rows=credit_rows,
+            include_prior_data=include_prior_data,
+        )
+        if store_scorecard.empty:
+            continue
+
+        store_report_df = _date_filter(store_sales_all, start_date, end_date)
+        store_summary = _owner_summary_from_scorecard(
+            scorecard=store_scorecard,
+            report_df=store_report_df,
+            catalog_all_df=store_catalog_all,
+            start_day=start_date,
+            end_day=end_date,
+            selected_store_codes=[abbr],
+            missing_sales_stores=[abbr] if abbr in missing_sales_stores else [],
+            missing_catalog_stores=[abbr] if abbr in missing_catalog_stores else [],
+        )
+        top_store_brand = store_scorecard.iloc[0] if store_scorecard is not None and not store_scorecard.empty else pd.Series(dtype=object)
+        store_email_summaries.append({
+            "store": abbr,
+            "total_net_sales": store_summary.get("total_net_sales", 0.0),
+            "brands_reviewed": store_summary.get("brands_reviewed", 0),
+            "average_real_margin": store_summary.get("average_real_margin", 0.0),
+            "average_margin_with_assumed_kickback": store_summary.get("average_margin_with_assumed_kickback", 0.0),
+            "expected_support_amount": store_summary.get("expected_support_amount", 0.0),
+            "total_credit_gap": store_summary.get("total_credit_gap", 0.0),
+            "inventory_value": store_summary.get("inventory_value", 0.0),
+            "days_supply": store_summary.get("days_supply", np.nan),
+            "top_brand": top_store_brand.get("brand_name", "n/a"),
+            "top_brand_sales": top_store_brand.get("net_revenue", 0.0),
+            "top_action": top_store_brand.get("recommended_action", ""),
+        })
+        store_scorecard_csv = paths.cache_dir / safe_filename(f"owner_top_brands_scorecard_{abbr}.csv")
+        store_scorecard.to_csv(store_scorecard_csv, index=False)
+        store_pdf = paths.pdf_dir / safe_filename(
+            f"Owner Top Brands Review - {abbr} - {start_date.isoformat()}_to_{end_date.isoformat()}.pdf"
+        )
+        build_owner_brand_rollup_pdf(
+            out_pdf=store_pdf,
+            start_day=start_date,
+            end_day=end_date,
+            selected_store_codes=[abbr],
+            scorecard=store_scorecard,
+            summary=store_summary,
+            include_brand_cards=include_brand_cards,
+            compact=compact,
+            report_df=store_report_df,
+            catalog_all_df=store_catalog_all,
+            report_title=f"Owner Top Brands Review - {abbr}",
+        )
+        store_pdf_paths.append(store_pdf)
+        _log(f"[PDF] Created (Owner Top Brands Review - {abbr}): {store_pdf}", logger)
+
     if email:
-        send_owner_brand_rollup_email(out_pdf, start_date, end_date, summary, OWNER_BRAND_ROLLUP_EMAIL, logger)
+        send_owner_brand_rollup_email(
+            out_pdf,
+            start_date,
+            end_date,
+            summary,
+            owner_email_to if owner_email_to is not None else OWNER_BRAND_ROLLUP_EMAILS,
+            extra_attachments=store_pdf_paths,
+            scorecard=scorecard,
+            store_summaries=store_email_summaries,
+            logger=logger,
+        )
 
     return OwnerBrandRollupArtifacts(
         pdf_path=out_pdf,
@@ -5802,6 +8002,7 @@ def generate_owner_brand_rollup_packet(
         brand_count=int(len(scorecard)),
         missing_sales_stores=list(missing_sales_stores),
         missing_catalog_stores=list(missing_catalog_stores),
+        store_pdf_paths=store_pdf_paths,
     )
 
 
@@ -5824,30 +8025,52 @@ def _mpl_setup() -> None:
         "grid.alpha": 0.9,
         "xtick.color": "#374151",
         "ytick.color": "#374151",
+        "savefig.dpi": PDF_CHART_DPI,
     })
 
 
 def _save_chart_image(buf: BytesIO, dpi: int = 170, quality: int = 85) -> None:
+    target_dpi = max(int(dpi or PDF_CHART_DPI), int(PDF_CHART_DPI))
+    target_quality = max(int(quality or PDF_CHART_JPEG_QUALITY), int(PDF_CHART_JPEG_QUALITY))
+    image_format = "jpeg" if PDF_CHART_FORMAT in {"jpg", "jpeg"} else "png"
+    buf.seek(0)
+    buf.truncate(0)
+    if image_format == "png":
+        plt.savefig(
+            buf,
+            format="png",
+            dpi=target_dpi,
+            bbox_inches="tight",
+            pad_inches=0.14,
+            facecolor="white",
+            edgecolor="white",
+        )
+        buf.seek(0)
+        return
+
     try:
         plt.savefig(
             buf,
             format="jpeg",
-            dpi=dpi,
+            dpi=target_dpi,
             bbox_inches="tight",
             pad_inches=0.14,
+            facecolor="white",
+            edgecolor="white",
             pil_kwargs={
-                "quality": quality,
+                "quality": target_quality,
                 "optimize": True,
                 "progressive": True,
                 "subsampling": 0,
             },
         )
     except TypeError:
-        plt.savefig(buf, format="jpeg", dpi=dpi, bbox_inches="tight", pad_inches=0.14)
+        plt.savefig(buf, format="jpeg", dpi=target_dpi, bbox_inches="tight", pad_inches=0.14, facecolor="white", edgecolor="white")
     except Exception:
         buf.seek(0)
         buf.truncate(0)
-        plt.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.14)
+        plt.savefig(buf, format="png", dpi=target_dpi, bbox_inches="tight", pad_inches=0.14, facecolor="white", edgecolor="white")
+    buf.seek(0)
 
 
 def chart_daily_net(daily_df: pd.DataFrame, title: str) -> BytesIO:
@@ -7772,6 +9995,8 @@ def write_dashboard_cache(cache_dir: Path, dashboard_data: Dict[str, Any], logge
         "dashboard_store_weekly_metrics.csv": dashboard_data.get("store_weekly_metrics", pd.DataFrame()),
         "dashboard_category_mix.csv": dashboard_data.get("category_mix", pd.DataFrame()),
         "dashboard_credit_margin_summary.csv": dashboard_data.get("credit_margin_summary", pd.DataFrame()),
+        "dashboard_product_inventory_snapshot.csv": dashboard_data.get("product_inventory_snapshot", pd.DataFrame()),
+        "dashboard_category_inventory_snapshot.csv": dashboard_data.get("category_inventory_snapshot", pd.DataFrame()),
     }
     for name, df in outputs.items():
         out_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
@@ -7912,6 +10137,158 @@ def _inventory_rows(df: pd.DataFrame, mode: str, section_type: str) -> List[List
             str(r.get("action", "Watch depth")),
         ])
     return rows
+
+
+def _brand_trend_rows(trend_df: pd.DataFrame, max_rows: int = 12, include_tickets: bool = True) -> List[List[Any]]:
+    rows = [["Period", "Sales", "+/-", "Units", "Margin", "Disc"] + (["Tix"] if include_tickets else [])]
+    if trend_df is None or trend_df.empty:
+        rows.append(["No data", "", "", "", "", ""] + ([""] if include_tickets else []))
+        return rows
+    tmp = trend_df.copy()
+    if "period_start" in tmp.columns:
+        tmp["period_start"] = pd.to_datetime(tmp["period_start"], errors="coerce")
+        tmp = tmp.sort_values("period_start")
+    if max_rows and len(tmp) > max_rows:
+        tmp = tmp.tail(max_rows)
+    for _, r in tmp.iterrows():
+        row = [
+            str(r.get("period", "")),
+            money0(r.get("net_revenue", 0.0)),
+            _format_delta(r.get("sales_vs_prior_pct"), r.get("net_revenue", 0.0), r.get("prior_net_revenue", 0.0)),
+            int0(r.get("units", 0.0)),
+            pct1(r.get("margin_real", 0.0)),
+            pct1(r.get("discount_rate", 0.0)),
+        ]
+        if include_tickets:
+            row.append(int0(r.get("tickets", 0.0)))
+        rows.append(row)
+    return rows
+
+
+def _brand_product_inventory_rows(product_snapshot: pd.DataFrame, max_rows: Optional[int] = None) -> List[List[Any]]:
+    rows = [["Product Group", "Cat", "Sales", "Units", "Margin", "On Hand", "7/14/30", "DOS", "Products Included"]]
+    if product_snapshot is None or product_snapshot.empty:
+        rows.append(["No product rows available", "", "", "", "", "", "", "", ""])
+        return rows
+    tmp = product_snapshot.copy()
+    for col in ["net_revenue", "units", "inventory_value"]:
+        if col not in tmp.columns:
+            tmp[col] = 0.0
+    tmp = tmp.sort_values(["net_revenue", "units", "inventory_value"], ascending=[False, False, False]).copy()
+    if max_rows is not None:
+        tmp = tmp.head(max(0, int(max_rows)))
+    for _, r in tmp.iterrows():
+        rows.append([
+            short_product_label(r.get("product_group_display", ""), 42),
+            _dashboard_category_short(r.get("category", "")),
+            money0(r.get("net_revenue", 0.0)),
+            int0(r.get("units", 0.0)),
+            pct1(r.get("margin_real", 0.0)),
+            int0(r.get("units_on_hand", 0.0)),
+            f"{int0(r.get('units_sold_7d', 0.0))}/{int0(r.get('units_sold_14d', 0.0))}/{int0(r.get('units_sold_30d', 0.0))}",
+            _format_days_supply_v2(r.get("days_supply_30d", np.nan), safe_div(r.get("units_sold_30d", 0.0), 30.0, 0.0), r.get("units_on_hand", 0.0)),
+            short_product_label(r.get("product_list", ""), 72),
+        ])
+    return rows
+
+
+def _brand_category_inventory_rows(category_snapshot: pd.DataFrame, max_rows: Optional[int] = None) -> List[List[Any]]:
+    rows = [["Category", "Sales", "Units", "Margin", "Disc", "On Hand", "Inv $", "7/14/30", "DOS"]]
+    if category_snapshot is None or category_snapshot.empty:
+        rows.append(["No category rows available", "", "", "", "", "", "", "", ""])
+        return rows
+    tmp = category_snapshot.sort_values(["net_revenue", "inventory_value"], ascending=[False, False]).copy()
+    if max_rows is not None:
+        tmp = tmp.head(max(0, int(max_rows)))
+    for _, r in tmp.iterrows():
+        rows.append([
+            str(r.get("category", "")),
+            money0(r.get("net_revenue", 0.0)),
+            int0(r.get("units", 0.0)),
+            pct1(r.get("margin_real", 0.0)),
+            pct1(r.get("discount_rate", 0.0)),
+            int0(r.get("units_on_hand", 0.0)),
+            money0(r.get("inventory_value", 0.0)),
+            f"{int0(r.get('units_sold_7d', 0.0))}/{int0(r.get('units_sold_14d', 0.0))}/{int0(r.get('units_sold_30d', 0.0))}",
+            _format_days_supply_v2(r.get("days_supply_30d", np.nan), safe_div(r.get("units_sold_30d", 0.0), 30.0, 0.0), r.get("units_on_hand", 0.0)),
+        ])
+    return rows
+
+
+def _brand_snapshot_metric_values(product_snapshot: pd.DataFrame, category_snapshot: pd.DataFrame) -> Dict[str, Any]:
+    product_snapshot = product_snapshot if product_snapshot is not None else pd.DataFrame()
+    category_snapshot = category_snapshot if category_snapshot is not None else pd.DataFrame()
+    top_product = product_snapshot.iloc[0].to_dict() if not product_snapshot.empty else {}
+    top_category = category_snapshot.iloc[0].to_dict() if not category_snapshot.empty else {}
+    return {
+        "top_product": top_product.get("product_group_display", "n/a"),
+        "top_product_sales": float(top_product.get("net_revenue", 0.0) or 0.0),
+        "top_category": top_category.get("category", "n/a"),
+        "top_category_sales": float(top_category.get("net_revenue", 0.0) or 0.0),
+        "units_on_hand": float(pd.to_numeric(product_snapshot.get("units_on_hand", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not product_snapshot.empty else 0.0,
+        "inventory_value": float(pd.to_numeric(product_snapshot.get("inventory_value", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not product_snapshot.empty else 0.0,
+        "units_sold_7d": float(pd.to_numeric(product_snapshot.get("units_sold_7d", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not product_snapshot.empty else 0.0,
+        "units_sold_14d": float(pd.to_numeric(product_snapshot.get("units_sold_14d", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not product_snapshot.empty else 0.0,
+        "units_sold_30d": float(pd.to_numeric(product_snapshot.get("units_sold_30d", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not product_snapshot.empty else 0.0,
+    }
+
+
+def build_product_sales_inventory_snapshot_page_v2(
+    story: List[Any],
+    product_snapshot: pd.DataFrame,
+    category_snapshot: pd.DataFrame,
+    trend_snapshots: Dict[str, pd.DataFrame],
+    mode: str,
+) -> None:
+    mode = str(mode or "standard").lower()
+    metrics = _brand_snapshot_metric_values(product_snapshot, category_snapshot)
+    units_per_day_30 = safe_div(metrics.get("units_sold_30d", 0.0), 30.0, 0.0)
+    days_supply = _safe_dos(metrics.get("units_on_hand", 0.0), units_per_day_30)
+    cards = [
+        _metric_card("Top Product", money0(metrics.get("top_product_sales", 0.0)), short_product_label(metrics.get("top_product", "n/a"), 36)),
+        _metric_card("Top Category", money0(metrics.get("top_category_sales", 0.0)), str(metrics.get("top_category", "n/a"))),
+        _metric_card("Units On Hand", int0(metrics.get("units_on_hand", 0.0)), "current inventory"),
+        _metric_card("Inventory Value", money0(metrics.get("inventory_value", 0.0)), "cost on hand"),
+        _metric_card("7/14/30 Sold", f"{int0(metrics.get('units_sold_7d', 0.0))}/{int0(metrics.get('units_sold_14d', 0.0))}/{int0(metrics.get('units_sold_30d', 0.0))}", "unit movement"),
+        _metric_card("Days Supply", _format_days_supply_v2(days_supply, units_per_day_30, metrics.get("units_on_hand", 0.0)), "30d pace"),
+    ]
+    daily_rows = _brand_trend_rows((trend_snapshots or {}).get("daily", pd.DataFrame()), max_rows=14 if mode == "quick" else 21, include_tickets=False)
+    weekly_rows = _brand_trend_rows((trend_snapshots or {}).get("weekly", pd.DataFrame()), max_rows=8, include_tickets=False)
+    monthly_rows = _brand_trend_rows((trend_snapshots or {}).get("monthly", pd.DataFrame()), max_rows=6, include_tickets=False)
+    daily_table = build_premium_table(daily_rows, [0.62 * inch, 0.72 * inch, 0.52 * inch, 0.46 * inch, 0.50 * inch, 0.46 * inch], money_cols=[1], pct_cols=[2, 4, 5])
+    weekly_table = build_premium_table(weekly_rows, [0.66 * inch, 0.74 * inch, 0.54 * inch, 0.48 * inch, 0.50 * inch, 0.46 * inch], money_cols=[1], pct_cols=[2, 4, 5])
+    monthly_table = build_premium_table(monthly_rows, [0.80 * inch, 0.78 * inch, 0.58 * inch, 0.48 * inch, 0.48 * inch, 0.44 * inch], money_cols=[1], pct_cols=[2, 4, 5])
+    trend_grid = Table([
+        [Paragraph("Day by Day", build_brand_packet_theme_v2()["small_v2"]), Paragraph("Week by Week", build_brand_packet_theme_v2()["small_v2"])],
+        [daily_table, weekly_table],
+        [Paragraph("Month by Month", build_brand_packet_theme_v2()["small_v2"]), Paragraph("Category Snapshot", build_brand_packet_theme_v2()["small_v2"])],
+        [monthly_table, build_premium_table(
+            _brand_category_inventory_rows(category_snapshot, max_rows=8 if mode == "quick" else None),
+            [0.70 * inch, 0.58 * inch, 0.36 * inch, 0.38 * inch, 0.34 * inch, 0.36 * inch, 0.50 * inch, 0.62 * inch, 0.38 * inch],
+            money_cols=[1, 6],
+            pct_cols=[3, 4],
+        )],
+    ], colWidths=[3.62 * inch, 3.62 * inch])
+    trend_grid.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    max_product_rows = 25 if mode == "quick" else None
+    _section_page(story, "Sales Timing + Product Inventory Snapshot", [
+        _metric_grid(cards, cols=6),
+        Spacer(1, 0.08 * inch),
+        trend_grid,
+        Spacer(1, 0.08 * inch),
+        Paragraph("Product Sales and Current Inventory On Hand", build_brand_packet_theme_v2()["small_v2"]),
+        build_premium_table(
+            _brand_product_inventory_rows(product_snapshot, max_rows=max_product_rows),
+            [1.42 * inch, 0.48 * inch, 0.56 * inch, 0.38 * inch, 0.42 * inch, 0.42 * inch, 0.62 * inch, 0.40 * inch, 2.15 * inch],
+            money_cols=[2],
+            pct_cols=[4],
+        ),
+    ], page_break=False)
 
 
 def _category_rows(category_60: pd.DataFrame, mode: str) -> List[List[Any]]:
@@ -8467,6 +10844,9 @@ def build_brand_packet_premium_pdf(
     health_reason: str = "",
     meeting_ask: str = "",
     store_credit_scorecard: Optional[pd.DataFrame] = None,
+    product_inventory_snapshot: Optional[pd.DataFrame] = None,
+    category_inventory_snapshot: Optional[pd.DataFrame] = None,
+    sales_trend_snapshots: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> None:
     osnap.setup_fonts()
     theme = build_brand_packet_theme_v2()
@@ -8501,6 +10881,13 @@ def build_brand_packet_premium_pdf(
     build_store_scorecards_page_v2(story, store_credit_scorecard, mode)
     build_location_performance_overview_v2(story, store_sales_packets, store_weekly_metrics)
     build_product_category_page_v2(story, category_60, product_60, mode)
+    build_product_sales_inventory_snapshot_page_v2(
+        story,
+        product_inventory_snapshot if product_inventory_snapshot is not None else pd.DataFrame(),
+        category_inventory_snapshot if category_inventory_snapshot is not None else pd.DataFrame(),
+        sales_trend_snapshots or {},
+        mode,
+    )
     build_inventory_sellthrough_page_v2(story, inv_overview, inventory_risk, fast_movers, slow_movers, mode)
     if mode in {"standard", "deep"} and options.include_store_sections:
         for abbr in order_store_codes(list(store_sales_packets.keys())):
@@ -8680,7 +11067,7 @@ def _dashboard_fast_rows(df: pd.DataFrame, sort_col: str, max_rows: int) -> List
 def _dashboard_store_rows(store_matrix: pd.DataFrame) -> List[List[Any]]:
     rows = [[
         "Store", "Sales", "Share", "Sales +/-", "Units", "Units +/-", "Margin", "Disc",
-        "Inv $", "DOS", "Sell", "Fastest", "Slowest", "Action",
+        "Inventory Cost", "DOS", "Sell", "Fastest", "Slowest", "Action",
     ]]
     if store_matrix is not None and not store_matrix.empty:
         for _, r in store_matrix.iterrows():
@@ -8752,7 +11139,7 @@ def _dashboard_store_weekly_rows(store_weekly: pd.DataFrame) -> List[List[Any]]:
 
 
 def _dashboard_category_rows(category_mix: pd.DataFrame) -> List[List[Any]]:
-    rows = [["Category", "Sales", "Share", "Units", "Margin", "Disc", "Inv $", "DOS", "Sell", "Top Product", "Action"]]
+    rows = [["Category", "Sales", "Share", "Units", "Margin", "Disc", "Inventory Cost", "DOS", "Sell", "Top Product", "Action"]]
     if category_mix is not None and not category_mix.empty:
         for _, r in category_mix.head(12).iterrows():
             rows.append([
@@ -8877,6 +11264,55 @@ def build_brand_packet_dashboard_pdf(
             money_cols=[3],
             pct_cols=[6, 7, 8, 11],
             status_cols=[0],
+        ),
+    ])
+
+    product_snapshot = dashboard_data.get("product_inventory_snapshot", pd.DataFrame())
+    category_snapshot = dashboard_data.get("category_inventory_snapshot", pd.DataFrame())
+    trend_snapshots = dashboard_data.get("sales_trend_snapshots", {}) or {}
+    daily_table = build_premium_table(
+        _brand_trend_rows(trend_snapshots.get("daily", pd.DataFrame()), max_rows=14, include_tickets=False),
+        [0.58 * inch, 0.68 * inch, 0.50 * inch, 0.44 * inch, 0.48 * inch, 0.44 * inch],
+        money_cols=[1],
+        pct_cols=[2, 4, 5],
+    )
+    weekly_table = build_premium_table(
+        _brand_trend_rows(trend_snapshots.get("weekly", pd.DataFrame()), max_rows=8, include_tickets=False),
+        [0.62 * inch, 0.72 * inch, 0.52 * inch, 0.46 * inch, 0.48 * inch, 0.44 * inch],
+        money_cols=[1],
+        pct_cols=[2, 4, 5],
+    )
+    monthly_table = build_premium_table(
+        _brand_trend_rows(trend_snapshots.get("monthly", pd.DataFrame()), max_rows=6, include_tickets=False),
+        [0.68 * inch, 0.72 * inch, 0.55 * inch, 0.42 * inch, 0.44 * inch, 0.40 * inch],
+        money_cols=[1],
+        pct_cols=[2, 4, 5],
+    )
+    trend_table = Table([
+        [Paragraph("Day by Day", theme["small_v2"]), Paragraph("Week by Week", theme["small_v2"]), Paragraph("Month by Month", theme["small_v2"])],
+        [daily_table, weekly_table, monthly_table],
+    ], colWidths=[3.36 * inch, 3.36 * inch, 3.36 * inch])
+    trend_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    _dashboard_section(story, "Product Sales and Current Inventory On Hand", [
+        trend_table,
+        Spacer(1, 0.08 * inch),
+        build_premium_table(
+            _brand_product_inventory_rows(product_snapshot, max_rows=max(1, int(options.max_products or 20))),
+            [1.55 * inch, 0.44 * inch, 0.56 * inch, 0.36 * inch, 0.40 * inch, 0.40 * inch, 0.60 * inch, 0.38 * inch, 4.85 * inch],
+            money_cols=[2],
+            pct_cols=[4],
+        ),
+        Spacer(1, 0.06 * inch),
+        build_premium_table(
+            _brand_category_inventory_rows(category_snapshot),
+            [1.15 * inch, 0.70 * inch, 0.46 * inch, 0.48 * inch, 0.42 * inch, 0.48 * inch, 0.62 * inch, 0.72 * inch, 0.46 * inch],
+            money_cols=[1, 6],
+            pct_cols=[3, 4],
         ),
     ])
 
@@ -9817,6 +12253,9 @@ def build_brand_packet_quick_pdf(
     health_reason: str = "",
     meeting_ask: str = "",
     store_credit_scorecard: Optional[pd.DataFrame] = None,
+    product_inventory_snapshot: Optional[pd.DataFrame] = None,
+    category_inventory_snapshot: Optional[pd.DataFrame] = None,
+    sales_trend_snapshots: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> None:
     osnap.setup_fonts()
     styles = osnap.build_styles()
@@ -9997,6 +12436,16 @@ def build_brand_packet_quick_pdf(
                 [3.5 * inch, 1.3 * inch, 1.1 * inch, 1.4 * inch],
             ))
             story.append(Spacer(1, 0.05 * inch))
+
+    story.append(PageBreak())
+    build_product_sales_inventory_snapshot_page_v2(
+        story,
+        product_inventory_snapshot if product_inventory_snapshot is not None else pd.DataFrame(),
+        category_inventory_snapshot if category_inventory_snapshot is not None else pd.DataFrame(),
+        sales_trend_snapshots or {},
+        mode,
+    )
+    story.append(PageBreak())
 
     story.append(Paragraph("Quick Store Dashboards", styles["Section"]))
     story.append(Paragraph(
@@ -11378,6 +13827,19 @@ def generate_brand_meeting_packet(
     daily_60 = summarize_daily(report_df)
     weekly_60 = summarize_weekly(report_df)
     store_weekly_metrics = build_dashboard_store_weekly_metrics(report_df, selected_store_codes)
+    product_inventory_snapshot, category_inventory_snapshot = build_brand_product_inventory_snapshot(
+        sales_brand,
+        catalog_brand,
+        report_start,
+        report_end,
+        selected_store_codes=selected_store_codes,
+    )
+    sales_trend_snapshots = build_brand_sales_trend_snapshots(
+        sales_brand,
+        report_start,
+        report_end,
+        selected_store_codes=selected_store_codes,
+    )
 
     kickback_rules = summarize_kickback_rules(report_df)
 
@@ -11676,6 +14138,9 @@ def generate_brand_meeting_packet(
             include_prior_data=bool(options.include_prior_window_data and prior_window_covered),
             meeting_ask=meeting_ask,
         )
+        dashboard_data["product_inventory_snapshot"] = product_inventory_snapshot
+        dashboard_data["category_inventory_snapshot"] = category_inventory_snapshot
+        dashboard_data["sales_trend_snapshots"] = sales_trend_snapshots
 
     # Persist cache CSVs for debugging / quick QA
     try:
@@ -11690,6 +14155,8 @@ def generate_brand_meeting_packet(
         p_credit_source = paths.cache_dir / "credit_source_summary.csv"
         p_actions = paths.cache_dir / "brand_action_items.csv"
         p_store_credit = paths.cache_dir / "store_credit_scorecards.csv"
+        p_product_inventory_snapshot = paths.cache_dir / "product_sales_inventory_snapshot.csv"
+        p_category_inventory_snapshot = paths.cache_dir / "category_sales_inventory_snapshot.csv"
 
         report_df.to_csv(p_sales, index=False)
         last14_df.to_csv(p_sales_14, index=False)
@@ -11703,6 +14170,11 @@ def generate_brand_meeting_packet(
         pd.DataFrame(action_items).to_csv(p_actions, index=False)
         store_credit_scorecard.to_csv(p_store_credit, index=False)
         store_weekly_metrics.to_csv(paths.cache_dir / "dashboard_store_weekly_metrics.csv", index=False)
+        product_inventory_snapshot.to_csv(p_product_inventory_snapshot, index=False)
+        category_inventory_snapshot.to_csv(p_category_inventory_snapshot, index=False)
+        for trend_name, trend_df in (sales_trend_snapshots or {}).items():
+            if isinstance(trend_df, pd.DataFrame):
+                trend_df.to_csv(paths.cache_dir / f"sales_trend_{safe_filename(str(trend_name))}.csv", index=False)
 
         # DOS QA files: shows the trend keys and how sales/inventory align.
         sales_q_grp = pd.DataFrame(columns=["supply_base_key", "supply_merge_key", "units_sold"])
@@ -11821,6 +14293,9 @@ def generate_brand_meeting_packet(
             health_reason=health_reason,
             meeting_ask=meeting_ask,
             store_credit_scorecard=store_credit_scorecard,
+            product_inventory_snapshot=product_inventory_snapshot,
+            category_inventory_snapshot=category_inventory_snapshot,
+            sales_trend_snapshots=sales_trend_snapshots,
         )
         _log(f"[PDF] Created ({'Premium Compact' if options.compact_pdf_mode else 'Quick Store Dashboards'}): {out_quick_pdf}", logger)
 
@@ -11937,6 +14412,11 @@ def parse_cli_args() -> argparse.Namespace:
     p.add_argument("--no-owner-brand-cards", dest="owner_brand_cards", action="store_false", help="Skip compact brand cards in the owner rollup.")
     p.set_defaults(owner_brand_cards=True)
     p.add_argument("--owner-email", action="store_true", help="Email the owner top-brands review after it is built (default; use --no-email to skip).")
+    p.add_argument(
+        "--owner-email-to",
+        action="append",
+        help="Owner rollup email recipient. Repeat or comma-separate for multiple recipients.",
+    )
     p.add_argument("--owner-output-root", type=str, default="", help="Output root for owner rollups. Defaults to --output-dir.")
     p.add_argument("--owner-creditflow", action="store_true", help="Pull CreditFlow credits for reviewed owner-rollup brands.")
     p.add_argument("--sort-by", choices=["sales"], default="sales", help="Owner rollup sort field. Currently only sales is supported.")
@@ -12030,6 +14510,7 @@ def main() -> None:
             api_workers=max(1, int(args.workers or DEFAULT_PACKET_API_WORKERS)),
             credit_ledger_path=str(args.credit_ledger),
             creditflow_base_url=str(args.creditflow_base_url),
+            owner_email_to=parse_email_recipients(args.owner_email_to) if args.owner_email_to else None,
             logger=_default_logger,
         )
         return
