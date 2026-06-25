@@ -108,7 +108,8 @@ def is_brand_match(row: dict[str, Any], aliases: list[str]) -> bool:
 
     product_name = clean_text(row.get("productName"))
     product_key = product_name.casefold()
-    normalized_product = normalize_key(product_name)
+    leading_product_segment = product_name.split("|", 1)[0].strip()
+    normalized_leading_segment = normalize_key(leading_product_segment)
     for alias in aliases:
         alias_text = clean_text(alias)
         alias_key = normalize_key(alias_text)
@@ -116,7 +117,9 @@ def is_brand_match(row: dict[str, Any], aliases: list[str]) -> bool:
             continue
         if product_key.startswith(f"{alias_text.casefold()} |"):
             return True
-        if normalized_product.startswith(alias_key):
+        if normalized_leading_segment == alias_key:
+            return True
+        if re.match(rf"^{re.escape(alias_text.casefold())}(?=$|[\s|/\\_.:;,#()\[\]-])", product_key):
             return True
     return False
 
